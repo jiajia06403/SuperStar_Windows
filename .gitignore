@@ -1,0 +1,37 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.venv-build/
+
+# ---------- Runtime artifacts ----------
+chaoxing.log
+*.log
+progress_cache/
+config_win.ini.bak
+
+# ---------- Test / lint cache ----------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+
+# ---------- PyInstaller build output ----------
+build/
+dist/
+dist_test/
+*.spec
+
+# ---------- IDE / OS ----------
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ---------- Agent workspace / local memory ----------
+.workbuddy/

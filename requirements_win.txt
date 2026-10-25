@@ -1,0 +1,20 @@
+# SuperStar Windows 客户端依赖
+# 只含刷课引擎真正需要的运行时依赖。
+
+# ---- 网络 / 解析 ----
+requests>=2.32.5
+urllib3>=2.5.0
+pyaes>=1.6.1
+beautifulsoup4>=4.14.2
+lxml>=5.0.0
+
+# ---- 日志 / 进度条 ----
+loguru>=0.7.3
+tqdm>=4.67.1
+
+# ---- 加密题库字体解码 ----
+fonttools>=4.60.1
+
+# ---- AI 大模型答题（provider=AI / SiliconFlow 使用，已随发行包内置）----
+openai>=1.109.1
+httpx>=0.28.1

@@ -1,0 +1,160 @@
+name: Release
+
+# 版本号唯一来源：仓库根目录 version.txt（格式 X.Y.Z）
+# 触发方式：
+#   1. 发版：把 version.txt 里的版本号打成 tag 推上来
+#        git tag v$(Get-Content version.txt) && git push origin v$(Get-Content version.txt)
+#       tag 带后缀（v1.0.0-rc.1）视为预发布
+#   2. 试构建：Actions -> Release -> Run workflow（只构建出 Artifact，不发 Release）
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      run_tests:
+        description: '是否跑全套测试（含 GUI 自检，较慢）'
+        required: false
+        type: boolean
+        default: false
+      prerelease:
+        description: '是否标记为预发布'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows executable
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      prerelease: ${{ steps.ver.outputs.prerelease }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # release job 需要 git describe 找上一个 tag，必须保留完整历史
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # 3.12 自带 tkinter，且 PyInstaller 支持成熟
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements_win.txt
+          pip install pyinstaller
+
+      # 版本号从 version.txt 读出，后续 exe 名 / zip 名 / artifact 名全部由它推导
+      - name: Resolve version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = (Get-Content -Path version.txt -Raw).Trim()
+          if ($v -notmatch '^\d+\.\d+\.\d+$') { throw "version.txt 版本号应为 X.Y.Z，实际为：$v" }
+          "version=$v" >> $env:GITHUB_OUTPUT
+          if ($env:GITHUB_REF.StartsWith('refs/tags/v')) {
+            $tag = $env:GITHUB_REF -replace '^refs/tags/', ''
+            if ($tag -ne "v$v" -and $tag -notlike "v$v-*") {
+              throw "tag($tag) 与 version.txt($v) 不一致，先同步版本号再发版"
+            }
+            "prerelease=$(($tag -like '*-*').ToString().ToLower())" >> $env:GITHUB_OUTPUT
+          }
+          Write-Host "VERSION=$v  REF=$env:GITHUB_REF"
+
+      # 完整测试默认只在本地跑（python test/run_test.py）：GUI 自检要真实建窗口，
+      # 在无显示会话的 runner 上不稳定；需要时勾选 run_tests 或本地执行。
+      - name: Run full tests
+        if: ${{ inputs.run_tests }}
+        env:
+          PYTHONUTF8: '1'
+        run: python test/run_test.py
+
+      # 构建 + 产物自检：失败时把日志尾部提升为 Annotation，避免只看到一个退出码
+      - name: Build release package
+        shell: pwsh
+        env:
+          # Windows runner 的 stdout 默认是本地代码页，打印中文随包文件名会 UnicodeEncodeError；
+          # build.py / run.py 内部已 reconfigure，这里只是双保险
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: utf-8
+          PKG_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          python build.py 2>&1 | Tee-Object -FilePath build.log
+          $code = $LASTEXITCODE
+          if ($code -eq 0) {
+            if (-not (Test-Path "dist\SuperStar-$env:PKG_VERSION.exe")) { $code = 9 }
+            elseif (-not (Test-Path "dist\SuperStar-$env:PKG_VERSION-win64.zip")) { $code = 9 }
+          }
+          if ($code -ne 0) {
+            $tail = (Get-Content build.log -Tail 30) -join '%0A'
+            Write-Output "::error title=build failed ($code)::$tail"
+            throw "构建失败（退出码 $code），关键输出见上方 Annotation"
+          }
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SuperStar-${{ steps.ver.outputs.version }}-win64
+          path: dist/SuperStar-${{ steps.ver.outputs.version }}-win64.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    # 手动触发只做构建校验（Artifact），发版必须走 tag
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    needs: build-windows
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 版本号取自 tag；changelog 取上一个 tag 到现在的提交（没有历史 tag 就取最近 20 条）
+      - name: Prepare release notes
+        id: notes
+        run: |
+          echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -n "$PREVIOUS_TAG" ]; then
+            COMMITS=$(git log "$PREVIOUS_TAG"..HEAD --pretty=format:"- %s" --no-merges)
+          else
+            COMMITS=$(git log --pretty=format:"- %s" --no-merges -20)
+          fi
+          {
+            echo "changes<<EOF"
+            echo "$COMMITS"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: Download package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: SuperStar-${{ needs.build-windows.outputs.version }}-win64
+          path: dist
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref }}
+          name: SuperStar ${{ steps.notes.outputs.VERSION }}
+          body: |
+            ## SuperStar ${{ steps.notes.outputs.VERSION }}
+
+            Windows x64，请**解压整个文件夹**后运行 `SuperStar-${{ needs.build-windows.outputs.version }}.exe`
+            （单 exe 缺少随包配置与目录，不单独分发）。
+
+            ### 更新内容
+            ${{ steps.notes.outputs.changes }}
+          draft: false
+          prerelease: ${{ needs.build-windows.outputs.prerelease == 'true' || inputs.prerelease == 'true' }}
+          files: dist/SuperStar-${{ needs.build-windows.outputs.version }}-win64.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
