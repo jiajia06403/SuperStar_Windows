@@ -208,6 +208,40 @@ def test_save_keeps_hidden_provider_defaults_empty():
                 root.destroy()
 
 
+def test_video_log_interval_saved_to_common():
+    """[common] video_log_interval：界面默认 30，可改；保存写进用户配置且不影响 [tiku]。"""
+    from unittest import mock
+
+    import gui.app as app_mod
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _prepare_dir(tmp)
+        with _FakeAppDir(tmp):
+            root = tk.Tk()
+            try:
+                dlg = _open(root)
+                assert _value(dlg, "video_log_interval") == "30", \
+                    f"视频日志间隔默认值应来自默认配置，实际 {_value(dlg, 'video_log_interval')!r}"
+                dlg.vars["video_log_interval"][1].set("5")
+                dlg._on_save()
+                assert dlg.common_result["video_log_interval"] == "5"
+                cfg = config_store.load_section("common")
+                assert cfg["video_log_interval"] == "5", cfg
+                assert config_store.load_section("tiku").get("provider") is not None, \
+                    "保存 [common] 不应丢掉 [tiku]"
+
+                # 非数字不落盘（弹窗提示，测试里替换掉避免阻塞）
+                dlg2 = _open(root)
+                dlg2.vars["video_log_interval"][1].set("abc")
+                with mock.patch.object(app_mod.messagebox, "showerror"):
+                    dlg2._on_save()
+                assert dlg2.result is None, "非法间隔不应保存"
+                assert config_store.load_section("common")["video_log_interval"] == "5"
+                dlg2.destroy()
+            finally:
+                root.destroy()
+
+
 def test_layout_not_clipped():
     with tempfile.TemporaryDirectory() as tmp:
         _prepare_dir(tmp)
@@ -228,6 +262,82 @@ def test_layout_not_clipped():
                 root.destroy()
 
 
+def _wait_test_done(dlg, timeout=5.0) -> None:
+    """泵 Tk 事件循环，直到连通性测试结束（后台线程 + 队列回主线程）。"""
+    import time
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        dlg.update()
+        if not dlg._testing:
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"连通性测试未在 {timeout}s 内结束：{dlg.test_state.get()!r}")
+
+
+def test_conn_test_button_shows_result():
+    """点「测试连通性」：按钮右侧显示结果，测试期间按钮禁用、结束后恢复。"""
+    import api.answer as answer_mod
+    with tempfile.TemporaryDirectory() as tmp:
+        _prepare_dir(tmp)
+        with _FakeAppDir(tmp):
+            root = tk.Tk()
+            captured = {}
+            origin = answer_mod.test_tiku_connection
+
+            def _fake(conf):
+                captured.update(conf)
+                return True, "连接正常（测试桩）"
+
+            answer_mod.test_tiku_connection = _fake
+            try:
+                dlg = _open(root)
+                _select(dlg, "AI")
+                dlg.vars["key"][1].set("sk-ui")     # 未保存的界面值也要参与测试
+                assert dlg.test_row.winfo_manager(), "选择提供方后应显示测试行"
+
+                dlg._on_test()
+                assert "测试中" in dlg.test_state.get(), dlg.test_state.get()
+                assert dlg.test_btn.instate(["disabled"]), "测试期间按钮应禁用"
+                _wait_test_done(dlg)
+                text = dlg.test_state.get()
+                assert "测试通过" in text and "连接正常" in text, text
+                assert dlg.test_btn.instate(["!disabled"]), "测试结束后按钮应恢复"
+                assert dlg.test_lbl.winfo_x() > dlg.test_btn.winfo_x() + dlg.test_btn.winfo_width(), \
+                    "结果标签应位于按钮右侧"
+                assert captured.get("key") == "sk-ui", f"测试应使用界面未保存的值：{captured}"
+                assert captured.get("provider") == "AI", captured
+
+                answer_mod.test_tiku_connection = lambda conf: (False, "未填写 API Key")
+                dlg._on_test()
+                _wait_test_done(dlg)
+                assert "测试失败" in dlg.test_state.get(), dlg.test_state.get()
+                dlg.destroy()
+            finally:
+                answer_mod.test_tiku_connection = origin
+                root.destroy()
+
+
+def test_conn_test_row_hidden_when_disabled():
+    """停用题库时没有可测的服务：整行（按钮 + 结果）隐藏。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        _prepare_dir(tmp)
+        with _FakeAppDir(tmp):
+            root = tk.Tk()
+            try:
+                dlg = _open(root)
+                _select(dlg, "")
+                assert not dlg.test_row.winfo_manager(), "停用时测试行应隐藏"
+                _select(dlg, "TikuAdapter")
+                assert dlg.test_row.winfo_manager(), "选择提供方后测试行应回来"
+                # 切回停用：进行中的测试结果作废（代数 +1）
+                gen = dlg._test_gen
+                _select(dlg, "")
+                assert dlg._test_gen > gen, "切换提供方应作废旧测试"
+                dlg.destroy()
+            finally:
+                root.destroy()
+
+
 if __name__ == "__main__":
     cases = [
         test_only_relevant_fields_shown,
@@ -235,7 +345,10 @@ if __name__ == "__main__":
         test_save_keeps_other_providers_values,
         test_shared_field_edits_are_kept,
         test_save_keeps_hidden_provider_defaults_empty,
+        test_video_log_interval_saved_to_common,
         test_layout_not_clipped,
+        test_conn_test_button_shows_result,
+        test_conn_test_row_hidden_when_disabled,
     ]
     failed = []
     for case in cases:

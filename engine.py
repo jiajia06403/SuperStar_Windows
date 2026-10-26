@@ -27,14 +27,36 @@ from pathlib import Path
 from threading import RLock
 from typing import Callable, Optional
 
+from api import cancel
 from api.answer import Tiku
 from api.base import Account, Chaoxing, StudyResult
+from api.cancel import Cancelled
 from api.exceptions import LoginError
 from api.logger import logger
 from api.live import Live
 from api.live_process import LiveProcessor
 from account_store import AccountStore
 from paths import data_dir as _data_dir
+
+# 视频状态日志默认间隔（秒）；0 表示不输出。可在 config_win.ini 的 [common] 段调整。
+DEFAULT_VIDEO_LOG_INTERVAL = 30
+
+
+def video_log_interval_from_config(default: float = DEFAULT_VIDEO_LOG_INTERVAL) -> float:
+    """读取 [common] video_log_interval（秒）；缺省/非法时回落到 default。"""
+    try:
+        from config_store import load_section
+        raw = str(load_section("common").get("video_log_interval", "") or "").strip()
+    except Exception as exc:  # noqa: BLE001 - 配置不可用不得影响刷课
+        logger.debug(f"读取视频日志间隔配置失败，使用默认值: {exc}")
+        return float(default)
+    if raw == "":
+        return float(default)
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        logger.warning(f"video_log_interval 配置无效，已使用默认值 {default}: {raw!r}")
+        return float(default)
 
 # --------------------------------------------------------------------------- #
 # 章节处理结果
@@ -47,6 +69,8 @@ class ChapterResult(Enum):
     # 任务点都跑完了，但回读服务端仍显示「未通过/需重新作答」（例如章节检测判不合格）。
     # 与 ERROR 区分：不再由外层盲目重试（避免耗尽平台答题次数），且绝不能标记为已完成。
     UNVERIFIED = 4
+    # 用户点了停止：中断当前章节，整轮刷课收尾（不重试、不计入失败）
+    STOPPED = 5
 
 
 # --------------------------------------------------------------------------- #
@@ -84,6 +108,10 @@ def process_job(chaoxing: Chaoxing, course: dict, job: dict, job_info: dict, spe
             live = Live(attachment=job, defaults=defaults, course_id=course.get("courseId"))
             thread = threading.Thread(target=LiveProcessor.run_live, args=(live, speed), daemon=True)
             thread.start()
+            # 分段 join：停止时不必等直播循环跑完
+            while thread.is_alive():
+                thread.join(timeout=0.5)
+                cancel.check()
             thread.join()
             return StudyResult.SUCCESS
         except Exception as e:  # noqa: BLE001
@@ -157,55 +185,61 @@ def process_chapter(chaoxing: Chaoxing, course: dict, point: dict, speed: float,
         work_retry = 1
 
     reanswer = 0
-    while True:
-        chaoxing.rate_limiter.limit_rate(random_time=True, random_min=0, random_max=0.2)
+    try:
+        while True:
+            cancel.check()
+            chaoxing.rate_limiter.limit_rate(random_time=True, random_min=0, random_max=0.2)
 
-        jobs, job_info = chaoxing.get_job_list(course, point)
+            jobs, job_info = chaoxing.get_job_list(course, point)
 
-        # 发现未开放章节
-        if job_info.get("notOpen", False):
-            return ChapterResult.NOT_OPEN
+            # 发现未开放章节
+            if job_info.get("notOpen", False):
+                return ChapterResult.NOT_OPEN
 
-        job_results: list[StudyResult] = []
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            for result in executor.map(lambda j: process_job(chaoxing, course, j, job_info, speed), jobs):
-                job_results.append(result)
+            job_results: list[StudyResult] = []
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                for result in executor.map(lambda j: process_job(chaoxing, course, j, job_info, speed), jobs):
+                    job_results.append(result)
 
-        for result in job_results:
-            if result.is_failure():
-                return ChapterResult.ERROR
+            for result in job_results:
+                if result.is_failure():
+                    return ChapterResult.ERROR
 
-        # 本章没有章节检测任务 -> 任务点全部跑完即视为完成
-        if not any(j.get("type") == "workid" for j in jobs):
-            return ChapterResult.SUCCESS
+            # 本章没有章节检测任务 -> 任务点全部跑完即视为完成
+            if not any(j.get("type") == "workid" for j in jobs):
+                return ChapterResult.SUCCESS
 
-        # 题库停用（未配置题库）时无法答题，不做回读重答，避免白白消耗平台答题次数
-        if _tiku_disabled(chaoxing):
-            logger.info(f"题库未启用，跳过章节检测完成校验: {point['title']}")
-            return ChapterResult.SUCCESS
+            # 题库停用（未配置题库）时无法答题，不做回读重答，避免白白消耗平台答题次数
+            if _tiku_disabled(chaoxing):
+                logger.info(f"题库未启用，跳过章节检测完成校验: {point['title']}")
+                return ChapterResult.SUCCESS
 
-        # 有章节检测：提交后回读服务端，确认平台真的接受了这次作答。
-        # 平台判「不合格/需重新作答」时任务点仍为未通过，必须重新作答而不是草率算完成。
-        pending = _work_still_pending(chaoxing, course, point)
-        if pending is None:
-            logger.warning(f"未能回读章节检测状态，暂按已完成处理: {point['title']}")
-            return ChapterResult.SUCCESS
-        if not pending:
-            logger.info(f"回读确认章节检测已通过: {point['title']}")
-            return ChapterResult.SUCCESS
+            # 有章节检测：提交后回读服务端，确认平台真的接受了这次作答。
+            # 平台判「不合格/需重新作答」时任务点仍为未通过，必须重新作答而不是草率算完成。
+            pending = _work_still_pending(chaoxing, course, point)
+            if pending is None:
+                logger.warning(f"未能回读章节检测状态，暂按已完成处理: {point['title']}")
+                return ChapterResult.SUCCESS
+            if not pending:
+                logger.info(f"回读确认章节检测已通过: {point['title']}")
+                return ChapterResult.SUCCESS
 
-        if reanswer >= work_retry:
-            logger.error(
-                f"章节检测提交后平台仍判定未通过（需重新作答），已重答 {reanswer} 次，"
-                f"放弃并保留为未完成: {point['title']}"
+            if reanswer >= work_retry:
+                logger.error(
+                    f"章节检测提交后平台仍判定未通过（需重新作答），已重答 {reanswer} 次，"
+                    f"放弃并保留为未完成: {point['title']}"
+                )
+                return ChapterResult.UNVERIFIED
+
+            reanswer += 1
+            logger.warning(
+                f"章节检测提交后平台仍显示未通过，重新作答({reanswer}/{work_retry}): {point['title']}"
             )
-            return ChapterResult.UNVERIFIED
-
-        reanswer += 1
-        logger.warning(
-            f"章节检测提交后平台仍显示未通过，重新作答({reanswer}/{work_retry}): {point['title']}"
-        )
-        time.sleep(min(3.0, 1.0 * reanswer))
+            if cancel.wait(min(3.0, 1.0 * reanswer)):
+                raise Cancelled()
+    except Cancelled:
+        logger.info(f"收到停止信号，中断章节处理: {point['title']}")
+        return ChapterResult.STOPPED
 
 
 # --------------------------------------------------------------------------- #
@@ -339,7 +373,7 @@ class StudyEngine:
     CHAPTER = "chapter"            # (course_id, index, total, title)
     STATUS = "status"              # (state, message)
     ACCOUNTS = "accounts"          # (uid_list)
-    FINISHED = "finished"          # ()
+    FINISHED = "finished"          # (stopped: bool)；同时记录到 engine.last_stopped
 
     def __init__(self, cache_dir: "str | None" = None, poll_interval: int = 15):
         cache_dir = str(cache_dir or _data_dir())
@@ -352,6 +386,7 @@ class StudyEngine:
         self.accounts = self._store.load()       # 启动即恢复已保存账号
         self._handlers: dict[str, list[Callable]] = {}
         self._stop = False
+        self.last_stopped = False   # 本轮是否被用户停止（FINISHED 时置位，供界面区分文案）
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.RLock()
         # 已知「未开放」章节：courseId -> {pointId}（仅供界面展示，不落盘）
@@ -361,6 +396,8 @@ class StudyEngine:
         self.jobs = 1
         self.query_delay = 0
         self.work_retry = 1     # 章节检测回读不合格时的重新作答次数
+        # 视频状态日志间隔（秒，0=关闭）：观看视频时每 N 秒输出章节号/进度百分比等
+        self.video_log_interval = video_log_interval_from_config()
 
     # ---- 事件订阅 ----
     def on(self, event: str, cb: Callable) -> None:
@@ -400,7 +437,42 @@ class StudyEngine:
         tiku.config_set(tiku_config or {})
         tiku = tiku.get_tiku_from_config()
         tiku.init_tiku()
-        return Chaoxing(account=account, tiku=tiku, query_delay=self.query_delay)
+        chaoxing = Chaoxing(account=account, tiku=tiku, query_delay=self.query_delay)
+        self._push_video_log(chaoxing)
+        return chaoxing
+
+    # ---- 视频状态日志 ----
+    def _push_video_log(self, chaoxing=None) -> None:
+        """把视频状态日志间隔写入后端实例（0=关闭）。"""
+        target = chaoxing if chaoxing is not None else self.chaoxing
+        if target is None:
+            return
+        try:
+            target.video_log_interval = float(self.video_log_interval or 0)
+        except (TypeError, ValueError):
+            target.video_log_interval = float(DEFAULT_VIDEO_LOG_INTERVAL)
+
+    def apply_video_log_config(self) -> float:
+        """重新读取 [common] 的视频日志间隔并即时生效（设置保存后调用）。
+
+        返回生效的间隔秒数；0 表示关闭。正在刷课时也会作用于当前视频循环。
+        """
+        self.video_log_interval = video_log_interval_from_config()
+        self._push_video_log()
+        return self.video_log_interval
+
+    def _set_video_context(self, point: dict, index: int, total: int) -> None:
+        """记录当前章节（序号/总数/标题），供视频状态日志显示「第几章/共几章」。"""
+        if self.chaoxing is None:
+            return
+        try:
+            self.chaoxing.video_context = {
+                "chapter_index": int(index),
+                "chapter_total": int(total),
+                "chapter_title": str(point.get("title") or ""),
+            }
+        except Exception as exc:  # noqa: BLE001 - 仅用于日志展示，失败无妨
+            logger.debug(f"设置章节上下文失败: {exc}")
 
     def login(self, username: str, password: str, use_cookies: bool = False,
               tiku_config: Optional[dict] = None, remember: bool = True) -> str:
@@ -512,6 +584,7 @@ class StudyEngine:
         from demo_chaoxing import DemoChaoxing
         self.chaoxing = DemoChaoxing(not_open_ids=not_open_ids)
         self.current_uid = self.chaoxing.get_uid()
+        self._push_video_log()
         with self._lock:
             self.accounts[self.current_uid] = {
                 "username": "demo", "password": "", "use_cookies": False,
@@ -673,6 +746,17 @@ class StudyEngine:
         self.speed = min(2.0, max(1.0, speed))
         self.jobs = max(1, jobs)
         self._stop = False
+        self.last_stopped = False
+        cancel.clear()          # 清掉上一轮的停止标记，否则新一轮刚开始就中断
+        # 以配置文件为准刷新视频状态日志间隔（用户可能直接改过 ini），并推给后端
+        self.apply_video_log_config()
+        if self.video_log_interval > 0:
+            logger.info(
+                f"视频状态日志：每 {self.video_log_interval:g} 秒输出一次"
+                f"（章节号 / 进度百分比 / 预计剩余；设 0 可关闭）"
+            )
+        else:
+            logger.info("视频状态日志已关闭（在「设置」里填间隔秒数即可开启）")
         self._thread = threading.Thread(
             target=self._run, args=(course_list,), daemon=True
         )
@@ -680,7 +764,9 @@ class StudyEngine:
         self._emit(self.STATUS, "running", "开始刷课")
 
     def stop(self) -> None:
+        """请求停止：置标记 + 唤醒正在 sleep 的循环，让长任务点尽快中断。"""
         self._stop = True
+        cancel.set()
         self._emit(self.STATUS, "stopping", "正在停止...")
 
     @property
@@ -696,14 +782,23 @@ class StudyEngine:
                 self._study_course(course)
             if self.current_uid:
                 self.cache.flush(self.current_uid)
-            self._emit(self.FINISHED)
+            self.last_stopped = bool(self._stop)
+            self._emit(self.FINISHED, self.last_stopped)
             self._emit(self.STATUS, "idle", "全部完成" if not self._stop else "已停止")
+        except Cancelled:
+            # 停止信号从深层任务点冒上来（视频/直播/答题），正常收尾而不是报错
+            if self.current_uid:
+                self.cache.flush(self.current_uid)
+            self.last_stopped = True
+            self._emit(self.FINISHED, True)
+            self._emit(self.STATUS, "idle", "已停止")
         except Exception as e:  # noqa: BLE001
             logger.error(f"学习线程异常: {type(e).__name__}: {e}")
             logger.error(traceback.format_exc())
             self._emit(self.STATUS, "error", f"{type(e).__name__}: {e}")
         finally:
             self._stop = False
+            cancel.clear()      # 线程退出后清标记，避免影响下一轮/读取进度
 
     def _study_course(self, course: dict) -> None:
         uid = self.current_uid
@@ -725,6 +820,7 @@ class StudyEngine:
 
             point = points[i]
             self._emit(self.CHAPTER, cid, i, total, point["title"])
+            self._set_video_context(point, i + 1, total)   # 视频状态日志带上章节号
 
             pid = str(point["id"])
 
@@ -749,6 +845,12 @@ class StudyEngine:
 
             result = process_chapter(self.chaoxing, course, point, self.speed,
                                      work_retry=self.work_retry)
+
+            if result == ChapterResult.STOPPED:
+                # 停止信号已打断正在跑的任务点（视频/直播/答题），整轮收尾
+                self._emit(self.PROGRESS, cid, pid, "pending")
+                logger.info("收到停止信号，结束当前课程")
+                return
 
             if result == ChapterResult.SUCCESS:
                 point["has_finished"] = True
@@ -786,9 +888,13 @@ class StudyEngine:
             tries = 1
             while tries < max_tries and not self._stop:
                 logger.warning(f"章节处理出错，重试({tries}/{max_tries}): {point['title']}")
-                time.sleep(2)
+                if cancel.wait(2):
+                    logger.info("收到停止信号，结束当前课程")
+                    return
                 r = process_chapter(self.chaoxing, course, point, self.speed,
                                     work_retry=self.work_retry)
+                if r == ChapterResult.STOPPED:
+                    return
                 if r == ChapterResult.SUCCESS:
                     point["has_finished"] = True
                     locked.discard(pid)
@@ -823,8 +929,11 @@ class StudyEngine:
             if not prev.get("has_finished"):
                 logger.info(f"章节未开放，回退检查上一章节未完成，重新完成: {prev['title']}")
                 self._emit(self.STATUS, "backtrack", f"回退重做: {prev['title']}")
+                self._set_video_context(prev, i, len(points))
                 r = process_chapter(self.chaoxing, course, prev, self.speed,
                                     work_retry=self.work_retry)
+                if r == ChapterResult.STOPPED:
+                    return False
                 if r == ChapterResult.SUCCESS:
                     prev["has_finished"] = True
                     self.cache.mark_done(uid, cid, str(prev["id"]))
@@ -851,8 +960,7 @@ class StudyEngine:
         logger.info(f"章节未开放，每 {self.poll_interval} 秒检查一次开放状态: {points[i]['title']}")
         self._emit(self.STATUS, "polling", f"等待开放: {points[i]['title']}")
         while not self._stop:
-            time.sleep(self.poll_interval)
-            if self._stop:
+            if cancel.wait(self.poll_interval):   # 可被停止按钮立刻唤醒
                 return False
             try:
                 _, job_info = self.chaoxing.get_job_list(course, points[i])

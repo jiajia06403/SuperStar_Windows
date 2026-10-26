@@ -1,5 +1,6 @@
 import time
 
+from api import cancel
 from api.config import GlobalConst as gc
 from api.live import Live
 from api.logger import logger
@@ -33,17 +34,21 @@ class LiveProcessor:
 
         # 循环提交时长（每59秒一次，模拟持续观看）
         for i in range(total_minutes):
+            # 停止按钮要能立刻中断直播刷取（原本按分钟循环，点了停止也会跑完）
+            cancel.check()
             logger.info(f"直播'{live.name}'已观看{i+1}/{total_minutes}分钟")
             success = live.do_finish()  # 提交当前时长
             if not success:
                 logger.warning(f"第{i+1}分钟时长提交失败，将重试")
                 # 失败重试一次
-                time.sleep(5)
+                if cancel.wait(5):
+                    raise cancel.Cancelled()
                 live.do_finish()
 
             # 根据倍速调整间隔时间
             sleep_time = 59 / speed
-            time.sleep(sleep_time)
+            if cancel.wait(sleep_time):
+                raise cancel.Cancelled()
 
         logger.success(f"直播'{live.name}'时长刷取完成")
         return True

@@ -287,6 +287,176 @@ def test_like_switches_parse_text_bool():
     assert tiku._search is True and tiku._retry is True
 
 
+# --------------------------------------------------------------------------- #
+# 连通性测试（界面「测试连通性」按钮的后端）
+# --------------------------------------------------------------------------- #
+class _FakeResp:
+    def __init__(self, status=200, payload=None, text='{"ok":1}'):
+        self.status_code = status
+        self._payload = payload if payload is not None else {}
+        self.text = text
+
+    def json(self):
+        if isinstance(self._payload, Exception):
+            raise self._payload
+        return self._payload
+
+
+class _FakeChat:
+    def __init__(self, content, capture):
+        self._content = content
+        self._capture = capture
+
+    def create(self, **kwargs):
+        self._capture.update(kwargs)
+        msg = type("Msg", (), {"content": self._content})()
+        choice = type("Choice", (), {"message": msg})()
+        return type("Completion", (), {"choices": [choice]})()
+
+
+def _fake_client_factory(capture, content="2"):
+    def _factory(base_url, api_key, proxy=None, max_retries=None):
+        capture.update(base_url=base_url, api_key=api_key, proxy=proxy, max_retries=max_retries)
+        return type("Client", (), {
+            "chat": type("ChatNS", (), {"completions": _FakeChat(content, capture)})()
+        })()
+    return _factory
+
+
+def test_conn_test_disabled_provider():
+    """provider 留空 → 直接说明题库停用，不发起任何请求。"""
+    ok, msg = answer.test_tiku_connection({"provider": ""})
+    assert ok is False and "停用" in msg, msg
+    ok, msg = answer.test_tiku_connection({"provider": "NotAProvider"})
+    assert ok is False and "未知" in msg, msg
+
+
+def test_conn_test_ai_without_key():
+    """未填 Key：不发请求，直接给出可读提示。"""
+    calls = []
+    origin = answer._openai_client
+    answer._openai_client = lambda *a, **k: calls.append(a)
+    try:
+        ok, msg = answer.test_tiku_connection(
+            {"provider": "AI", "endpoint": "https://api.openai.com/v1", "model": "gpt-3.5-turbo"})
+    finally:
+        answer._openai_client = origin
+    assert ok is False and "API Key" in msg, msg
+    assert not calls, "未填 Key 时不应构造客户端"
+
+
+def test_conn_test_ai_ok():
+    """填全后能拿到回复即判定连通，且探测不复用刷课时的重试（max_retries=0）。"""
+    capture = {}
+    origin = answer._openai_client
+    answer._openai_client = _fake_client_factory(capture, content="2")
+    try:
+        ok, msg = answer.test_tiku_connection({
+            "provider": "AI", "endpoint": "https://api.openai.com/v1/chat/completions",
+            "key": "sk-x", "model": "gpt-3.5-turbo"})
+    finally:
+        answer._openai_client = origin
+    assert ok is True, msg
+    assert "2" in msg, msg
+    assert capture["base_url"] == "https://api.openai.com/v1", capture
+    assert capture["api_key"] == "sk-x", capture
+    assert capture["max_retries"] == 0, "探测应关闭 SDK 自动重试，避免按钮长时间无响应"
+    assert capture["model"] == "gpt-3.5-turbo", capture
+
+
+def test_conn_test_ai_uses_ignore_key_option():
+    """AI 勾选「忽略 API Key」后允许免鉴权端点；DeepSeek 不吃这个开关。"""
+    origin = answer._openai_client
+    answer._openai_client = _fake_client_factory({}, content="2")
+    try:
+        ok, _msg = answer.test_tiku_connection({
+            "provider": "AI", "endpoint": "http://127.0.0.1:11434/v1",
+            "model": "qwen", "ignore_api_key": "true"})
+        assert ok is True, "勾选忽略 Key 后自建端点应可测试"
+        ok, msg = answer.test_tiku_connection({
+            "provider": "DeepSeek", "deepseek_key": "", "ignore_api_key": "true"})
+        assert ok is False and "API Key" in msg, msg
+    finally:
+        answer._openai_client = origin
+
+
+def test_conn_test_deepseek_uses_own_keys():
+    """DeepSeek 探测读 deepseek_* 键，不受 AI 的 endpoint/model 影响。"""
+    capture = {}
+    origin = answer._openai_client
+    answer._openai_client = _fake_client_factory(capture, content="2")
+    try:
+        ok, _msg = answer.test_tiku_connection({
+            "provider": "DeepSeek", "deepseek_endpoint": "https://api.deepseek.com/v1",
+            "deepseek_key": "sk-ds", "deepseek_model": "deepseek-chat",
+            "endpoint": "https://api.openai.com/v1", "key": "sk-openai", "model": "gpt-4o"})
+    finally:
+        answer._openai_client = origin
+    assert ok is True
+    assert capture["base_url"] == "https://api.deepseek.com/v1", capture
+    assert capture["api_key"] == "sk-ds", capture
+    assert capture["model"] == "deepseek-chat", capture
+
+
+def test_conn_test_yanxi_and_adapter():
+    """言溪 / TikuAdapter 走 requests：成功判连通，异常给可读提示。"""
+    origin_get, origin_post = answer.requests.get, answer.requests.post
+    try:
+        answer.requests.get = lambda *a, **k: _FakeResp(
+            200, {"code": 1, "data": {"answer": "2", "times": 88}})
+        ok, msg = answer.test_tiku_connection({"provider": "TikuYanxi", "tokens": "t1,t2"})
+        assert ok is True and "88" in msg, msg
+
+        answer.requests.get = lambda *a, **k: _FakeResp(
+            200, {"code": 0, "message": "TOKEN无效"})
+        ok, msg = answer.test_tiku_connection({"provider": "TikuYanxi", "tokens": "t1"})
+        assert ok is False and "TOKEN无效" in msg, msg
+
+        def _boom(*a, **k):
+            raise ConnectionError("模拟网络不可达")
+
+        answer.requests.get = _boom
+        ok, msg = answer.test_tiku_connection({"provider": "TikuYanxi", "tokens": "t1"})
+        assert ok is False and "请求失败" in msg, msg
+
+        answer.requests.post = lambda *a, **k: _FakeResp(200, {"answer": {"bestAnswer": []}})
+        ok, msg = answer.test_tiku_connection(
+            {"provider": "TikuAdapter", "url": "http://127.0.0.1:5000/api/search"})
+        assert ok is True, msg
+
+        ok, msg = answer.test_tiku_connection({"provider": "TikuAdapter", "url": ""})
+        assert ok is False and "服务地址" in msg, msg
+
+        # LIKE：余额接口 200 且余额可解析 → 连通并报剩余次数；401 → TOKEN 失效
+        answer.requests.get = lambda *a, **k: _FakeResp(200, {"balance": 12})
+        ok, msg = answer.test_tiku_connection({"provider": "TikuLike", "tokens": "t1,t2"})
+        assert ok is True and "12" in msg, msg
+
+        answer.requests.get = lambda *a, **k: _FakeResp(401, {}, text="unauthorized")
+        ok, msg = answer.test_tiku_connection({"provider": "TikuLike", "tokens": "t1"})
+        assert ok is False and "TOKEN" in msg, msg
+
+        ok, msg = answer.test_tiku_connection({"provider": "TikuLike", "tokens": ""})
+        assert ok is False and "TOKEN" in msg, msg
+    finally:
+        answer.requests.get, answer.requests.post = origin_get, origin_post
+
+
+def test_conn_test_does_not_touch_global_state():
+    """探测不调用 init_tiku：不会重建本地题库单例，也不写配置。"""
+    import api.local_bank as local_bank
+    before = getattr(local_bank, "_BANK", None)
+    origin = answer._openai_client
+    answer._openai_client = _fake_client_factory({}, content="2")
+    try:
+        answer.test_tiku_connection({"provider": "AI", "endpoint": "https://x/v1",
+                                     "key": "sk-x", "model": "m"})
+    finally:
+        answer._openai_client = origin
+    assert getattr(local_bank, "_BANK", None) is before, \
+        "连通性测试不应调用 init_tiku（会重建/改写本地题库单例）"
+
+
 if __name__ == "__main__":
     _patch_cache()
     cases = [
@@ -303,6 +473,13 @@ if __name__ == "__main__":
         test_deepseek_requires_key,
         test_llm_endpoint_accepts_full_url,
         test_like_switches_parse_text_bool,
+        test_conn_test_disabled_provider,
+        test_conn_test_ai_without_key,
+        test_conn_test_ai_ok,
+        test_conn_test_ai_uses_ignore_key_option,
+        test_conn_test_deepseek_uses_own_keys,
+        test_conn_test_yanxi_and_adapter,
+        test_conn_test_does_not_touch_global_state,
     ]
     failed = []
     for case in cases:

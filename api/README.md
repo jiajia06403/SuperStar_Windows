@@ -3,6 +3,10 @@
 - `__init__.py`: 提供格式化输出辅助函数
 - `base.py`: 提供核心功能，包含主要的Chaoxing类和学习功能
 - `answer.py`: 提供多种题库接口和答题功能
+- `local_bank.py`: 本地题库（按课程一个文件、全账号共享；只存平台确认的正确答案，只写缺失或与平台不一致的题，支持导入/导出/合并）
+- `work_verify.py`: 作业页解析（每题对错 / 「正确答案」/「我的答案」），供入库与采集共用
+- `collect.py`: 从已完成作业批量采集答案进本地题库（只发 GET，不提交作业）
+- `decode.py::decode_work_questions`: 解析作业页题目（不需要 form，成绩页也能用）
 - `answer_check.py`: 答案检查和验证
 - `cipher.py`: AES加密解密功能
 - `config.py`: 全局配置常量

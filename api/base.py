@@ -29,6 +29,7 @@ from api.decode import (
     decode_questions_info,
 )
 from api.exceptions import MaxRetryExceeded
+from api import cancel, local_bank, work_verify
 
 
 def _progress_stream():
@@ -48,6 +49,24 @@ def _progress_stream():
 
 def get_timestamp():
     return str(int(time.time() * 1000))
+
+
+def _clip_text(text, limit: int) -> str:
+    """截断过长文本（章节名/视频名），保证状态日志一行能看完。"""
+    text = str(text or "").strip()
+    return text if len(text) <= limit else text[: max(1, limit - 1)] + "…"
+
+
+def _fmt_duration(seconds: float) -> str:
+    """秒数 -> 「1时02分03秒」/「2分03秒」/「45秒」。"""
+    seconds = int(max(0, seconds))
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}时{minutes:02d}分{secs:02d}秒"
+    if minutes:
+        return f"{minutes}分{secs:02d}秒"
+    return f"{secs}秒"
 
 
 class SessionManager:
@@ -139,6 +158,11 @@ class Chaoxing:
         self.rollback_times = 0
         self.rate_limiter = RateLimiter(0.5) # 其他接口速率限制比较松
         self.video_log_limiter = RateLimiter(2) # 上报进度极其容易卡验证码，限制2s一次
+        # 视频状态日志：每 N 秒在日志输出一条「章节号 + 进度百分比 + 预计剩余」，0 = 关闭。
+        # 由引擎按配置（config_win.ini [common] video_log_interval）写入。
+        self.video_log_interval: float = 0
+        # 当前章节上下文（引擎在进入章节前写入）：章节序号/总数/名称，供视频日志显示。
+        self.video_context: dict = {}
 
     def login(self, login_with_cookies=False):
         if login_with_cookies:
@@ -254,7 +278,13 @@ class Chaoxing:
         logger.info("课程章节读取成功...")
         return decode_course_point(_resp.text)
 
-    def get_job_list(self, course: dict, point: dict) -> tuple[list[dict], dict]:
+    def get_job_list(self, course: dict, point: dict,
+                     stop_early: bool = False) -> tuple[list[dict], dict]:
+        """读取章节任务点。
+
+        ``stop_early``：一遇到空卡片就停（采集题库时用；整章刷课仍走原来的
+        「凑满 7 张卡片」逻辑，避免漏掉多卡片章节的任务点）。
+        """
         _session = SessionManager.get_session()
         self.rate_limiter.limit_rate()
         job_list = []
@@ -286,6 +316,10 @@ class Chaoxing:
                 # 直接返回, 节省一次请求
                 logger.info("该章节未开放")
                 return [], _job_info
+
+            if stop_early and not _job_list and _possible_num != "0":
+                # 卡片序号从 0 连续排列：第 1 张之后还空就说明没有更多卡片了
+                break
 
             job_list += _job_list
             job_info.update(_job_info)
@@ -499,6 +533,39 @@ class Chaoxing:
         return None
 
 
+    def _video_status_line(self, _job: dict, play_time: float, duration: int,
+                           _speed: float) -> str:
+        """构造一行视频状态日志：章节号 → 任务名 → 百分比/时长 → 倍速 → 预计剩余。"""
+        total = max(int(duration or 0), 1)
+        percent = min(100.0, max(0.0, float(play_time)) * 100.0 / total)
+        speed = float(_speed or 1.0) or 1.0
+        parts = []
+
+        ctx = getattr(self, "video_context", None) or {}
+        index, count = ctx.get("chapter_index"), ctx.get("chapter_total")
+        if index and count:
+            head = f"章节 {index}/{count}"
+            title = _clip_text(ctx.get("chapter_title"), 16)
+            if title:
+                head += f"《{title}》"
+            parts.append(head)
+
+        name = _clip_text(_job.get("name") or _job.get("title"), 18)
+        if name:
+            parts.append(f"任务 {name}")
+        parts.append(f"{percent:.1f}% ({int(play_time)}/{total}s)")
+        parts.append(f"{speed:g}x")
+        parts.append(f"剩余约{_fmt_duration((total - play_time) / speed)}")
+        return "视频进度 | " + " | ".join(parts)
+
+    def _log_video_status(self, _job: dict, play_time: float, duration: int,
+                          _speed: float) -> None:
+        """输出一条视频状态日志（章节号/进度百分比等）；异常不得打断刷课。"""
+        try:
+            logger.info(self._video_status_line(_job, play_time, duration, _speed))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"视频状态日志输出失败: {exc}")
+
     def study_video(self, _course, _job, _job_info, _speed: float = 1.0, _type: Literal["Video", "Audio"] = "Video") -> StudyResult:
         _session = SessionManager.get_session()
 
@@ -519,7 +586,9 @@ class Chaoxing:
         # Time in the video (can be scaled with the speed factor): duration, play_time, last_log_time, wait_time
 
         duration = int(_video_info["duration"])
-        play_time = int(_job["playTime"]) // 1000
+        # playTime 与 duration 同单位（秒），切勿再 //1000（会把 1000s 内的续播进度全部归零，
+        # 导致「当前观看」始终显示 0 秒，并连带污染 enc 签名）。
+        play_time = int(_job["playTime"] or 0)
         last_log_time = 0
         last_iter = time.time()
         wait_time = int(random.uniform(30, 90))
@@ -533,59 +602,89 @@ class Chaoxing:
         forbidden_retry = 0
         max_forbidden_retry = 2
 
-        passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration, play_time, _type,headers=headers)
-        passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration, duration, _type, headers=headers)
+        # 视频状态日志（每 N 秒一条：章节号 + 进度百分比 + 预计剩余），0 表示关闭。
+        # 用真实时间计时而不是 play_time，倍速下「每 30 秒」才符合用户直觉。
+        try:
+            status_interval = max(0.0, float(getattr(self, "video_log_interval", 0) or 0))
+        except (TypeError, ValueError):
+            status_interval = 0.0
+        last_status = time.time()
+        last_status_play = play_time     # 上次输出的播放位置：进度没前进就不重复刷日志
 
-        if passed:
-            logger.info("任务瞬间完成: {}", _job['name'])
+        try:
+            cancel.check()
+            passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration, play_time, _type,headers=headers)
+            passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration, duration, _type, headers=headers)
+
+            if passed:
+                logger.info("任务瞬间完成: {}", _job['name'])
+                return StudyResult.SUCCESS
+
+            if status_interval > 0:      # 开播先报一条，立刻能看到章节归属与续播进度
+                self._log_video_status(_job, play_time, duration, _speed)
+
+            while not passed:
+                # 停止按钮必须能中断视频循环：一个视频动辄几十分钟，
+                # 只在章节边界检查会让界面长时间卡在「停止中」。
+                cancel.check()
+                # Sometimes the last request needs to be sent several times to complete the task
+                if play_time - last_log_time >= wait_time or play_time == duration:
+
+                    passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration,
+                                                            int(play_time), _type, headers=headers)
+
+                    if state == 403:
+                        if forbidden_retry >= max_forbidden_retry:
+                            logger.warning("403重试失败, 跳过当前任务")
+                            return StudyResult.FORBIDDEN
+                        forbidden_retry += 1
+                        logger.warning(
+                            "出现403报错, 正在尝试刷新会话状态 (第{}次)",
+                            forbidden_retry,
+                        )
+                        time.sleep(random.uniform(2, 4))
+                        refreshed_meta = self._recover_after_forbidden(_session, _job, _type)
+                        if refreshed_meta:
+                            # FIXME: Maybe it should be considered an error if those keys aren't present in the refreshed meta, so we perhaps shouldn't use get()
+                            _dtoken = refreshed_meta.get("dtoken", _dtoken)
+                            _duration = refreshed_meta.get("duration", duration)
+                            play_time = refreshed_meta.get("playTime", play_time)
+
+                            logger.debug("Refreshed token: {}, duration: {}, play time: {}", _dtoken, _duration, play_time)
+                            continue
+
+                    elif not passed and state != 200:
+                        return StudyResult.ERROR
+
+
+
+
+                    wait_time = int(random.uniform(30, 90))
+                    last_log_time = play_time
+
+                dt = (time.time() - last_iter) * _speed # Since uploading the progress takes time, we assume that the video is still playing in the background, so manually calculate the time elapsed is required
+                last_iter = time.time()
+                play_time = min(duration, play_time+dt)
+
+                pbar.n = int(play_time)
+                pbar.refresh()
+                if status_interval > 0 and (time.time() - last_status) >= status_interval \
+                        and int(play_time) > int(last_status_play):
+                    last_status = time.time()
+                    last_status_play = play_time
+                    self._log_video_status(_job, play_time, duration, _speed)
+                time.sleep(gc.THRESHOLD)
+
+            logger.info("任务完成: {}", _job['name'])
             return StudyResult.SUCCESS
-
-        while not passed:
-            # Sometimes the last request needs to be sent several times to complete the task
-            if play_time - last_log_time >= wait_time or play_time == duration:
-
-                passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration,
-                                                        int(play_time), _type, headers=headers)
-
-                if state == 403:
-                    if forbidden_retry >= max_forbidden_retry:
-                        logger.warning("403重试失败, 跳过当前任务")
-                        return StudyResult.FORBIDDEN
-                    forbidden_retry += 1
-                    logger.warning(
-                        "出现403报错, 正在尝试刷新会话状态 (第{}次)",
-                        forbidden_retry,
-                    )
-                    time.sleep(random.uniform(2, 4))
-                    refreshed_meta = self._recover_after_forbidden(_session, _job, _type)
-                    if refreshed_meta:
-                        # FIXME: Maybe it should be considered an error if those keys aren't present in the refreshed meta, so we perhaps shouldn't use get()
-                        _dtoken = refreshed_meta.get("dtoken", _dtoken)
-                        _duration = refreshed_meta.get("duration", duration)
-                        play_time = refreshed_meta.get("playTime", play_time)
-
-                        logger.debug("Refreshed token: {}, duration: {}, play time: {}", _dtoken, _duration, play_time)
-                        continue
-
-                elif not passed and state != 200:
-                    return StudyResult.ERROR
-
-
-
-
-                wait_time = int(random.uniform(30, 90))
-                last_log_time = play_time
-
-            dt = (time.time() - last_iter) * _speed # Since uploading the progress takes time, we assume that the video is still playing in the background, so manually calculate the time elapsed is required
-            last_iter = time.time()
-            play_time = min(duration, play_time+dt)
-
-            pbar.n = int(play_time)
-            pbar.refresh()
-            time.sleep(gc.THRESHOLD)
-
-        logger.info("任务完成: {}", _job['name'])
-        return StudyResult.SUCCESS
+        except cancel.Cancelled:
+            logger.info(f"收到停止信号，中断任务: {_job['name']}（已播 {int(play_time)}/{duration}s）")
+            raise
+        finally:
+            try:
+                pbar.close()
+            except Exception:  # noqa: BLE001  进度条关闭失败不影响主流程
+                pass
 
     def study_document(self, _course, _job) -> StudyResult:
         """
@@ -621,8 +720,16 @@ class Chaoxing:
 
     def study_work(self, _course, _job, _job_info) -> StudyResult:
         # FIXME: 这一块可以单独搞一个类出来了，方法里面又套方法，每一次调用都会创建新的方法，十分浪费
+        # 题库停用（provider 留空 / 未配置）= 不答作业；本地题库只做加速层，不单独启用，
+        # 避免「没收录的题随机作答并提交」把作业做烂。
         if self.tiku.DISABLE or not self.tiku:
             return StudyResult.SUCCESS
+        # 本地题库按课程存放（同一门课的题目和答案对所有账号都一样）：
+        # 查询时优先查这门课的文件，入库也写进这门课的文件
+        local_bank.set_scope(
+            course=str(_course.get("title") or "") if isinstance(_course, dict) else "",
+            course_id=str(_course.get("courseId") or "") if isinstance(_course, dict) else "",
+        )
         _ORIGIN_HTML_CONTENT = ""  # 用于配合输出网页源码, 帮助修复#391错误
 
         def random_answer(options: str) -> str:
@@ -781,30 +888,13 @@ class Chaoxing:
         # 学习通这里根据参数差异能重定向至两个不同接口, 需要定向至https://mooc1.chaoxing.com/mooc-ans/workHandle/handle
         _session = SessionManager.get_session()
 
-        _url = "https://mooc1.chaoxing.com/mooc-ans/api/work"
+        _url = work_verify.WORK_URL
+        # 抓题、提交后核验、采集已完成作业共用同一组参数（见 api.work_verify.build_work_params）
+        work_params = work_verify.build_work_params(_course, _job, _job_info)
 
         @with_retry(max_retries=3, delay=1)
         def fetch_response():
-            return _session.get(
-                _url,
-                params={
-                    "api": "1",
-                    "workId": _job["jobid"].replace("work-", ""),
-                    "jobid": _job["jobid"],
-                    "originJobId": _job["jobid"],
-                    "needRedirect": "true",
-                    "skipHeader": "true",
-                    "knowledgeid": str(_job_info["knowledgeid"]),
-                    "ktoken": _job_info["ktoken"],
-                    "cpi": _job_info["cpi"],
-                    "ut": "s",
-                    "clazzId": _course["clazzId"],
-                    "type": "",
-                    "enc": _job["enc"],
-                    "mooc2": "1",
-                    "courseid": _course["courseId"],
-                }
-            )
+            return _session.get(_url, params=work_params)
 
         final_resp = {}
         questions = {}
@@ -820,6 +910,8 @@ class Chaoxing:
         # 搜题
         total_questions = len(questions["questions"])
         found_answers = 0
+        # 本次的作答明细，提交成功后交给本地题库（判对存本次答案，判错存平台正确答案）
+        submitted: list[dict] = []
         # 大模型类题库（AI / DeepSeek / SiliconFlow）：整个任务只在这里做一次可用性检查，
         # 连不通则本题及后续题目直接随机作答，不再逐题请求大模型（见 Tiku.ensure_available）。
         _ensure = getattr(self.tiku, "ensure_available", None)
@@ -829,6 +921,8 @@ class Chaoxing:
                 f"（如需恢复：修正配置后在「设置」里保存一次）: {getattr(self.tiku, 'name', '题库')}"
             )
         for q in questions["questions"]:
+            # 停止时不再逐题作答：作业还没提交，中断是安全的（不会留下半份提交）
+            cancel.check()
             logger.debug(f"当前题目信息 -> {q}")
             # 添加搜题延迟 #428 - 默认0s延迟
             query_delay = self.kwargs.get("query_delay", 0)
@@ -887,6 +981,13 @@ class Chaoxing:
             # 填充答案
             q["answerField"][f'answer{q["id"]}'] = answer
             logger.info(f'{q["title"]} 填写答案为 {answer}')
+            submitted.append({
+                "qid": q["id"],
+                "title": q["title"],
+                "type": q["type"],
+                "options": q["options"],
+                "answer": answer,
+            })
         cover_rate = (found_answers / total_questions) * 100
         logger.info(f"章节检测题库覆盖率： {cover_rate:.0f}%")
         # 提交模式  现在与题库绑定,留空直接提交, 1保存但不提交
@@ -971,7 +1072,50 @@ class Chaoxing:
         # 真正提交成功后重置回退计数，使后续章节仍按覆盖率阈值判断
         if questions["pyFlag"] == "":
             self.rollback_times = 0
+            # 提交成功后只补「题库里还没有正确答案」的题：判对存本次答案、
+            # 判错但拿得到正确答案的存正确答案（写进 <课程>.json，重做/换账号直接用）
+            self._learn_work_answers(_course, submitted, work_params)
         return StudyResult.SUCCESS
+
+    def _learn_work_answers(self, course, submitted: list, work_params: dict) -> None:
+        """按平台判分结果同步本地题库（补缺失 + 纠正答错的题）。
+
+        口径：
+          1. 本地题库关闭，或 ``local_bank_verify=false``（不做核验）-> 什么都不做；
+          2. **核验整份作业**：只有核验才能发现「用题库答案作答但被判错」的题，
+             所以不能再用「库里已有答案」的题集做短路；
+          3. 判对 -> 收录本次答案；判错但页面给了「正确答案」-> 收录正确答案；
+          4. 库里已有答案且与平台一致 -> 跳过（不重复写）；
+             与平台不一致 -> **覆写纠正**（这就是题库答错后的自愈路径）；
+          5. 判错且拿不到正确答案 -> 不写（不知道对的是什么，绝不猜）。
+
+        题库只存正确答案，写入位置：``<题库根>/<课程>.json``（全账号共享）。
+        """
+        try:
+            bank = local_bank.get_bank()
+            if not bank.usable or not bank.verify or not submitted:
+                return
+            title = str(course.get("title") or "") if isinstance(course, dict) else ""
+            course_id = str(course.get("courseId") or "") if isinstance(course, dict) else ""
+            known = bank.known(submitted, title, course_id)
+            verdicts = work_verify.verify_work(SessionManager.get_session(), work_params) or None
+            if not verdicts:
+                logger.info("未取到判分信息，本次不更新本地题库（不猜答案）")
+                return
+            learner = getattr(self.tiku, "learn_work_answers", None)
+            if not callable(learner):
+                return
+            try:
+                learned = learner(submitted, verdicts, course=title, course_id=course_id)
+            except TypeError:          # 兼容外部自定义题库没跟进新签名
+                learned = learner(submitted, verdicts, course=title)
+            if learned:
+                logger.info(f"本地题库写入 {learned} 题正确答案"
+                            f"（题库原有 {known} 题命中，共 {bank.stats().get('total', 0)} 题）")
+            else:
+                logger.info("本次没有可写入的正确答案（判错且页面未公布答案）")
+        except Exception as exc:  # noqa: BLE001 - 入库失败绝不能中断刷课
+            logger.error(f"本地题库入库流程异常：{type(exc).__name__}: {exc}")
 
     def study_read(self, _course, _job, _job_info) -> StudyResult:
         """

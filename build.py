@@ -225,9 +225,27 @@ def _force_utf8_stdio() -> None:
                 pass
 
 
+def _ensure_tkinter() -> None:
+    """构建需要可用的 tkinter（GUI 运行时依赖）。
+
+    系统 Python 3.13 在部分环境 tkinter 损坏，PyInstaller 会静默把它排除出 exe，
+    导致打出的程序在导入 gui.app 时崩溃。这里提前显式报错，避免产出坏包。
+    """
+    try:
+        import tkinter  # noqa: F401
+    except Exception as exc:  # 多为 ImportError
+        raise SystemExit(
+            "当前 Python 缺少可用的 tkinter，无法构建 GUI 程序。\n"
+            "请使用项目自带的 .venv-build 环境（Python 3.12，自带 tkinter）执行构建：\n"
+            "    .venv-build\\Scripts\\python.exe build.py\n"
+            f"原始错误：{exc}"
+        )
+
+
 def main() -> None:
     root = os.path.dirname(os.path.abspath(__file__))
     _force_utf8_stdio()
+    _ensure_tkinter()
     print(f"VERSION={VERSION} (from {VERSION_FILE})")
     print(f"PRERELEASE={str(is_prerelease(VERSION)).lower()}")
     exe = build_exe(root, clean="--clean" in sys.argv)

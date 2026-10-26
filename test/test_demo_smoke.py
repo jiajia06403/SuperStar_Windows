@@ -38,7 +38,7 @@ def test_demo_full_run():
     eng.cache.mark_done(uid, cid, str(points_before[1]["id"]))
 
     finished = []
-    eng.on(eng.FINISHED, lambda: finished.append(1))
+    eng.on(eng.FINISHED, lambda _stopped=False: finished.append(1))
 
     eng.start_study([first], speed=1.0, jobs=1)
     for _ in range(200):

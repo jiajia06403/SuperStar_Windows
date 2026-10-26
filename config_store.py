@@ -37,11 +37,13 @@ USER_HEADER = [
     "; 要改配置请改本文件；改 config_win.ini 是无效的（下次升级必被覆盖）。",
 ]
 
-# 取值校验规则（只对 [tiku] 生效；空值一律视为合法）
+# 取值校验规则（只对 [tiku] / [common] 生效；空值一律视为合法）
 TIKU_FLOAT_KEYS = ("cover_rate", "delay", "min_interval_seconds")
 TIKU_INT_KEYS = ("work_retry", "likeapi_retry_times")
-TIKU_BOOL_KEYS = ("submit", "ignore_api_key", "likeapi_search", "likeapi_vision", "likeapi_retry")
+TIKU_BOOL_KEYS = ("submit", "ignore_api_key", "likeapi_search", "likeapi_vision", "likeapi_retry",
+                  "local_bank", "local_bank_verify")
 TIKU_PROVIDERS = ("", "TikuYanxi", "TikuLike", "TikuAdapter", "AI", "DeepSeek", "SiliconFlow")
+COMMON_INT_KEYS = ("video_log_interval",)
 
 _SECTION_RE = re.compile(r"^\s*\[(?P<name>[^\]]+)\]\s*$")
 _KV_RE = re.compile(r"^\s*(?P<key>[^#;=\s][^=]*?)\s*=(?P<rest>.*)$")
@@ -205,9 +207,15 @@ def _has_key(lines: "list[str]", section: str, key: str) -> bool:
 # --------------------------------------------------------------------------- #
 def _invalid(section: str, key: str, value: str) -> bool:
     """取值是否非法（空值一律合法，用于「留空即停用」）。"""
-    if section != "tiku" or not value.strip():
+    if not value.strip():
         return False
     value = value.strip()
+    if section == "common":
+        if key in COMMON_INT_KEYS:
+            return not re.fullmatch(r"\d+", value)
+        return False
+    if section != "tiku":
+        return False
     if key in TIKU_FLOAT_KEYS:
         try:
             float(value)

@@ -413,6 +413,47 @@ def decode_questions_info(html_content: str) -> Dict[str, Any]:
     return form_data
 
 
+
+def decode_work_questions(html_text: str) -> Dict[str, Any]:
+    """解析「作业页」上的题目（不依赖 form，成绩页/已提交页同样适用）。
+
+    ``decode_questions_info`` 需要 ``<form>`` 与答案输入框，已提交的作业页往往没有，
+    采集已完成作业的答案时用这个更稳。题干与选项复用同一套提取函数
+    （含字体加密解密），保证与作答时的指纹算出来的串一致。
+
+    Returns:
+        ``{qid: {"qid", "title", "type", "options"}}``
+    """
+    result: Dict[str, Any] = {}
+    try:
+        soup = BeautifulSoup(html_text, "lxml")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"作业页解析失败：{exc}")
+        return result
+
+    font_decoder = FontDecoder(html_text) if soup.find("style", id="cxSecretStyle") else None
+
+    for div_tag in soup.find_all("div", class_="singleQuesId"):
+        qid = str(div_tag.attrs.get("data", "") or "").strip()
+        if not qid:
+            continue
+        timu = div_tag.find("div", class_="TiMu")
+        type_code = str(timu.attrs.get("data", "") or "").strip() if timu else ""
+        title = _extract_title(div_tag.find("div", class_="Zy_TItle"), font_decoder)
+        ul = div_tag.find("ul")
+        options = ""
+        if ul:
+            choices = [_extract_choices(li, font_decoder) for li in ul.find_all("li")]
+            options = "\n".join(sorted(c for c in choices if c))
+        result[qid] = {
+            "qid": qid,
+            "title": str(title or "").strip(),
+            "type": _get_question_type(type_code) if type_code else "unknown",
+            "options": options,
+        }
+    return result
+
+
 def _extract_form_data(soup: BeautifulSoup) -> Dict[str, Any]:
     """从BeautifulSoup对象中提取表单数据"""
     form_data = {}

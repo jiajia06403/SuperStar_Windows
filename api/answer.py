@@ -22,6 +22,7 @@ except ImportError:  # pragma: no cover - 精简发行版不打包该可选依�
     httpx = None
     OpenAI = None
 
+from api import local_bank
 from api.answer_check import *
 from api.logger import logger
 
@@ -29,16 +30,33 @@ from api.logger import logger
 disable_warnings(exceptions.InsecureRequestWarning)
 
 
-def _openai_client(base_url: str, api_key: str, proxy: Optional[str] = None):
-    """构造 OpenAI 客户端（可选依赖，缺失时给出明确提示）。"""
+def _openai_client(base_url: str, api_key: str, proxy: Optional[str] = None,
+                   max_retries: Optional[int] = None):
+    """构造 OpenAI 客户端（可选依赖，缺失时给出明确提示）。
+
+    ``max_retries`` 仅供连通性探测用 0：默认重试 2 次会让「地址填错」的测试按钮等很久。
+    """
     if OpenAI is None or httpx is None:
         raise RuntimeError("AI 题库需要 openai 与 httpx 依赖：pip install openai httpx")
+    kwargs = {"base_url": base_url, "api_key": api_key}
+    if max_retries is not None:
+        kwargs["max_retries"] = max_retries
     if proxy:
-        return OpenAI(http_client=httpx.Client(proxy=proxy), base_url=base_url, api_key=api_key)
-    return OpenAI(base_url=base_url, api_key=api_key)
+        return OpenAI(http_client=httpx.Client(proxy=proxy), **kwargs)
+    return OpenAI(**kwargs)
+
+
+def _short_error(exc: BaseException, limit: int = 110) -> str:
+    """把异常压成一行短提示，供界面直接显示（去掉换行、限制长度）。"""
+    detail = " ".join(str(exc).split())
+    if len(detail) > limit:
+        detail = detail[:limit] + "…"
+    name = type(exc).__name__
+    return f"{name}: {detail}" if detail else name
+
 
 __all__ = ["CacheDAO", "Tiku", "TikuYanxi", "TikuLike", "TikuAdapter", "AI", "DeepSeek",
-           "SiliconFlow"]
+           "SiliconFlow", "test_tiku_connection"]
 
 
 def _normalize_base_url(raw: str) -> str:
@@ -236,12 +254,25 @@ class Tiku:
         # 尝试根据配置文件设置提交模式
         if not self._conf:
             self.config_set(self._get_conf())
+        conf = self._conf or {}
+        # 通用项一律读配置：口令是「题库停用 = 不答题」由调用方（study_work/query）判断，
+        # 这里只负责把 submit / cover_rate / 判断题词表解析出来，缺项时用类默认值，
+        # 避免老配置少了某个键就把整个题库初始化搞崩。
+        try:
+            submit = str(conf.get('submit', 'true') or 'true').strip().lower()
+            self.SUBMIT = submit in ('true', '1', 'yes', 'on')
+            cover = str(conf.get('cover_rate', '') or '').strip()
+            if cover:
+                self.COVER_RATE = float(cover)
+            true_list = str(conf.get('true_list', '') or '正确,对,√,是')
+            false_list = str(conf.get('false_list', '') or '错误,错,×,否')
+            self.true_list = [w.strip() for w in true_list.split(',') if w.strip()]
+            self.false_list = [w.strip() for w in false_list.split(',') if w.strip()]
+        except (TypeError, ValueError):  # noqa: BLE001 - 配置异常时用类默认值，不中断
+            pass
+        # 本地题库按同一份配置初始化/刷新（关闭时既不读也不写）
+        local_bank.configure(conf)
         if not self.DISABLE:
-            # 设置提交模式
-            self.SUBMIT = True if self._conf['submit'] == 'true' else False
-            self.COVER_RATE = float(self._conf['cover_rate'])
-            self.true_list = self._conf['true_list'].split(',')
-            self.false_list = self._conf['false_list'].split(',')
             # 调用自定义题库初始化
             self._init_tiku()
 
@@ -268,14 +299,22 @@ class Tiku:
             return None
         
     def query(self,q_info:dict) -> Optional[str]:
-        if self.DISABLE:
-            return None
-
         # 预处理, 去除【单选题】这样与标题无关的字段
+        # （本地题库的指纹用同一套处理后标题，所以必须放在最前面）
         logger.debug(f"原始标题：{q_info['title']}")
         q_info['title'] = sub(r'^\d+', '', q_info['title'])
         q_info['title'] = sub(r'（\d+\.\d+分）$', '', q_info['title'])
         logger.debug(f"处理后标题：{q_info['title']}")
+
+        # 题库停用（provider 留空 / 未配置）= 不答作业，本地题库也不参与：
+        # 否则纯本地模式下遇到没收录的题会「随机作答并提交」，把作业做烂。
+        if self.DISABLE:
+            return None
+
+        # 本地题库优先：只存平台判过对的答案，命中即用，不消耗任何远程额度
+        local_answer = self._query_local_bank(q_info)
+        if local_answer:
+            return local_answer
 
         # 先过缓存（本地缓存不消耗任何远程额度，大模型不可用时也应继续命中）
         cache_dao = CacheDAO()
@@ -312,7 +351,34 @@ class Tiku:
         self._record_failure()
         return None
 
+    def _query_local_bank(self, q_info: dict) -> Optional[str]:
+        """查本地题库（平台判过对的答案）。关闭 / 未命中 / 异常都返回 None。"""
+        try:
+            bank = local_bank.get_bank()
+            if not bank.usable:
+                return None
+            return bank.lookup(q_info.get('title', ''), q_info.get('type', ''),
+                               q_info.get('options', ''))
+        except Exception as exc:  # noqa: BLE001 - 本地题库异常不能影响正常搜题
+            logger.error(f"本地题库查询异常：{type(exc).__name__}: {exc}")
+            return None
 
+    def learn_work_answers(self, items: list, verdicts=None, course: str = "",
+                           course_id: str = "", **kwargs) -> int:
+        """把平台确认过的正确答案写进本地题库（题库只存正确答案）。
+
+        库里已有的答案与平台一致则不重写；不一致（用题库答案作答被判错）则**覆写纠正**。
+
+        ``items``    : [{"qid", "title", "type", "options", "answer"}]
+        ``verdicts`` : {qid: True/False/{ok, answer, options}}；None 表示没做核验，不入库
+        返回写入条数（新增 + 纠正）；题库关闭时恒为 0。
+        """
+        try:
+            bank = local_bank.get_bank()
+            return bank.learn(items, verdicts, course=course, course_id=course_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"本地题库入库异常：{type(exc).__name__}: {exc}")
+            return 0
 
     def _query(self, q_info:dict) -> Optional[str]:
         """
@@ -348,8 +414,12 @@ class Tiku:
         这是一个专用的方法, 要求配置维护两个选项列表, 一份用于正确选项, 一份用于错误选项, 以应对题库对判断题答案响应的各种可能的情况
         它的作用是将获取到的答案answer与可能的选项列对比并返回对应的布尔值
         """
-        if self.DISABLE:
-            return False
+        # 题库停用时调用方已提前返回，不会走到这里；保留词表兜底，
+        # 避免配置少写 true_list/false_list 时把判断题全判成「错」。
+        if not self.true_list:
+            self.true_list = ['正确', '对', '√', '是']
+        if not self.false_list:
+            self.false_list = ['错误', '错', '×', '否']
         # 对响应的答案作处理
         answer = answer.strip()
         if answer in self.true_list:
@@ -453,6 +523,18 @@ class Tiku:
         """
         return True
 
+    # ---------------- 连通性测试（界面的「测试连通性」按钮） ----------------
+    TEST_TIMEOUT = 15                      # 单次探测超时（秒）
+    TEST_QUESTION = "连通性测试：1+1 等于几？"   # 探测用题目，可能消耗 1 次额度
+
+    def test_connection(self) -> "tuple[bool, str]":
+        """探测当前配置能否正常使用，返回 ``(是否连通, 给用户看的一句话)``。
+
+        只读 ``self._conf``，不依赖 ``init_tiku()``（于是不会改动全局题库状态），
+        因此界面可以拿「尚未保存的界面值」直接测试。子类按各自接口实现。
+        """
+        return False, "该答案提供方式没有可测试的远程服务"
+
 
 # 按照以下模板实现更多题库
 
@@ -505,6 +587,34 @@ class TikuYanxi(Tiku):
 
     def _init_tiku(self):
         self.load_token()
+
+    def test_connection(self):
+        """测试言溪：带 TOKEN 发一次真实查询（会消耗少量次数）。"""
+        tokens = str((self._conf or {}).get('tokens', '') or '')
+        token = tokens.split(',')[0].strip() if tokens else ''
+        if not token:
+            return False, "未填写 TOKEN"
+        try:
+            res = requests.get(
+                self.api,
+                params={'question': self.TEST_QUESTION, 'token': token},
+                verify=False,
+                timeout=self.TEST_TIMEOUT,
+            )
+        except Exception as exc:  # noqa: BLE001 - 探测失败只需一句提示
+            return False, "请求失败 · " + _short_error(exc)
+        if res.status_code != 200:
+            return False, f"HTTP {res.status_code} · {res.text[:60]}"
+        try:
+            data = res.json()
+        except ValueError:
+            return False, "响应不是合法 JSON（地址可能不对）"
+        if data.get('code'):
+            times = (data.get('data') or {}).get('times')
+            tail = f"，剩余 {times} 次" if times not in (None, '') else ""
+            return True, f"连接正常{tail}"
+        msg = str(data.get('message') or data.get('msg') or '').strip()
+        return False, msg or "TOKEN 无效或查询次数不足"
 
 class TikuLike(Tiku):
     # LIKE知识库实现 参考 https://www.datam.site/
@@ -828,6 +938,34 @@ class TikuLike(Tiku):
             logger.error(f'{self.name}初始化失败: 未加载任何有效的Token')
             self.DISABLE = True
 
+    def test_connection(self):
+        """测试 LIKE：查第一个 TOKEN 的余额接口（只读，不消耗查询次数）。"""
+        tokens = [t.strip() for t in
+                  str((self._conf or {}).get('tokens', '') or '').split(',') if t.strip()]
+        if not tokens:
+            return False, "未填写 TOKEN"
+        token = tokens[0]
+        try:
+            res = requests.get(
+                self.balance_api,
+                headers={**self._headers, 'Authorization': f'Bearer {token}'},
+                verify=False,
+                timeout=self.TEST_TIMEOUT,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return False, "请求失败 · " + _short_error(exc)
+        if res.status_code == 401:
+            return False, "TOKEN 无效或已过期"
+        if res.status_code != 200:
+            return False, f"HTTP {res.status_code} · {res.text[:60]}"
+        try:
+            balance = int(res.json().get('balance', 0))
+        except (ValueError, AttributeError, TypeError):
+            return True, "连接正常（余额未知）"
+        if balance > 0:
+            return True, f"连接正常，剩余 {balance} 次"
+        return True, "连接正常，但该 TOKEN 余额为 0"
+
 class TikuAdapter(Tiku):
     # TikuAdapter题库实现 https://github.com/DokiDoki1103/tikuAdapter
     def __init__(self) -> None:
@@ -876,10 +1014,40 @@ class TikuAdapter(Tiku):
         # self.load_token()
         self.api = self._conf['url']
 
+    def test_connection(self):
+        """测试 TikuAdapter：向服务地址发一次探测查询，只看能否正常响应。"""
+        url = str((self._conf or {}).get('url', '') or '').strip()
+        if not url:
+            return False, "未填写服务地址"
+        try:
+            res = requests.post(
+                url,
+                json={'question': self.TEST_QUESTION, 'options': ['1', '2'], 'type': 0},
+                verify=False,
+                timeout=self.TEST_TIMEOUT,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return False, "请求失败 · " + _short_error(exc)
+        if res.status_code != 200:
+            return False, f"HTTP {res.status_code} · {res.text[:60]}"
+        try:
+            res.json()
+        except ValueError:
+            return False, "响应不是合法 JSON（地址可能不对）"
+        return True, "连接正常"
+
 class AI(Tiku):
     # AI大模型答题实现（OpenAI 兼容端点，例如 DeepSeek 官方 / 自建 Ollama）
     LLM_PROVIDER = True
     ALLOW_EMPTY_KEY = True      # 自建端点不需要鉴权时，配置里 ignore_api_key=true 放行
+    # 配置键与默认值；DeepSeek 子类只改这几个类属性即可复用整套请求/探测逻辑
+    ENDPOINT_FIELD = "endpoint"
+    KEY_FIELD = "key"
+    MODEL_FIELD = "model"
+    KEY_LABEL = "AI 端点"
+    DEFAULT_ENDPOINT = ""
+    DEFAULT_MODEL = ""
+    LEGACY_SILICONFLOW_FALLBACK = True   # 老配置只填过 siliconflow_* 时切到 AI 仍可用
     # 各题型的系统提示词：要求输出 {"Answer": [...]} 的纯 JSON
     SYSTEM_PROMPTS = {
         "single": "本题为单选题，你只能选择一个选项，请根据题目和选项回答问题，以json格式输出正确的选项内容，示例回答：{\"Answer\": [\"答案\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料",
@@ -939,53 +1107,59 @@ class AI(Tiku):
             logger.error(f"无法解析大模型输出内容：{e}\n{content}")
             return None
 
-    def _init_tiku(self):
-        # 与 SiliconFlow 共用回退键：优先读 AI 专用键，缺失时回落到 siliconflow_* 键，
-        # 避免老用户只填过 siliconflow_* 时切到 AI 直接不可用。
-        self.endpoint = _normalize_base_url(
-            self._conf.get('endpoint') or self._conf.get('siliconflow_endpoint', '')
+    def _conf_params(self) -> tuple:
+        """从配置解析 ``(endpoint, key, model, proxy)``，供初始化与连通性测试共用。"""
+        conf = self._conf or {}
+        legacy = conf if self.LEGACY_SILICONFLOW_FALLBACK else {}
+        endpoint = _normalize_base_url(
+            conf.get(self.ENDPOINT_FIELD) or legacy.get('siliconflow_endpoint') or self.DEFAULT_ENDPOINT
         )
-        self.key = self._conf.get('key') or self._conf.get('siliconflow_key', '')
-        self.model = self._conf.get('model') or self._conf.get('siliconflow_model', '')
-        self.http_proxy = self._conf.get('http_proxy', '')
+        key = conf.get(self.KEY_FIELD) or legacy.get('siliconflow_key', '')
+        model = conf.get(self.MODEL_FIELD) or legacy.get('siliconflow_model') or self.DEFAULT_MODEL
+        return endpoint, str(key or ''), str(model or ''), conf.get('http_proxy', '')
+
+    def _init_tiku(self):
+        self.endpoint, self.key, self.model, self.http_proxy = self._conf_params()
         try:
             self.min_interval_seconds = float(self._conf.get('min_interval_seconds', 3) or 3)
         except (TypeError, ValueError):
             self.min_interval_seconds = 3.0
         # 未配置 Key 时立即停用（不发起任何请求）；自建端点可显式勾选忽略 Key
-        self._require_api_key(self.key, "AI 端点")
+        self._require_api_key(self.key, self.KEY_LABEL)
+
+    def test_connection(self):
+        """测试大模型端点：发一条最小请求，看是否真能拿到回复。"""
+        endpoint, key, model, proxy = self._conf_params()
+        if not endpoint:
+            return False, "未填写接口地址"
+        if not model:
+            return False, "未填写模型"
+        if not key and not (self.ALLOW_EMPTY_KEY and self._conf_truthy(self.EMPTY_KEY_OPTION)):
+            return False, "未填写 API Key"
+        try:
+            client = _openai_client(endpoint, key, proxy, max_retries=0)
+            completion = client.chat.completions.create(
+                model=model,
+                messages=[{'role': 'user', 'content': '你好，请回答：1+1 等于几？只回答数字。'}],
+                max_tokens=10,
+                timeout=self.TEST_TIMEOUT,
+            )
+            content = (completion.choices[0].message.content or '').strip()
+        except Exception as exc:  # noqa: BLE001 - 探测失败只回一句提示
+            return False, _short_error(exc)
+        if not content:
+            return False, "端点已响应，但内容为空（检查模型名是否存在）"
+        return True, f"连接正常（{model} 回复 {content[:12]}）"
 
     def check_llm_connection(self) -> bool:
-        """
-        检查大模型连接是否可用
-        发送一个简单的测试请求来验证 API 配置
-        """
+        """刷课开始前的可用性检查：复用界面的同一套探测逻辑。"""
         logger.info(f'正在检查 {self.name} 连接...')
-        try:
-            client = _openai_client(self.endpoint, self.key, self.http_proxy)
-            
-            # 发送一个简单的测试请求
-            completion = client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {
-                        'role': 'user',
-                        'content': '你好，请回答：1+1 等于几？只回答数字。'
-                    }
-                ],
-                max_tokens=10
-            )
-            
-            if completion.choices and completion.choices[0].message.content:
-                logger.info(f'{self.name} 连接检查成功')
-                return True
-            else:
-                logger.error(f'{self.name} 连接检查失败：未收到响应')
-                return False
-                
-        except Exception as e:
-            logger.error(f'{self.name} 连接检查失败：{e}')
-            return False
+        ok, msg = self.test_connection()
+        if ok:
+            logger.info(f'{self.name} 连接检查成功：{msg}')
+        else:
+            logger.error(f'{self.name} 连接检查失败：{msg}')
+        return ok
 
 
 class SiliconFlow(Tiku):
@@ -1085,54 +1259,53 @@ class SiliconFlow(Tiku):
         self._require_api_key(self.api_key, "硅基流动")
 
     def check_llm_connection(self) -> bool:
-        """
-        检查硅基流动大模型连接是否可用
-        发送一个简单的测试请求来验证 API 配置
-        """
+        """刷课开始前的可用性检查：复用界面的同一套探测逻辑。"""
         logger.info(f'正在检查 {self.name} 连接...')
+        ok, msg = self.test_connection()
+        if ok:
+            logger.info(f'{self.name} 连接检查成功：{msg}')
+        else:
+            logger.error(f'{self.name} 连接检查失败：{msg}')
+        return ok
+
+    def test_connection(self):
+        """测试硅基流动：POST 一条最小请求（地址需是 .../chat/completions 完整地址）。"""
+        conf = self._conf or {}
+        endpoint = str(conf.get('siliconflow_endpoint', '') or '').strip() \
+            or 'https://api.siliconflow.cn/v1/chat/completions'
+        key = str(conf.get('siliconflow_key', '') or '').strip()
+        model = str(conf.get('siliconflow_model', '') or '').strip() or 'deepseek-ai/DeepSeek-V3'
+        if not key:
+            return False, "未填写 API Key"
+        payload = {
+            'model': model,
+            'messages': [{'role': 'user', 'content': '你好，请回答：1+1 等于几？只回答数字。'}],
+            'stream': False,
+            'max_tokens': 10,
+            'temperature': 0.7,
+            'top_p': 0.7,
+            'response_format': {'type': 'text'},
+        }
         try:
-            headers = {
-                'Authorization': f'Bearer {self.api_key}',
-                'Content-Type': 'application/json'
-            }
-            
-            payload = {
-                'model': self.model_name,
-                'messages': [
-                    {
-                        'role': 'user',
-                        'content': '你好，请回答：1+1 等于几？只回答数字。'
-                    }
-                ],
-                'stream': False,
-                'max_tokens': 10,
-                'temperature': 0.7,
-                'top_p': 0.7,
-                'response_format': {'type': 'text'}
-            }
-            
-            response = requests.post(
-                self.api_endpoint,
-                headers=headers,
+            res = requests.post(
+                endpoint,
+                headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'},
                 json=payload,
-                timeout=30
+                timeout=self.TEST_TIMEOUT,
             )
-            
-            if response.status_code == 200:
-                result = response.json()
-                if result.get('choices') and result['choices'][0]['message']['content']:
-                    logger.info(f'{self.name} 连接检查成功')
-                    return True
-                else:
-                    logger.error(f'{self.name} 连接检查失败：未收到有效响应')
-                    return False
-            else:
-                logger.error(f'{self.name} 连接检查失败：{response.status_code} {response.text}')
-                return False
-                
-        except Exception as e:
-            logger.error(f'{self.name} 连接检查失败：{e}')
-            return False
+        except Exception as exc:  # noqa: BLE001
+            return False, "请求失败 · " + _short_error(exc)
+        if res.status_code == 401:
+            return False, "API Key 无效或已过期"
+        if res.status_code != 200:
+            return False, f"HTTP {res.status_code} · {res.text[:60]}"
+        try:
+            content = str(res.json()['choices'][0]['message']['content'] or '').strip()
+        except (ValueError, KeyError, IndexError, TypeError):
+            return False, "响应格式不符（地址需为 .../v1/chat/completions）"
+        if not content:
+            return False, "端点已响应，但内容为空（检查模型名是否存在）"
+        return True, f"连接正常（{model} 回复 {content[:12]}）"
 
 
 class DeepSeek(AI):
@@ -1143,22 +1316,39 @@ class DeepSeek(AI):
     这样界面上 AI / DeepSeek / SiliconFlow 三种方式可以各存各的配置与默认值。
     """
     ALLOW_EMPTY_KEY = False     # DeepSeek 官方必须带 Key
+    ENDPOINT_FIELD = "deepseek_endpoint"
+    KEY_FIELD = "deepseek_key"
+    MODEL_FIELD = "deepseek_model"
+    KEY_LABEL = "DeepSeek 端点"
     DEFAULT_ENDPOINT = "https://api.deepseek.com/v1"
     DEFAULT_MODEL = "deepseek-chat"
+    LEGACY_SILICONFLOW_FALLBACK = False   # 用官方专用键，不吃 siliconflow_* 回退
 
     def __init__(self) -> None:
         super().__init__()
         self.name = 'DeepSeek大模型'
 
-    def _init_tiku(self):
-        self.endpoint = _normalize_base_url(
-            self._conf.get('deepseek_endpoint') or self.DEFAULT_ENDPOINT
-        )
-        self.key = self._conf.get('deepseek_key', '')
-        self.model = self._conf.get('deepseek_model') or self.DEFAULT_MODEL
-        self.http_proxy = self._conf.get('http_proxy', '')
-        try:
-            self.min_interval_seconds = float(self._conf.get('min_interval_seconds', 3) or 3)
-        except (TypeError, ValueError):
-            self.min_interval_seconds = 3.0
-        self._require_api_key(self.key, "DeepSeek 端点")
+
+# --------------------------------------------------------------------------- #
+# 连通性测试入口（界面「测试连通性」按钮用）
+# --------------------------------------------------------------------------- #
+def test_tiku_connection(conf) -> "tuple[bool, str]":
+    """按给定的 ``[tiku]`` 配置做一次连通性探测，返回 ``(是否连通, 一句话说明)``。
+
+    只用传入的配置构造题库对象，**不落盘、不调用 init_tiku()**：
+    界面因此可以测试「尚未保存的界面值」，也不会把正在运行的任务的题库状态改掉。
+    """
+    conf = dict(conf or {})
+    name = str(conf.get('provider', '') or '').strip()
+    if not name:
+        return False, "未选择答案提供方式（题库已停用）"
+    cls = globals().get(name)
+    if not isinstance(cls, type) or not issubclass(cls, Tiku):
+        return False, f"未知的答案提供方式：{name}"
+    try:
+        tiku = cls()
+        tiku.config_set(conf)
+        return tiku.test_connection()
+    except Exception as exc:  # noqa: BLE001 - 探测异常也要变成可读提示，不能崩界面
+        return False, _short_error(exc)
+
