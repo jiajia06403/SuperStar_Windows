@@ -23,10 +23,44 @@
 不 POST、不保存草稿，随时可中断。
 """
 import argparse
+import json
+import os
+import re
 import time
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from api import local_bank, work_verify
+
+# 每门课最多转储几份「认不出的页面」——够定位问题，又不会把磁盘塞满
+_DUMP_LIMIT = 3
+_DUMP_DIRNAME = "collect_debug"
+
+
+def _dump_page(params: Dict[str, Any], text: str, stats: dict, reason: str) -> str:
+    """把认不出的作业页原样存到 ``progress_cache/collect_debug``，返回路径。
+
+    页面结构是超星那边改的，靠猜没用：留一份原始 HTML，用户反馈时能直接定位。
+    写盘失败不影响采集。
+    """
+    if int(stats.get("dumps") or 0) >= _DUMP_LIMIT:
+        return ""
+    try:
+        from paths import data_path
+        folder = data_path(_DUMP_DIRNAME)
+        os.makedirs(folder, exist_ok=True)
+        jobid = str(params.get("jobid") or "work").replace("work-", "")[:16]
+        safe_reason = re.sub(r"[^\w\u4e00-\u9fa5]+", "_", reason)[:20] or "unknown"
+        stamp = time.strftime("%m%d-%H%M%S")
+        base = os.path.join(folder, f"{stamp}_{jobid}_{safe_reason}")
+        with open(base + ".html", "w", encoding="utf-8", errors="replace") as fp:
+            fp.write(text or "")
+        with open(base + ".json", "w", encoding="utf-8") as fp:
+            json.dump({"params": params, "reason": reason,
+                       "length": len(text or "")}, fp, ensure_ascii=False, indent=2)
+        stats["dumps"] = int(stats.get("dumps") or 0) + 1
+        return base + ".html"
+    except Exception:  # noqa: BLE001  转储失败不该影响采集
+        return ""
 
 
 def _limit(chaoxing: Any) -> None:
@@ -70,6 +104,7 @@ def _collect_work(session, chaoxing, course: Dict[str, Any], job: dict,
 
     if getattr(resp, "status_code", 0) != 200:
         stats["unreadable"] += 1
+        stats["bad_status"] = int(stats.get("bad_status") or 0) + 1
         emit(kind="log", message=f"【采集】作业页返回 {getattr(resp, 'status_code', '?')}，已跳过")
         return
 
@@ -77,8 +112,26 @@ def _collect_work(session, chaoxing, course: Dict[str, Any], job: dict,
     questions = work_verify.parse_questions(text)
     verdicts = work_verify.parse_verdicts(text)
     if not questions or not verdicts:
-        # 未批阅 / 作业已关闭 / 页面结构不认识 —— 一律跳过，不猜
+        # 没交过 / 交了没批阅 / 已关闭 / 结构不认识 —— 一律跳过，不猜
         stats["unreadable"] += 1
+        state = work_verify.page_state(text, bool(questions), bool(verdicts))
+        if state == work_verify.STATE_CLOSED:
+            key, reason = "closed", "作业已结束（老师已关闭或已过期），没有答案可采"
+        elif not questions:
+            key, reason = "no_questions", "没读到题目"
+        elif state == work_verify.STATE_UNSUBMITTED:
+            key, reason = "unsubmitted", "作业还没提交，没有答案可采"
+        elif state == work_verify.STATE_UNGRADED:
+            key, reason = "ungraded", "已提交但平台还没批阅/没公布答案"
+        else:
+            key, reason = "no_verdicts", "页面里没有对错或正确答案"
+        stats[key] = int(stats.get(key) or 0) + 1
+        # 结构不认识才需要留原始页面；未提交/未批阅/已关闭都是正常情况，不刷日志不写盘
+        dumped = "" if key in ("unsubmitted", "ungraded", "closed") \
+            else _dump_page(params, text, stats, reason)
+        detail = f"，原始页面已存到 {dumped}" if dumped else ""
+        emit(kind="log",
+             message=f"【采集】作业 {job.get('jobid', '')}：{reason}，已跳过{detail}")
         return
 
     mine = work_verify.parse_my_answers(text)
@@ -96,6 +149,11 @@ def _collect_work(session, chaoxing, course: Dict[str, Any], job: dict,
         })
     if not items:
         stats["unreadable"] += 1
+        stats["no_title"] = int(stats.get("no_title") or 0) + 1
+        dumped = _dump_page(params, text, stats, "题干读不出来")
+        detail = f"，原始页面已存到 {dumped}" if dumped else ""
+        emit(kind="log",
+             message=f"【采集】作业 {job.get('jobid', '')}：读到 {len(questions)} 题但题干全为空，已跳过{detail}")
         return
 
     # 全量交给 learn：与页面一致的不重写，不一致的覆写纠正（题库里答错的题会被修好）
@@ -104,9 +162,15 @@ def _collect_work(session, chaoxing, course: Dict[str, Any], job: dict,
     stats["read"] += 1
     stats["questions"] += len(items)
     stats["learned"] += learned
+    stats["known"] = int(stats.get("known") or 0) + known
+    # 既没写进库、也不是「库里已有」的，就是平台没判对也没公布正确答案的题
+    undecided = max(0, len(items) - learned - known)
+    stats["undecided"] = int(stats.get("undecided") or 0) + undecided
     stats["skipped"] = int(stats.get("skipped") or 0) + max(0, len(items) - learned)
     detail = f"，写入 {learned} 题" if learned else ""
     detail += f"，{known} 题此前已有答案" if known else ""
+    if undecided:
+        detail += f"，{undecided} 题平台没判对也没给正确答案"
     emit(kind="log",
          message=f"【采集】作业 {job.get('jobid', '')}：读 {len(items)} 题{detail}")
     emit(kind="progress", message="", done=stats["works"], total=stats.get("works_total") or 0)
@@ -135,6 +199,7 @@ def collect_course(chaoxing: Any, course: Dict[str, Any],
         "course_id": str(course.get("courseId") or ""),
         "points": 0, "works": 0, "works_total": 0, "read": 0,
         "questions": 0, "learned": 0, "unreadable": 0, "skipped": 0,
+        "known": 0, "undecided": 0,
         "errors": 0, "stopped": False,
     }
     bank = local_bank.get_bank()
@@ -201,16 +266,28 @@ def collect_course(chaoxing: Any, course: Dict[str, Any],
              done=index, total=len(points))
 
     total = bank.stats().get("total", 0)
+    parts = [f"读 {stats['read']} 份作业"]
     if stats["learned"]:
-        emit(kind="log",
-             message=f"【采集】{course_title} 完成：读 {stats['read']} 份作业，"
-                     f"写入 {stats['learned']} 题（跳过 {stats['skipped']} 题，"
-                     f"题库共 {total} 题）")
-    else:
-        emit(kind="log",
-             message=f"【采集】{course_title} 完成：没有需要写入的答案"
-                     f"（读 {stats['read']} 份 / 跳过 {stats['skipped']} 题 / "
-                     f"无法识别 {stats['unreadable']} 份，题库共 {total} 题）")
+        parts.append(f"新增/纠正 {stats['learned']} 题")
+    if int(stats.get("known") or 0):
+        parts.append(f"题库已有 {stats['known']} 题")
+    if int(stats.get("undecided") or 0):
+        parts.append(f"平台未给答案 {stats['undecided']} 题")
+    skips = []
+    for key, label in (("unsubmitted", "未提交"),
+                       ("ungraded", "未批阅/未公布答案"),
+                       ("closed", "已结束"),
+                       ("no_questions", "没读到题目"),
+                       ("no_verdicts", "没有对错或正确答案"),
+                       ("no_title", "题干为空"),
+                       ("bad_status", "状态码异常")):
+        count = int(stats.get(key) or 0)
+        if count:
+            skips.append(f"{label} {count} 份")
+    if skips:
+        parts.append("跳过：" + "、".join(skips))
+    parts.append(f"题库共 {total} 题")
+    emit(kind="log", message=f"【采集】{course_title} 完成：" + "，".join(parts))
     return stats
 
 

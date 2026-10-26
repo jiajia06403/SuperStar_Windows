@@ -21,6 +21,9 @@ config_user.ini
 .ruff_cache/
 .coverage
 
+# 归档探针的抓取产物（真实页面 HTML/JSON，含账号数据，仅本机对照，不入库）
+test/archive/probes/_out/
+
 # ---------- PyInstaller build output ----------
 build/
 dist/

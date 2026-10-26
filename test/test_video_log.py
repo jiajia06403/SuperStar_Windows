@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# layer: slow  # core=默认必跑 / gui=真窗口 / slow=仅 --all
 """视频状态日志测试（无需账号/网络）。
 
 覆盖：
@@ -178,6 +179,58 @@ def test_study_video_silent_when_disabled():
 
 
 # --------------------------------------------------------------------------- #
+# playTime 单位归一（部分卡片返回毫秒）
+# --------------------------------------------------------------------------- #
+def test_normalize_play_time_units():
+    """秒/毫秒两种单位都要认，脏数据归零而不是当成「已看完」。"""
+    assert base._normalize_play_time("123", 600) == 123       # 秒
+    assert base._normalize_play_time(123, 600) == 123
+    # 实测：1252s 的视频卡片报 playTime=75000（= 75s 的毫秒值）
+    assert base._normalize_play_time("75000", 1252) == 75
+    assert base._normalize_play_time(75000, 1252) == 75
+    # 毫秒单位下已看完
+    assert base._normalize_play_time("1252000", 1252) == 1252
+    # 服务端取整略超时长，按看完处理
+    assert base._normalize_play_time("1254", 1252) == 1252
+    # 脏数据绝不误判完成
+    assert base._normalize_play_time("99999999", 100) == 0
+    assert base._normalize_play_time(None, 100) == 0
+    assert base._normalize_play_time("abc", 100) == 0
+
+
+def test_study_video_normalizes_millis_playtime():
+    """回归：毫秒 playTime 曾导致「已进行 75000s / 总时长 1252s」的 100% 假进度。"""
+    ch = Chaoxing()
+    ch.video_context = {"chapter_index": 57, "chapter_total": 156}
+    ch.video_log_interval = 0.2
+
+    calls = {"n": 0}
+
+    def fake_log(_self, *args, **kwargs):
+        calls["n"] += 1
+        return calls["n"] >= 3, 200
+
+    lines: "list[str]" = []
+    sink = logger.add(lines.append, level="INFO", format="{message}")
+    try:
+        with mock.patch.object(base.SessionManager, "get_session",
+                               classmethod(lambda cls: _Session(duration=1252))), \
+             mock.patch.object(Chaoxing, "video_progress_log", fake_log), \
+             mock.patch.object(base, "_progress_stream", lambda: io.StringIO()):
+            ch.study_video({"courseId": "c"},
+                           {"objectid": "o", "name": "2.5.1.9Word-绘制复杂表格.mp4",
+                            "playTime": "75000"}, {}, _speed=50.0)
+    finally:
+        logger.remove(sink)
+
+    assert any("已进行: 75s" in line for line in lines), lines
+    status = [line for line in lines if line.startswith("视频进度")]
+    assert status, lines
+    # 首条状态行必须是真实的 6.0%，不能是 100%
+    assert "6.0% (75/1252s)" in status[0], status
+
+
+# --------------------------------------------------------------------------- #
 # 引擎：配置推送 + 章节上下文
 # --------------------------------------------------------------------------- #
 def test_engine_pushes_interval_and_context():
@@ -207,6 +260,8 @@ if __name__ == "__main__":
         test_status_line_contents,
         test_study_video_emits_status_by_interval,
         test_resume_playtime_not_zeroed,
+        test_normalize_play_time_units,
+        test_study_video_normalizes_millis_playtime,
         test_study_video_silent_when_disabled,
         test_engine_pushes_interval_and_context,
         test_engine_reads_interval_from_config,

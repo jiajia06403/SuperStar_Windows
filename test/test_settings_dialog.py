@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# layer: gui  # core=默认必跑 / gui=真窗口 / slow=仅 --all
 """答题设置窗口的行为测试（真实 Tk 窗口，无需账号/网络）。
 
 校验四条约定：
@@ -209,7 +210,7 @@ def test_save_keeps_hidden_provider_defaults_empty():
 
 
 def test_video_log_interval_saved_to_common():
-    """[common] video_log_interval：界面默认 30，可改；保存写进用户配置且不影响 [tiku]。"""
+    """[common] video_log_interval：界面默认值取自 config_win.ini，可改；保存写进用户配置且不影响 [tiku]。"""
     from unittest import mock
 
     import gui.app as app_mod
@@ -220,8 +221,10 @@ def test_video_log_interval_saved_to_common():
             root = tk.Tk()
             try:
                 dlg = _open(root)
-                assert _value(dlg, "video_log_interval") == "30", \
-                    f"视频日志间隔默认值应来自默认配置，实际 {_value(dlg, 'video_log_interval')!r}"
+                expected = config_store.load_default().get(
+                    "common", "video_log_interval", fallback="")
+                assert _value(dlg, "video_log_interval") == expected, \
+                    f"视频日志间隔默认值应来自默认配置 {expected!r}，实际 {_value(dlg, 'video_log_interval')!r}"
                 dlg.vars["video_log_interval"][1].set("5")
                 dlg._on_save()
                 assert dlg.common_result["video_log_interval"] == "5"

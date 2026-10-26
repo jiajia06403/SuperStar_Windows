@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# layer: core  # core=默认必跑 / gui=真窗口 / slow=仅 --all
 """引擎端到端冒烟测试：用 DemoChaoxing 假后端完整跑一遍学习流程（无需网络）。
 
 验证：

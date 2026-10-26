@@ -7,12 +7,13 @@ SuperStar Windows 引擎
      以用服务端真实进度重新缓存。
      **章节是否完成一律以服务端为准**：本地缓存只是辅助记录，平台若仍要求重新作答
      （判分不合格、未提交等）会清除本地标记并重新处理，避免误判为已完成。
-     「读取进度」还会逐章探测开放状态，未开放章节标记 ``not_open``（界面显示「未开放」）。
-  2. 章节检测提交后回读任务点校验；平台判不合格时重新作答（次数由 work_retry 控制），
-     重答后仍不通过则保留为未完成（ChapterResult.UNVERIFIED），绝不标记完成。
+  2. 章节检测提交后回读任务点校验；平台判不合格时重新作答（单次刷课内次数由 work_retry 控制，
+     默认 3），重答后仍不通过则保留为未完成（ChapterResult.UNVERIFIED），绝不标记完成。
   3. 切换章节时若发现章节未开放：
        - 回过头检查上一章节是否已经完成，若未完成则重新完成；
-       - 否则每 15 秒检查当前章节状态，直到开放或软件关闭。
+       - **若上一章因答题不合格一直未通过（因此本章永远解不了锁），重答不设上限**，
+         每 reanswer_interval 秒再来一轮，直到平台判通过或用户停止；
+       - 上一章已完成（或本就首章）则每 15 秒检查当前章节状态，直到开放或软件关闭。
 
 本模块与 GUI 解耦：通过 on(event, cb) 注册回调，GUI 只负责把这些回调映射到界面。
 """
@@ -39,7 +40,10 @@ from account_store import AccountStore
 from paths import data_dir as _data_dir
 
 # 视频状态日志默认间隔（秒）；0 表示不输出。可在 config_win.ini 的 [common] 段调整。
-DEFAULT_VIDEO_LOG_INTERVAL = 30
+DEFAULT_VIDEO_LOG_INTERVAL = 10
+
+# 章节检测「不合格重答」默认次数（[tiku] work_retry 缺省时使用）
+DEFAULT_WORK_RETRY = 3
 
 
 def video_log_interval_from_config(default: float = DEFAULT_VIDEO_LOG_INTERVAL) -> float:
@@ -149,26 +153,8 @@ def _work_still_pending(chaoxing: Chaoxing, course: dict, point: dict) -> Option
     return any(j.get("type") == "workid" for j in jobs)
 
 
-def _probe_not_open(chaoxing: Chaoxing, course: dict, point: dict) -> Optional[bool]:
-    """探测单章是否为「未开放」（单请求）。
-
-    返回 True=未开放 / False=已开放 / None=无法判断（后端不支持该探测或网络异常）。
-    """
-    probe = getattr(chaoxing, "is_point_open", None)
-    if probe is None:
-        return None
-    try:
-        opened = probe(course, point)
-    except Exception as e:  # noqa: BLE001
-        logger.warning(f"探测章节开放状态失败（{point.get('title', '')}）: {e}")
-        return None
-    if opened is None:
-        return None
-    return not opened
-
-
 def process_chapter(chaoxing: Chaoxing, course: dict, point: dict, speed: float,
-                    work_retry: int = 1) -> ChapterResult:
+                    work_retry: int = DEFAULT_WORK_RETRY) -> ChapterResult:
     """处理单个章节，返回 ChapterResult。
 
     ``work_retry``：章节检测提交后回读发现「仍未通过」时允许的重新作答次数。
@@ -182,7 +168,7 @@ def process_chapter(chaoxing: Chaoxing, course: dict, point: dict, speed: float,
     try:
         work_retry = max(0, int(work_retry))
     except (TypeError, ValueError):
-        work_retry = 1
+        work_retry = DEFAULT_WORK_RETRY
 
     reanswer = 0
     try:
@@ -357,8 +343,8 @@ class ProgressCache:
         for point in points:
             point["cache_done"] = self.is_done(uid, cid, str(point.get("id")))
         logger.info(
-            f"已从服务端读取进度并重新对齐缓存（uid={uid}, 课程={course['title']}, "
-            f"完成 {sum(1 for p in points if p.get('has_finished'))}/{len(points)} 章）"
+            f"已同步学习进度：{course['title']}（完成 "
+            f"{sum(1 for p in points if p.get('has_finished'))}/{len(points)} 章）"
         )
         return points
 
@@ -375,10 +361,13 @@ class StudyEngine:
     ACCOUNTS = "accounts"          # (uid_list)
     FINISHED = "finished"          # (stopped: bool)；同时记录到 engine.last_stopped
 
-    def __init__(self, cache_dir: "str | None" = None, poll_interval: int = 15):
+    def __init__(self, cache_dir: "str | None" = None, poll_interval: int = 15,
+                 reanswer_interval: float = 5.0):
         cache_dir = str(cache_dir or _data_dir())
         self.cache = ProgressCache(cache_dir)
         self.poll_interval = poll_interval
+        # 「上一章答题不合格导致本章未开放」时两轮重答之间的间隔（秒）
+        self.reanswer_interval = max(0.0, float(reanswer_interval))
         self.chaoxing: Optional[Chaoxing] = None
         self.current_uid: Optional[str] = None
         self.accounts: dict[str, dict] = {}      # uid -> {username, password, use_cookies}
@@ -392,10 +381,10 @@ class StudyEngine:
         # 已知「未开放」章节：courseId -> {pointId}（仅供界面展示，不落盘）
         self._not_open: dict[str, set[str]] = {}
         # 运行状态
-        self.speed = 1.0
-        self.jobs = 1
+        self.speed = 2.0
+        self.jobs = 4
         self.query_delay = 0
-        self.work_retry = 1     # 章节检测回读不合格时的重新作答次数
+        self.work_retry = DEFAULT_WORK_RETRY   # 单次刷课内章节检测不合格的重新作答次数
         # 视频状态日志间隔（秒，0=关闭）：观看视频时每 N 秒输出章节号/进度百分比等
         self.video_log_interval = video_log_interval_from_config()
 
@@ -497,7 +486,7 @@ class StudyEngine:
             }
             self.cache.load(uid)  # 切换缓存
         self._persist_accounts(uid)
-        logger.info(f"登录成功，uid={uid}，已切换进度缓存")
+        logger.info("登录成功")
         self._emit(self.ACCOUNTS, list(self.accounts.keys()))
         self._emit(self.STATUS, "logged_in", f"uid={uid}")
         return uid
@@ -591,7 +580,7 @@ class StudyEngine:
                 "persist": False,   # 演示账号不写入账号文件
             }
             self.cache.load(self.current_uid)
-        logger.info(f"演示登录成功，uid={self.current_uid}，已切换进度缓存")
+        logger.info("演示模式已就绪")
         self._emit(self.ACCOUNTS, list(self.accounts.keys()))
         self._emit(self.STATUS, "logged_in", f"uid={self.current_uid} (演示)")
         return self.current_uid
@@ -620,7 +609,7 @@ class StudyEngine:
 
         取到服务端章节状态后会与本地缓存双向对齐：平台说未完成的章节会清掉本地
         「已完成」记录，避免界面/后续刷课把需重新作答的章节误判成已完成。
-        已知「未开放」的章节会附带 ``not_open`` 标记（由「读取进度」探测得到）。
+        刷课时由服务端判定为未开放的章节会附带 ``not_open`` 标记（界面显示「未开放」）。
         """
         uid = self.current_uid
         point_list = self.chaoxing.get_course_point(
@@ -647,10 +636,8 @@ class StudyEngine:
                 p["not_open"] = True
 
     def refresh_progress(self, course: dict, emit: bool = True) -> list[dict]:
-        """只从服务端读取完成状态并对齐缓存（单请求，可先渲染界面）。
+        """从服务端读取完成状态并对齐缓存（单请求），供「读取进度」/ 勾选课程时渲染。
 
-        与 ``read_progress`` 相比不做逐章探测，因此耗时≈1 次请求；
-        界面可以先用它把「完成/待学」刷出来，再在后台流式探测「未开放」。
         ``emit=False`` 时不发逐章 PROGRESS（由调用方统一上报）。
         """
         assert self.chaoxing is not None, "请先登录"
@@ -664,73 +651,6 @@ class StudyEngine:
                 self._emit(self.PROGRESS, cid, str(p["id"]), self._point_status(p))
         return points
 
-    def probe_not_open(self, course: dict, points: list[dict],
-                       on_point: Optional[Callable[[str, Optional[bool], int, int], None]] = None,
-                       should_stop: Optional[Callable[[], bool]] = None) -> int:
-        """逐章探测「未开放」状态，返回探测到的未开放章节数。
-
-        只探测服务端标记为未完成的章节（已完成章节无需探测）。每章一次请求；
-        连续两次探测失败即中止，避免网络异常时逐章干等。探测失败时保留原状态
-        （界面显示「待学」），绝不把无法判断的章节误标为未开放。
-
-        ``on_point(pid, not_open, index, total)``：每探测完一章回调一次（``not_open``
-        为 None 表示无法判断），供界面流式刷新单行；``should_stop()`` 返回 True 时提前结束
-        （用户切课程 / 开始刷课）。
-        """
-        if self.chaoxing is None:
-            return 0
-        cid = str(course["courseId"])
-        locked = self._not_open.setdefault(cid, set())
-        targets = []
-        for point in points:
-            pid = str(point.get("id"))
-            if point.get("has_finished"):
-                locked.discard(pid)
-                continue
-            targets.append(point)
-        total = len(targets)
-        found = 0
-        misses = 0
-        for idx, point in enumerate(targets, 1):
-            if should_stop is not None and should_stop():
-                break
-            if misses >= 2:
-                break
-            pid = str(point.get("id"))
-            state = _probe_not_open(self.chaoxing, course, point)
-            if state is None:
-                misses += 1
-                if on_point is not None:
-                    on_point(pid, None, idx, total)
-                continue
-            misses = 0
-            if state:
-                locked.add(pid)
-                point["not_open"] = True
-                found += 1
-            else:
-                locked.discard(pid)
-                point.pop("not_open", None)
-            if on_point is not None:
-                on_point(pid, bool(state), idx, total)
-        return found
-
-    def read_progress(self, course: dict, probe: bool = True) -> list[dict]:
-        """手动读取进度按钮（同步版）：读取完成状态 + 逐章探测未开放。
-
-        界面走异步两段式（``refresh_progress`` → ``probe_not_open``）以免阻塞；
-        本方法供 CLI / 测试等需要一次拿到最终结果的场景使用。
-        """
-        points = self.refresh_progress(course, emit=False)
-        found = self.probe_not_open(course, points) if probe else 0
-        if found:
-            logger.info(f"识别到 {found} 个未开放章节: {course['title']}")
-        cid = str(course["courseId"])
-        for p in points:
-            self._emit(self.PROGRESS, cid, str(p["id"]), self._point_status(p))
-        self._emit(self.STATUS, "read_progress", f"课程={course['title']}")
-        return points
-
     @staticmethod
     def _point_status(point: dict) -> str:
         """章节状态字符串：done / not_open / pending（界面按此渲染）。"""
@@ -741,7 +661,7 @@ class StudyEngine:
         return "pending"
 
     # ---- 启动 / 停止 ----
-    def start_study(self, course_list: list[dict], speed: float = 1.0, jobs: int = 1) -> None:
+    def start_study(self, course_list: list[dict], speed: float = 2.0, jobs: int = 4) -> None:
         assert self.chaoxing is not None, "请先登录"
         self.speed = min(2.0, max(1.0, speed))
         self.jobs = max(1, jobs)
@@ -751,12 +671,13 @@ class StudyEngine:
         # 以配置文件为准刷新视频状态日志间隔（用户可能直接改过 ini），并推给后端
         self.apply_video_log_config()
         if self.video_log_interval > 0:
-            logger.info(
+            # 只是运行参数说明，界面上没必要占一行，写日志文件备查即可
+            logger.debug(
                 f"视频状态日志：每 {self.video_log_interval:g} 秒输出一次"
                 f"（章节号 / 进度百分比 / 预计剩余；设 0 可关闭）"
             )
         else:
-            logger.info("视频状态日志已关闭（在「设置」里填间隔秒数即可开启）")
+            logger.debug("视频状态日志已关闭（在「设置」里填间隔秒数即可开启）")
         self._thread = threading.Thread(
             target=self._run, args=(course_list,), daemon=True
         )
@@ -831,7 +752,7 @@ class StudyEngine:
                 if not self.cache.is_done(uid, cid, pid):
                     self.cache.mark_done(uid, cid, pid)
                 locked.discard(pid)
-                logger.info(f"章节已完成(服务端): {point['title']}")
+                logger.info(f"章节已完成: {point['title']}")
                 self._emit(self.PROGRESS, cid, pid, "done")
                 i += 1
                 continue
@@ -876,7 +797,8 @@ class StudyEngine:
 
             if result == ChapterResult.UNVERIFIED:
                 # 任务点已提交但平台仍判未通过（需重新作答）。
-                # 不标记完成、不盲目无限重试（避免耗尽平台答题次数），继续下一章。
+                # 这里不原地死循环（避免耗尽平台答题次数），先继续下一章；
+                # 若下一章因此一直未开放，_handle_not_open 会回退无限重答本章。
                 logger.error(
                     f"章节仍未通过平台校验（需重新作答），保留为未完成: {point['title']}"
                 )
@@ -918,47 +840,95 @@ class StudyEngine:
                          cid: str, uid: str) -> bool:
         """
         处理「章节未开放」：
-          - 若存在上一章节且其未完成 -> 回过头重新完成上一章节，完成后检查当前章节
-            是否已解锁：已解锁则继续处理当前章节(返回 True)，否则转入轮询。
+          - 若存在上一章节且其未完成 -> 回过头重新完成上一章节（见 _redo_prev_until_open）。
+            完成后检查当前章节是否已解锁：已解锁返回 True，否则转入轮询。
           - 否则（上一章节已完成，或本就是首章）-> 每 poll_interval 秒检查当前章节状态，
             直到开放（返回 True）或软件关闭/停止（返回 False）。
         """
         # 1) 回退检查上一章节（以服务端状态为准；本次运行中已重做成功会置为 True）
-        if i > 0:
-            prev = points[i - 1]
-            if not prev.get("has_finished"):
-                logger.info(f"章节未开放，回退检查上一章节未完成，重新完成: {prev['title']}")
-                self._emit(self.STATUS, "backtrack", f"回退重做: {prev['title']}")
-                self._set_video_context(prev, i, len(points))
-                r = process_chapter(self.chaoxing, course, prev, self.speed,
-                                    work_retry=self.work_retry)
-                if r == ChapterResult.STOPPED:
-                    return False
-                if r == ChapterResult.SUCCESS:
-                    prev["has_finished"] = True
-                    self.cache.mark_done(uid, cid, str(prev["id"]))
-                    self._emit(self.PROGRESS, cid, str(prev["id"]), "done")
-                    logger.info(f"上一章节重新完成: {prev['title']}，检查当前章节是否解锁")
-                    # 重新检查当前章节是否已开放，再决定是否继续处理当前章节
-                    try:
-                        _, job_info = self.chaoxing.get_job_list(course, points[i])
-                    except Exception:  # noqa: BLE001
-                        logger.warning("检查章节开放状态失败，转为轮询当前章节")
-                        job_info = {"notOpen": True}
-                    if not job_info.get("notOpen", False):
-                        logger.info(f"当前章节已解锁: {points[i]['title']}")
-                        return True
-                    # 仍被锁 -> 落到下面的轮询逻辑
-                elif r == ChapterResult.NOT_OPEN:
-                    logger.warning(f"上一章节也处于未开放状态，转为轮询当前章节: {prev['title']}")
-                    # 落到下面的轮询逻辑
-                else:
-                    logger.warning(f"上一章节重做出错: {prev['title']}，转为轮询当前章节")
-                    # 落到下面的轮询逻辑
+        if i > 0 and not points[i - 1].get("has_finished"):
+            return self._redo_prev_until_open(course, points, i, cid, uid)
 
-        # 2) 轮询当前章节，每 poll_interval 秒检查一次，直到开放或软件关闭
-        logger.info(f"章节未开放，每 {self.poll_interval} 秒检查一次开放状态: {points[i]['title']}")
-        self._emit(self.STATUS, "polling", f"等待开放: {points[i]['title']}")
+        # 2) 上一章无问题（或本就是首章）：只能等平台解锁
+        return self._poll_until_open(course, points, i)
+
+    def _redo_prev_until_open(self, course: dict, points: list[dict], i: int,
+                              cid: str, uid: str) -> bool:
+        """重做上一章节，直到当前章节解锁 / 只能轮询 / 用户停止。
+
+        **答题不合格没有上限**：上一章被平台判「需重新作答」时，本章永远不会解锁，
+        重答是唯一出路 —— 因此每 ``reanswer_interval`` 秒再来一轮，不设次数上限。
+        其它原因（上一章也锁着、网络报错）不值得无限重试，退回轮询。
+        """
+        prev = points[i - 1]
+        title = prev["title"]
+        cur_title = points[i]["title"]
+        error_tries = max(1, int(self.work_retry or 1))    # 非答题类报错的重试上限
+        errors = 0
+        attempt = 0
+        while not self._stop:
+            attempt += 1
+            if attempt == 1:
+                logger.info(f"章节未开放，回退检查上一章节未完成，重新完成: {title}")
+                self._emit(self.STATUS, "backtrack", f"回退重做: {title}")
+            else:
+                logger.warning(f"上一章节仍未通过平台校验，继续重答(第 {attempt} 轮): {title}")
+            self._set_video_context(prev, i, len(points))
+
+            r = process_chapter(self.chaoxing, course, prev, self.speed,
+                                work_retry=self.work_retry)
+
+            if r == ChapterResult.STOPPED:
+                return False
+
+            if r == ChapterResult.SUCCESS:
+                prev["has_finished"] = True
+                self.cache.mark_done(uid, cid, str(prev["id"]))
+                self._emit(self.PROGRESS, cid, str(prev["id"]), "done")
+                logger.info(f"上一章节重新完成: {title}，检查当前章节是否解锁")
+                # 重新检查当前章节是否已开放，再决定是否继续处理当前章节
+                try:
+                    _, job_info = self.chaoxing.get_job_list(course, points[i])
+                except Exception:  # noqa: BLE001
+                    logger.warning("检查章节开放状态失败，转为轮询当前章节")
+                    job_info = {"notOpen": True}
+                if not job_info.get("notOpen", False):
+                    logger.info(f"当前章节已解锁: {cur_title}")
+                    return True
+                logger.info(f"上一章节已完成但当前章节仍被锁，转为轮询: {cur_title}")
+                break
+
+            if r == ChapterResult.NOT_OPEN:
+                logger.warning(f"上一章节也处于未开放状态，转为轮询当前章节: {title}")
+                break
+
+            if r == ChapterResult.UNVERIFIED:
+                # 答题不合格：本章永远解不了锁，只能继续重答 —— 不设上限
+                logger.warning(
+                    f"上一章节答题未通过平台校验（本章因而未开放），无限重答(第 {attempt} 轮): {title}"
+                )
+                self._emit(self.STATUS, "reanswer", f"答题不合格重答: {title}")
+                if cancel.wait(self.reanswer_interval):
+                    return False
+                continue
+
+            # ERROR：可能只是一次性网络抖动，重试几轮仍失败就退回轮询，避免卡死在死链上
+            errors += 1
+            if errors >= error_tries:
+                logger.warning(f"上一章节重做连续出错 {errors} 次，转为轮询当前章节: {title}")
+                break
+            logger.warning(f"上一章节重做出错({errors}/{error_tries})，稍后重试: {title}")
+            self._emit(self.STATUS, "backtrack", f"回退重做出错，重试: {title}")
+            if cancel.wait(self.reanswer_interval):
+                return False
+
+        return self._poll_until_open(course, points, i)
+
+    def _poll_until_open(self, course: dict, points: list[dict], i: int) -> bool:
+        """轮询当前章节，每 poll_interval 秒检查一次，直到开放（True）或停止（False）。"""
+        title = points[i]["title"]
+        logger.info(f"章节未开放，每 {self.poll_interval} 秒检查一次开放状态: {title}")
+        self._emit(self.STATUS, "polling", f"等待开放: {title}")
         while not self._stop:
             if cancel.wait(self.poll_interval):   # 可被停止按钮立刻唤醒
                 return False
@@ -968,7 +938,7 @@ class StudyEngine:
                 logger.warning("检查章节开放状态失败，稍后重试")
                 continue
             if not job_info.get("notOpen", False):
-                logger.info(f"章节已开放: {points[i]['title']}")
+                logger.info(f"章节已开放: {title}")
                 return True
             logger.info(f"章节仍未开放，继续等待（{self.poll_interval}s 后再次检查）")
         return False

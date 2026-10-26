@@ -14,13 +14,27 @@ from typing import Optional
 import requests
 from urllib3 import disable_warnings, exceptions
 
-try:
-    # AI 大模型答题属于可选能力：缺失 openai/httpx 时，其余题库与刷课功能照常工作。
-    import httpx
-    from openai import OpenAI
-except ImportError:  # pragma: no cover - 精简发行版不打包该可选依赖
-    httpx = None
-    OpenAI = None
+# AI 大模型答题属于可选能力：openai/httpx 改为「首次使用时」才导入（见 _get_openai）。
+# 这样 provider 用 TikuYanxi/Like/DeepSeek/SiliconFlow 时，启动不再白付 ~1.1s 的导入开销；
+# 缺失这两个依赖时其余题库与刷课功能照常工作。
+_openai_import = None  # None=尚未尝试, False=不可用, (OpenAI, httpx)=可用
+
+
+def _get_openai():
+    """惰性加载 openai/httpx，返回 ``(OpenAI, httpx)``；缺失依赖时返回 ``(None, None)``。
+
+    结果按模块级缓存（import 由 GIL + import 锁保护，并发首次调用幂等），
+    因此只有第一次真正用到 AI 题库时才付导入代价。
+    """
+    global _openai_import
+    if _openai_import is None:
+        try:
+            import httpx
+            from openai import OpenAI
+            _openai_import = (OpenAI, httpx)
+        except ImportError:  # pragma: no cover - 精简发行版不打包该可选依赖
+            _openai_import = False
+    return _openai_import or (None, None)
 
 from api import local_bank
 from api.answer_check import *
@@ -36,6 +50,7 @@ def _openai_client(base_url: str, api_key: str, proxy: Optional[str] = None,
 
     ``max_retries`` 仅供连通性探测用 0：默认重试 2 次会让「地址填错」的测试按钮等很久。
     """
+    OpenAI, httpx = _get_openai()
     if OpenAI is None or httpx is None:
         raise RuntimeError("AI 题库需要 openai 与 httpx 依赖：pip install openai httpx")
     kwargs = {"base_url": base_url, "api_key": api_key}

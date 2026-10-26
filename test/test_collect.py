@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# layer: core  # core=默认必跑 / gui=真窗口 / slow=仅 --all
 """采集题库测试（api/collect.py + api/work_verify 的题目/我的答案解析）。
 
 覆盖：
@@ -7,7 +8,7 @@
   3. 未批阅 / 作业已关闭 / 状态码异常 -> 计为「无法识别」且不入库；
   4. 中断（should_stop）与 --max-works 上限；
   5. 关闭本地题库时直接返回错误、一个请求都不发；
-  6. 采集结果落在 <课程>.json（按课程共享，不按账号分文件夹），能按指纹命中；
+  6. 采集结果落在 <课程ID>.json（按课程共享，不按账号分文件夹），能按指纹命中；
   7. 题库已有正确答案的题只跳过、不重复写。
 """
 import os
@@ -39,28 +40,28 @@ JOB = {"type": "workid", "jobid": "work-07647c38d8de4c648a9277c5bed7075a",
 
 # 一份「已批阅」的作业页：q11 判对、q12 判错但给了正确答案、q13 判断题判错、q14 无判分
 PAGE_OK = """
-<div class="singleQuesId" data="11">
+<div class="singleQuesId" data="405717711">
   <div class="TiMu" data="0">
     <div class="Zy_TItle">1. 下列说法正确的是（2.0分）</div>
     <ul><li>A. 甲选项</li><li>B. 乙选项</li></ul>
   </div>
   <div><span class="dui"></span> 我的答案：B 正确答案：B 得分：2.0分 满分：2.0分</div>
 </div>
-<div class="singleQuesId" data="12">
+<div class="singleQuesId" data="405717712">
   <div class="TiMu" data="0">
     <div class="Zy_TItle">2. 另一道题（2.0分）</div>
     <ul><li>A. 甲选项</li><li>B. 乙选项</li></ul>
   </div>
   <div><span class="cuo"></span> 我的答案：B 正确答案：A 得分：0.0分 满分：2.0分</div>
 </div>
-<div class="singleQuesId" data="13">
+<div class="singleQuesId" data="405717713">
   <div class="TiMu" data="3">
     <div class="Zy_TItle">3. 判断题（1.0分）</div>
     <ul><li>A. 对</li><li>B. 错</li></ul>
   </div>
   <div><span class="cuo"></span> 我的答案：A 正确答案：B</div>
 </div>
-<div class="singleQuesId" data="14">
+<div class="singleQuesId" data="405717714">
   <div class="TiMu" data="0">
     <div class="Zy_TItle">4. 还没批阅的题</div>
     <ul><li>A. 甲选项</li><li>B. 乙选项</li></ul>
@@ -70,7 +71,7 @@ PAGE_OK = """
 
 # 只判对、不公布正确答案：应当用「我的答案」（选项乱序，靠文本重映射）
 PAGE_NO_ANSWER = """
-<div class="singleQuesId" data="21">
+<div class="singleQuesId" data="405717721">
   <div class="TiMu" data="0">
     <div class="Zy_TItle">1. 下列说法正确的是（2.0分）</div>
     <ul><li>B. 乙选项</li><li>A. 甲选项</li></ul>
@@ -218,6 +219,9 @@ def test_page_without_verdicts_is_counted_not_stored():
     stats, _session, _cx = _collect(store, html="<html><body>作业已结束</body></html>")
     assert stats["read"] == 0 and stats["learned"] == 0, stats
     assert stats["unreadable"] == 1, stats
+    # 「作业已结束」是老师关过作业，属正常情况，不能记成「结构不认识」
+    assert stats.get("closed") == 1, stats
+    assert stats.get("no_questions") is None, stats
     assert store.stats()["total"] == 0
 
 
@@ -265,7 +269,7 @@ def test_answers_land_in_course_file():
     courses = store.stats()["courses"]
     assert len(courses) == 1, courses
     rel = os.path.relpath(courses[0]["path"], store.root).replace("\\", "/")
-    assert rel == "高等数学_246831735.json", rel
+    assert rel == "246831735.json", rel
     assert not [n for n in os.listdir(store.root)
                 if os.path.isdir(os.path.join(store.root, n))], "不应按账号建目录"
 

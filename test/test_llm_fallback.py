@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# layer: core  # core=默认必跑 / gui=真窗口 / slow=仅 --all
 """大模型答题的降级行为测试（无需网络 / 无需 GUI）。
 
 覆盖本次改动的三条约定：

@@ -69,6 +69,37 @@ def _fmt_duration(seconds: float) -> str:
     return f"{secs}秒"
 
 
+def _normalize_play_time(raw, duration) -> int:
+    """把任务卡片里的 playTime 归一到「秒」。
+
+    学习通同一份知识卡片里的 playTime 单位并不稳定：多数是秒，也有接口/账号返回毫秒
+    （实测出现过 1252s 的视频 playTime=75000，即 75s 的毫秒值）。单位只能靠真实时长做上界推断：
+    - 不超过时长 → 当秒用；
+    - 略超时长（≤1.01 倍）→ 服务端取整，按看完处理；
+    - 远超时长，但 //1000 后不超过时长 → 当毫秒，换算成秒；
+    - 都不成立 → 脏数据，归零重播（绝不能当成「已看完」，否则会瞬间跳过任务点）。
+
+    返回 0..duration 之间的整数秒。
+    """
+    total = int(duration or 0)
+    try:
+        value = int(float(raw or 0))
+    except (TypeError, ValueError):
+        return 0
+    if value <= 0:
+        return 0
+    if total <= 0:
+        return 0
+    if value <= total:
+        return value
+    if value <= total * 1.01:      # 服务端取整导致略超时长，按看完处理
+        return total
+    if value // 1000 <= total:     # 毫秒值（远大于时长，不可能是秒）
+        return value // 1000
+    logger.warning("playTime 异常（{}s 的视频报 {}），已按 0 处理", total, value)
+    return 0
+
+
 class SessionManager:
     _instance = None
 
@@ -331,40 +362,6 @@ class Chaoxing:
 
         return job_list, job_info
 
-    def is_point_open(self, course: dict, point: dict) -> Optional[bool]:
-        """单次请求探测章节是否已开放（供「读取进度」批量标注章节状态）。
-
-        ``get_job_list`` 为凑任务卡片数会连发多次请求，不适合逐章探测；
-        这里只取一次卡片页，靠解析器给出的 notOpen 标记判断。
-
-        Returns:
-            True = 已开放 / False = 未开放（平台返回「章节未开放」）/ None = 无法判断。
-        """
-        _session = SessionManager.get_session()
-        self.rate_limiter.limit_rate()
-        try:
-            _resp = _session.get(
-                "https://mooc1.chaoxing.com/mooc-ans/knowledge/cards",
-                params={
-                    "clazzid": course["clazzId"],
-                    "courseid": course["courseId"],
-                    "knowledgeid": point["id"],
-                    "ut": "s",
-                    "cpi": course["cpi"],
-                    "v": "2025-0424-1038-3",
-                    "mooc2": 1,
-                    "num": 0,
-                },
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"探测章节开放状态失败 -> {e}")
-            return None
-        if _resp.status_code != 200:
-            logger.warning(f"探测章节开放状态失败 -> [{_resp.status_code}] {point.get('title', '')}")
-            return None
-        _, _job_info = decode_course_card(_resp.text)
-        return not (isinstance(_job_info, dict) and _job_info.get("notOpen", False))
-
     def get_enc(self, clazzId, jobid, objectId, playingTime, duration, userid):
         return md5(
             f"[{clazzId}][{userid}][{jobid}][{objectId}][{playingTime * 1000}][d_yHJ!$pdA~5][{duration * 1000}][0_{duration}]".encode()
@@ -535,11 +532,18 @@ class Chaoxing:
 
     def _video_status_line(self, _job: dict, play_time: float, duration: int,
                            _speed: float) -> str:
-        """构造一行视频状态日志：章节号 → 任务名 → 百分比/时长 → 倍速 → 预计剩余。"""
+        """构造一行视频状态日志：进度/剩余 → 章节号 → 任务名。
+
+        计时信息（百分比、已播/总时长、预计剩余）放在最前面：日志面板里这一行
+        往往比窗口还宽，放在末尾时会被右边界裁掉，看起来像「计时不走」。
+        """
         total = max(int(duration or 0), 1)
         percent = min(100.0, max(0.0, float(play_time)) * 100.0 / total)
         speed = float(_speed or 1.0) or 1.0
-        parts = []
+        parts = [
+            f"{percent:.1f}% ({int(play_time)}/{total}s)",
+            f"剩余约{_fmt_duration((total - play_time) / speed)}（{speed:g}x）",
+        ]
 
         ctx = getattr(self, "video_context", None) or {}
         index, count = ctx.get("chapter_index"), ctx.get("chapter_total")
@@ -553,9 +557,6 @@ class Chaoxing:
         name = _clip_text(_job.get("name") or _job.get("title"), 18)
         if name:
             parts.append(f"任务 {name}")
-        parts.append(f"{percent:.1f}% ({int(play_time)}/{total}s)")
-        parts.append(f"{speed:g}x")
-        parts.append(f"剩余约{_fmt_duration((total - play_time) / speed)}")
         return "视频进度 | " + " | ".join(parts)
 
     def _log_video_status(self, _job: dict, play_time: float, duration: int,
@@ -586,9 +587,16 @@ class Chaoxing:
         # Time in the video (can be scaled with the speed factor): duration, play_time, last_log_time, wait_time
 
         duration = int(_video_info["duration"])
-        # playTime 与 duration 同单位（秒），切勿再 //1000（会把 1000s 内的续播进度全部归零，
-        # 导致「当前观看」始终显示 0 秒，并连带污染 enc 签名）。
-        play_time = int(_job["playTime"] or 0)
+        # playTime 单位不保证是秒（部分卡片给毫秒），统一按 duration 推断并归一，
+        # 否则会出现「已进行 75000s / 总时长 1252s」这种 100% 假进度，进而瞬间跳过任务点。
+        raw_play_time = _job.get("playTime")
+        play_time = _normalize_play_time(raw_play_time, duration)
+        try:
+            raw_int = int(float(raw_play_time or 0))
+        except (TypeError, ValueError):
+            raw_int = 0
+        if play_time and play_time != raw_int:
+            logger.info("续播进度单位换算: {} -> {}s（总时长 {}s）", raw_play_time, play_time, duration)
         last_log_time = 0
         last_iter = time.time()
         wait_time = int(random.uniform(30, 90))
@@ -647,8 +655,10 @@ class Chaoxing:
                         if refreshed_meta:
                             # FIXME: Maybe it should be considered an error if those keys aren't present in the refreshed meta, so we perhaps shouldn't use get()
                             _dtoken = refreshed_meta.get("dtoken", _dtoken)
-                            _duration = refreshed_meta.get("duration", duration)
-                            play_time = refreshed_meta.get("playTime", play_time)
+                            _duration = int(refreshed_meta.get("duration", duration) or duration)
+                            play_time = _normalize_play_time(
+                                refreshed_meta.get("playTime", play_time), _duration
+                            )
 
                             logger.debug("Refreshed token: {}, duration: {}, play time: {}", _dtoken, _duration, play_time)
                             continue
@@ -1054,7 +1064,9 @@ class Chaoxing:
         if res.status_code == 200:
             res_json = res.json()
             if res_json["status"]:
-                logger.info(f'{action}答题成功 -> {res_json["msg"]}')
+                # 面板只看这一条汇总；逐题的「题目 -> 答案」明细在 debug 级别
+                logger.info(f'章节检测已{action}（共 {total_questions} 题，'
+                            f'题库命中 {found_answers} 题）')
             else:
                 logger.error(f'{action}答题失败 -> {res_json["msg"]}')
                 return StudyResult.ERROR
@@ -1073,7 +1085,7 @@ class Chaoxing:
         if questions["pyFlag"] == "":
             self.rollback_times = 0
             # 提交成功后只补「题库里还没有正确答案」的题：判对存本次答案、
-            # 判错但拿得到正确答案的存正确答案（写进 <课程>.json，重做/换账号直接用）
+            # 判错但拿得到正确答案的存正确答案（写进 <课程ID>.json，重做/换账号直接用）
             self._learn_work_answers(_course, submitted, work_params)
         return StudyResult.SUCCESS
 
@@ -1089,7 +1101,7 @@ class Chaoxing:
              与平台不一致 -> **覆写纠正**（这就是题库答错后的自愈路径）；
           5. 判错且拿不到正确答案 -> 不写（不知道对的是什么，绝不猜）。
 
-        题库只存正确答案，写入位置：``<题库根>/<课程>.json``（全账号共享）。
+        题库只存正确答案，写入位置：``<题库根>/<课程ID>.json``（全账号共享）。
         """
         try:
             bank = local_bank.get_bank()
@@ -1136,8 +1148,7 @@ class Chaoxing:
             logger.error(f"阅读任务学习失败 -> [{_resp.status_code}]{_resp.text}")
             return StudyResult.ERROR
         else:
-            _resp_json = _resp.json()
-            logger.info(f"阅读任务学习 -> {_resp_json['msg']}")
+            logger.info(f"阅读任务完成: {_job.get('name') or _job.get('title') or ''}".rstrip(": "))
             return StudyResult.SUCCESS
 
     def study_emptypage(self, _course, point):

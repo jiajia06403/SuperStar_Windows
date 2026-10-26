@@ -286,7 +286,7 @@ def _process_attachment_cards(cards: List[Dict[str, Any]]) -> List[Dict[str, Any
                 job_list.append(work_job)
         else:
             logger.warning(f"Unknown card type: {card_type}")
-            logger.warning(card)
+            logger.debug(card)   # 整段卡片源码只写日志文件，别往界面上刷
 
     return job_list
 
@@ -433,22 +433,20 @@ def decode_work_questions(html_text: str) -> Dict[str, Any]:
 
     font_decoder = FontDecoder(html_text) if soup.find("style", id="cxSecretStyle") else None
 
-    for div_tag in soup.find_all("div", class_="singleQuesId"):
-        qid = str(div_tag.attrs.get("data", "") or "").strip()
-        if not qid:
-            continue
-        timu = div_tag.find("div", class_="TiMu")
-        type_code = str(timu.attrs.get("data", "") or "").strip() if timu else ""
-        title = _extract_title(div_tag.find("div", class_="Zy_TItle"), font_decoder)
-        ul = div_tag.find("ul")
+    # 题块识别统一交给 work_verify（作答态 / 新版 .TiMu / 成绩态 .mark_item 都认）
+    from api.work_verify import block_qtype, block_title_element, iter_question_blocks
+    for qid, block in iter_question_blocks(html_text):
+        title = _extract_title(block_title_element(block), font_decoder)
+        title = re.sub(r"[\s\u3000]+", " ", str(title or "")).strip()
+        ul = block.find("ul") if block is not None else None
         options = ""
         if ul:
             choices = [_extract_choices(li, font_decoder) for li in ul.find_all("li")]
             options = "\n".join(sorted(c for c in choices if c))
         result[qid] = {
             "qid": qid,
-            "title": str(title or "").strip(),
-            "type": _get_question_type(type_code) if type_code else "unknown",
+            "title": title,
+            "type": block_qtype(block, title),
             "options": options,
         }
     return result

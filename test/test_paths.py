@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# layer: slow  # core=默认必跑 / gui=真窗口 / slow=仅 --all
 """路径约定测试：发行包不往 exe 目录里凭空写文件。
 
 校验三件事：
@@ -23,7 +24,7 @@ import paths  # noqa: E402
 import build  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# exe 文件名随版本号变化（version.txt 是唯一来源），这里统一推导
+# exe 文件名恒定（不带版本号），这里统一推导
 EXE_NAME = getattr(build, "EXE_NAME", f"{build.APP_NAME}.exe")
 
 
@@ -70,15 +71,29 @@ def test_frozen_paths():
             _restore_frozen(old)
 
 
+def _fake_app_dir(tmp: str) -> str:
+    """造一个 onedir 产物目录：SuperStar.exe + runtime/（bootloader 按 exe 同级找运行时）。"""
+    app = os.path.join(tmp, "app")
+    os.makedirs(app, exist_ok=True)
+    with open(os.path.join(app, build.EXE_NAME), "wb") as fp:
+        fp.write(b"MZ")
+    runtime = os.path.join(app, build.RUNTIME_DIRNAME)
+    os.makedirs(os.path.join(runtime, "sub"), exist_ok=True)
+    with open(os.path.join(runtime, "python312.dll"), "wb") as fp:
+        fp.write(b"\x00")
+    with open(os.path.join(runtime, "sub", "data.bin"), "wb") as fp:
+        fp.write(b"\x01")
+    return app
+
+
 def test_stage_install_contents():
     with tempfile.TemporaryDirectory() as tmp:
-        exe = os.path.join(tmp, "SuperStar.exe")
-        open(exe, "wb").close()
+        app = _fake_app_dir(tmp)
         target = os.path.join(tmp, "pkg")
-        entries = build.stage_install(ROOT, target, exe)
+        entries = build.stage_install(ROOT, target, app)
 
         assert build.EXE_NAME in entries, entries
-        assert build.VERSION in build.EXE_NAME, "exe 文件名必须带版本号"
+        assert build.EXE_NAME == f"{build.APP_NAME}.exe", "exe 文件名不得带版本号"
         assert os.path.isfile(os.path.join(target, build.EXE_NAME))
         assert build.CONFIG_NAME in entries
         assert build.LOG_NAME in entries
@@ -87,6 +102,12 @@ def test_stage_install_contents():
         assert build.LICENSE_NAME in entries
         assert os.path.isdir(os.path.join(target, build.DATA_DIRNAME))
         assert os.path.getsize(os.path.join(target, build.LOG_NAME)) == 0
+        # 运行时目录必须与 exe 平铺同级：bootloader 只在 exe 同级找它
+        assert build.RUNTIME_DIRNAME + os.sep in entries, entries
+        runtime = os.path.join(target, build.RUNTIME_DIRNAME)
+        assert os.path.isdir(runtime)
+        assert os.path.isfile(os.path.join(runtime, "python312.dll"))
+        assert os.path.isfile(os.path.join(runtime, "sub", "data.bin"))
         with open(os.path.join(target, build.README_NAME), encoding="utf8") as fp:
             text = fp.read()
         assert "完整解压" in text, "使用说明必须提示解压整个文件夹后运行"
@@ -107,26 +128,27 @@ def test_version_file_is_single_source():
     version = build.read_version(ROOT)
     assert VERSION_RE.fullmatch(version), f"版本号格式应为 X.Y.Z[-预发布]：{version!r}"
     assert version == build.VERSION
-    assert build.EXE_NAME == f"{build.APP_NAME}-{version}.exe"
+    assert build.EXE_NAME == f"{build.APP_NAME}.exe"
     with open(os.path.join(ROOT, "build.py"), encoding="utf8") as fp:
         src = fp.read()
     assert 'VERSION = "' not in src, "build.py 不应再硬编码版本号"
     assert build.VERSION_FILE in src
 
 
-def test_prerelease_suffix_kept_in_artifact_names():
-    """预发布后缀（1.0.0-rc.1）必须出现在 exe / zip 名里，否则预览版与正式版重名。"""
+def test_prerelease_suffix_kept_in_zip_name():
+    """预发布后缀（1.0.0-rc.1）必须出现在 zip 名里，否则预览版与正式版重名；
+    exe 文件名恒为 SuperStar.exe（不带版本号），版本区分交给 zip 名承担。"""
     with tempfile.TemporaryDirectory() as tmp:
         with open(os.path.join(tmp, build.VERSION_FILE), "w", encoding="utf8") as fp:
             fp.write("1.2.0-rc.1\n")
         version = build.read_version(tmp)
         assert version == "1.2.0-rc.1", version
         assert build.is_prerelease(version)
-        assert build.exe_name(version) == "SuperStar-1.2.0-rc.1.exe"
+        assert build.exe_name() == "SuperStar.exe"
         assert build.zip_name(version) == "SuperStar-1.2.0-rc.1-win64.zip"
         # 正式版不带后缀，且不能被判成预发布
         assert not build.is_prerelease("1.2.0")
-        assert build.exe_name("1.2.0") == "SuperStar-1.2.0.exe"
+        assert build.exe_name() == "SuperStar.exe"
     # 非法版本号直接拒绝（避免 rc 后缀被静默丢弃）
     for bad in ("1.0", "v1.0.0", "1.0.0-rc 1", "1.0.0_1", ""):
         try:
@@ -158,10 +180,11 @@ def test_zip_layout():
                      os.path.join(root, build.README_NAME))
         shutil.copy2(os.path.join(ROOT, build.LICENSE_NAME),
                      os.path.join(root, build.LICENSE_NAME))
-        exe = os.path.join(tmp, "SuperStar.exe")
-        open(exe, "wb").close()
+        # 安装目录 = onedir 产物目录（PyInstaller 直接落在这里）
+        install = _fake_app_dir(tmp)
+        build.stage_install(root, install, install)
 
-        zip_path = build.make_zip(root, exe)
+        zip_path = build.make_zip(root, install)
         with zipfile.ZipFile(zip_path) as zf:
             names = zf.namelist()
         # zip 内不得再套一层顶层目录：解压即得主目录
@@ -170,7 +193,17 @@ def test_zip_layout():
                        build.LICENSE_NAME):
             assert expect in names, f"zip 缺少 {expect}: {names}"
         assert not any(n.startswith("dist_stage") for n in names), names
-        assert not any("/" in n.rstrip("/") for n in names), f"zip 存在多余层级: {names}"
+        # 顶层只能是这几个条目（runtime/ 是唯一的子目录）
+        # progress_cache/ 是 zip 里的空目录条目（rstrip 后也在顶层集合里）
+        top = {n.rstrip("/") for n in names if "/" not in n.rstrip("/")}
+        assert top == {build.EXE_NAME, build.CONFIG_NAME, build.LOG_NAME,
+                       build.DATA_DIRNAME, build.README_NAME,
+                       build.LICENSE_NAME}, top
+        # 运行时目录整棵子树都要进 zip（缺文件 exe 起不来）
+        runtime = build.RUNTIME_DIRNAME + "/"
+        assert any(n.startswith(runtime) for n in names), names
+        assert f"{runtime}python312.dll" in names, names
+        assert f"{runtime}sub/data.bin" in names, names
 
 
 def _main() -> int:

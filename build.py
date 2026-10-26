@@ -1,21 +1,28 @@
 # -*- coding: utf-8 -*-
-"""构建 Windows 可执行文件（PyInstaller onefile）并打成分发包。
+"""构建 Windows 可执行文件（PyInstaller onedir）并打成分发包。
 
 用法：
-    python build.py             # 构建 dist/ 安装目录（exe + 随包文件）并打包 zip
-    python build.py --exe-only  # 只出 exe（不铺随包文件、不打 zip）
+    python build.py             # 构建 dist/ 安装目录（exe + 运行时目录 + 随包文件）并打包 zip
+    python build.py --exe-only  # 只出 onedir 产物目录（build/onedir/SuperStar/）
     python build.py --clean     # 清空中间产物后重新构建
 
-发行包的形态（设计意图：让用户一眼看出「不是单个 exe 就能跑的程序」）：
-    SuperStar-<版本>.exe  主程序（文件名带完整版本号，取自 version.txt；
-                          预发布形如 SuperStar-1.0.0-rc.1.exe，后缀不可丢）
-    SuperStar-<版本>-win64.zip  分发压缩包（同名规则）
-    config_win.ini       默认配置（随包自带，升级时覆盖 —— 用户不要改）
-                         用户配置 config_user.ini 由程序首次启动生成，不随包分发（防覆盖）
-    chaoxing.log         运行日志（随包自带的空文件，追加写入）
-    progress_cache\\      进度缓存 / 账号 / cookies（随包自带的空目录）
+发行包的形态（设计意图：程序本来就需要一整个文件夹，不该压成单个 exe）：
+
+    SuperStar-<版本>-win64.zip  分发压缩包（文件名带完整版本号，取自 version.txt；
+                          预发布形如 SuperStar-1.0.0-rc.1-win64.zip，后缀不可丢）
+    SuperStar.exe       主程序（文件名不带版本号，恒为 SuperStar.exe）
+    runtime\\            运行时目录（Python 运行时 / 依赖库 / 资源 —— exe 启动必需）
+    config_win.ini      默认配置（随包自带，升级时覆盖 —— 用户不要改）
+                        用户配置 config_user.ini 由程序首次启动生成，不随包分发（防覆盖）
+    chaoxing.log        运行日志（随包自带的空文件，追加写入）
+    progress_cache\\     进度缓存 / 账号 / cookies（随包自带的空目录）
     使用说明.txt
-    LICENSE              GPL-3.0 许可文本（二进制分发须随附）
+    LICENSE             GPL-3.0 许可文本（二进制分发须随附）
+
+**为什么是 onedir 而不是 onefile**：onefile 每次启动都要把上千个文件解压到
+%TEMP%，换台电脑首次启动时这批新文件还要被 Defender 逐个扫描 —— 这是
+「首次启动要好几秒」的主因。onedir 直接就地加载，免掉解包与首轮全量扫描。
+代价是不能再只拷一个 exe（只拷 exe 会报 "Failed to load Python DLL"，已写进使用说明）。
 
 发行包排除演示后端 demo_chaoxing 与 gui.selftest：界面不出现「演示」入口，
 `--demo` / `--selftest` 直接被拒绝（退出码 3）。演示与自检只在源码目录运行，
@@ -36,8 +43,9 @@ ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 VERSION_FILE = "version.txt"
 APP_NAME = "SuperStar"
 # 版本号格式：X.Y.Z 或 X.Y.Z-<预发布>（如 1.0.0-rc.1 / 1.2.0-rc3 / 2.0.0-beta.2）
-# 预发布后缀必须写进 version.txt —— exe 名、zip 名、Release tag 全部由它推导，
-# 否则预览版会和同号正式版重名（历史坑：tag 是 v1.0.0-rc.1，包却叫 SuperStar-1.0.0.exe）。
+# 预发布后缀必须写进 version.txt —— zip 名、Release tag 全部由它推导，
+# 否则预览版会和同号正式版重名（历史坑：tag 是 v1.0.0-rc.1，zip 却叫 SuperStar-1.0.0-win64.zip）。
+# 注意：exe 文件名恒为 SuperStar.exe（不带版本号），版本区分交给 zip 名承担。
 VERSION_RE = re.compile(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?")
 # 只在源码/测试时使用的模块，发行包一律排除
 TEST_ONLY_MODULES = ("demo_chaoxing", "gui.selftest")
@@ -47,6 +55,12 @@ LOG_NAME = "chaoxing.log"
 DATA_DIRNAME = "progress_cache"
 README_NAME = "使用说明.txt"
 LICENSE_NAME = "LICENSE"
+# onedir 的运行时目录名（PyInstaller 6 默认叫 _internal，这里换成更易懂的 runtime）
+# 目录里是 Python 运行时、依赖库与内嵌资源 —— exe 启动时按「exe 同级」找它，
+# 缺了就会报 "Failed to load Python DLL"，因此它必须与 exe 一起分发。
+RUNTIME_DIRNAME = "runtime"
+# 安装目录名（= 产物目录名）：dist/SuperStar/ 即用户解压后看到的那个文件夹
+INSTALL_DIRNAME = APP_NAME
 
 
 def parse_version(text: str, source: str = VERSION_FILE) -> str:
@@ -85,8 +99,9 @@ def is_prerelease(version: str) -> bool:
     return "-" in version
 
 
-def exe_name(version: str) -> str:
-    return f"{APP_NAME}-{version}.exe"
+def exe_name() -> str:
+    """主程序文件名（不带版本号，恒为 SuperStar.exe）。"""
+    return f"{APP_NAME}.exe"
 
 
 def zip_name(version: str) -> str:
@@ -94,24 +109,33 @@ def zip_name(version: str) -> str:
 
 
 VERSION = read_version()
-EXE_NAME = exe_name(VERSION)
+EXE_NAME = exe_name()
 ZIP_NAME = zip_name(VERSION)
 
 # 分发文档直接取自项目主目录的静态文件，构建脚本不再生成内容
 
 
 def build_exe(root: str, clean: bool = False) -> str:
+    """构建 onedir 产物，返回安装目录（含 ``SuperStar.exe`` 与 ``runtime/``）。
+
+    onedir 而非 onefile：onefile 每次启动都要把上千个文件解压到 %TEMP%，
+    换机首次运行时这批新文件还要被杀毒软件逐个扫描。onedir 直接就地加载，
+    免掉解包与首轮全量扫描 —— 这是「首次启动慢」的主要来源。
+    """
     if _pyinstaller is None:
         raise SystemExit("未安装 pyinstaller：pip install pyinstaller")
     sep = ";" if os.name == "nt" else ":"
     args = [
         os.path.join(root, "run.py"),
-        # --name 决定 spec 文件名与中间产物名：统一叫 SuperStar（一次性中间产物不带版本号），
-        # 最终 exe 在构建后重命名为 SuperStar-<版本>.exe
+        # --name 决定产物目录名：统一叫 SuperStar（内含 SuperStar.exe）
         "--name", APP_NAME,
-        "--onefile",
+        "--onedir",
+        # 运行时目录改名 runtime（默认 _internal）：对用户更易读，
+        # 且 bootloader 按这个名字在 exe 同级找运行时，缺了就起不来
+        "--contents-directory", RUNTIME_DIRNAME,
         "--windowed",
         "--noconfirm",
+        # 产物直接落在 dist/<name>/ —— 不再经过中间目录，避免上千文件的重复复制
         "--distpath", os.path.join(root, "dist"),
         "--workpath", os.path.join(root, "build"),
         # spec 是构建中间产物：统一写进 build/SuperStar.spec，项目根不再堆 *.spec
@@ -132,11 +156,14 @@ def build_exe(root: str, clean: bool = False) -> str:
         "--hidden-import", "openai",
         "--hidden-import", "httpx",
         "--hidden-import", "pydantic",
+        # 显式禁用 UPX：onefile 时代是 no-op（本机/CI 无 upx），但 onedir 下
+        # UPX 会压缩每个 dll/pyd，运行时反而要逐个解压回内存，白白拖慢启动
+        "--noupx",
     ]
     if clean:
         args.append("--clean")
 
-    # 排除项：测试专用模块 + 与本项目无关的重量级包（保证单文件体积最小）
+    # 排除项：测试专用模块 + 与本项目无关的重量级包（保证安装目录最小）
     # 注意：openai / httpx / pydantic 必须保留 —— provider=AI（OpenAI 兼容端点，
     # 含 DeepSeek 官方 API）依赖它们，api/answer.py 是 try-import，缺库则该提供方不可用。
     excludes = list(TEST_ONLY_MODULES) + [
@@ -146,27 +173,51 @@ def build_exe(root: str, clean: bool = False) -> str:
     for module in excludes:
         args += ["--exclude-module", module]
 
+    # 产物目录的清理由 PyInstaller 自己完成（COLLECT 前会 _make_clean_directory，
+    # --noconfirm 表示直接删不询问），因此这里不再重复删除，避免多一次批量删除。
+    install_dir = os.path.join(root, "dist", APP_NAME)
     _pyinstaller.run(args)
-    # PyInstaller 产物固定叫 SuperStar.exe，这里重命名为带版本号的分发名
-    built = os.path.join(root, "dist", f"{APP_NAME}.exe")
-    exe = os.path.join(root, "dist", EXE_NAME)
-    if not os.path.exists(built):
-        raise SystemExit(f"构建失败：未生成 {built}")
-    if os.path.abspath(built) != os.path.abspath(exe):
-        os.replace(built, exe)
-    return exe
+
+    # onedir 产物：<distpath>/<name>/{SuperStar.exe, runtime/}
+    exe = os.path.join(install_dir, EXE_NAME)
+    if not os.path.exists(exe):
+        raise SystemExit(f"构建失败：未生成 {exe}")
+    runtime = os.path.join(install_dir, RUNTIME_DIRNAME)
+    if not os.path.isdir(runtime):
+        raise SystemExit(f"构建失败：未生成运行时目录 {runtime}")
+    return install_dir
 
 
-def stage_install(root: str, target_dir: str, exe: str) -> "list[str]":
-    """把发行包所需的全部文件铺到 ``target_dir``（= 用户解压后看到的文件夹）。
+def stage_install(root: str, target_dir: str, app_dir: str) -> "list[str]":
+    """把 onedir 产物 + 随包文件铺到 ``target_dir``（= 用户解压后看到的文件夹）。
+
+    onedir 产物（``SuperStar.exe`` + ``runtime/``）由 PyInstaller 落在 ``app_dir``：
+      - ``target_dir == app_dir``（正式构建）：exe 与 runtime 原地不动，只补随包文件；
+      - ``target_dir != app_dir``（自检/测试）：把 exe 与 runtime 整棵树拷过去。
+    两种情况都不做删除操作。
+
+    布局刻意做成「exe 与 runtime/ 平铺在同一层」：bootloader 按 exe 所在目录
+    找运行时目录，所以两者必须同级；这样运行期文件（config/log/cache）也仍在
+    exe 顶层，``paths.app_dir()`` 的语义完全不变。
 
     返回铺好的条目名列表，供测试断言与构建日志使用。
     """
     os.makedirs(target_dir, exist_ok=True)
+    same_dir = os.path.abspath(target_dir) == os.path.abspath(app_dir)
 
+    # 主程序
+    src_exe = os.path.join(app_dir, EXE_NAME)
     dst_exe = os.path.join(target_dir, EXE_NAME)
-    if os.path.abspath(exe) != os.path.abspath(dst_exe):   # dist/ 铺装时源即目标，跳过
-        shutil.copy2(exe, dst_exe)
+    if not same_dir and os.path.exists(src_exe):
+        shutil.copy2(src_exe, dst_exe)
+
+    # 运行时目录（Python 运行时 / 依赖库 / 内嵌资源）
+    src_runtime = os.path.join(app_dir, RUNTIME_DIRNAME)
+    dst_runtime = os.path.join(target_dir, RUNTIME_DIRNAME)
+    if not same_dir and os.path.isdir(src_runtime):
+        # dirs_exist_ok：覆盖式拷贝，不删除任何东西
+        shutil.copytree(src_runtime, dst_runtime, dirs_exist_ok=True)
+
     shutil.copy2(os.path.join(root, CONFIG_NAME), os.path.join(target_dir, CONFIG_NAME))
     # 空日志文件：程序追加写入，用户不会看到「运行后突然多出一个文件」
     with open(os.path.join(target_dir, LOG_NAME), "w", encoding="utf-8"):
@@ -183,31 +234,36 @@ def stage_install(root: str, target_dir: str, exe: str) -> "list[str]":
         raise SystemExit(f"缺少开源协议文件：{license_src}")
     shutil.copy2(license_src, os.path.join(target_dir, LICENSE_NAME))
 
-    return sorted([EXE_NAME, CONFIG_NAME, LOG_NAME, DATA_DIRNAME + os.sep,
-                   README_NAME, LICENSE_NAME])
+    return sorted([EXE_NAME, RUNTIME_DIRNAME + os.sep, CONFIG_NAME, LOG_NAME,
+                   DATA_DIRNAME + os.sep, README_NAME, LICENSE_NAME])
 
 
-def make_zip(root: str, exe: str) -> str:
-    """由 stage_install 的产物打包；zip 内不再套 ``SuperStar-<版本>/`` 顶层目录。
+def make_zip(root: str, install_dir: str) -> str:
+    """把安装目录打包成 zip；zip 内不再套 ``SuperStar-<版本>/`` 顶层目录。
 
     解压即主目录（解压器默认会按 zip 名建一层文件夹，用户看到的就是程序文件夹）。
+    直接从安装目录读取（不再复制一份中间目录）—— 运行时目录上千个文件，
+    复制 + 删除既慢又容易触发批量删除拦截。
     """
     zip_path = os.path.join(root, "dist", ZIP_NAME)
     os.makedirs(os.path.dirname(zip_path), exist_ok=True)
-    stage = os.path.join(root, "build", "dist_stage")
-    shutil.rmtree(stage, ignore_errors=True)
-    stage_install(root, stage, exe)
 
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
         # 空目录不会被自动收录，必须显式写目录条目
         info = zipfile.ZipInfo(DATA_DIRNAME + "/")
         info.external_attr = (0o40755 << 16) | 0x10
         zf.writestr(info, b"")
-        for name in sorted(os.listdir(stage)):
-            full = os.path.join(stage, name)
+        for name in sorted(os.listdir(install_dir)):
+            full = os.path.join(install_dir, name)
             if os.path.isfile(full):
                 zf.write(full, arcname=name)
-    shutil.rmtree(stage, ignore_errors=True)
+            elif os.path.isdir(full):
+                # 运行时目录：整棵子树按相对路径写入（arcname 用 / 分隔，跨平台一致）
+                for base, _dirs, files in os.walk(full):
+                    for fname in sorted(files):
+                        fpath = os.path.join(base, fname)
+                        arc = os.path.relpath(fpath, install_dir).replace(os.sep, "/")
+                        zf.write(fpath, arcname=arc)
     return zip_path
 
 
@@ -242,24 +298,41 @@ def _ensure_tkinter() -> None:
         )
 
 
+def _dir_size(path: str) -> float:
+    """目录总大小（MB）：onedir 下 exe 本身很小，体积主要在运行时目录里。"""
+    total = 0
+    for base, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(base, name))
+            except OSError:
+                pass
+    return total / 1024 / 1024
+
+
 def main() -> None:
     root = os.path.dirname(os.path.abspath(__file__))
     _force_utf8_stdio()
     _ensure_tkinter()
     print(f"VERSION={VERSION} (from {VERSION_FILE})")
     print(f"PRERELEASE={str(is_prerelease(VERSION)).lower()}")
-    exe = build_exe(root, clean="--clean" in sys.argv)
-    size = os.path.getsize(exe) / 1024 / 1024
-    print(f"BUILD_DONE={exe}  size={size:.1f}MB")
+    app_dir = build_exe(root, clean="--clean" in sys.argv)
+    print(f"BUILD_DONE={app_dir}  size={_dir_size(app_dir):.1f}MB")
 
     if "--exe-only" in sys.argv:
+        # onedir 没有「只要一个 exe」的概念：产物就是整个应用目录
         return
 
-    # dist/ 本身即「解压后的文件夹」：exe + 随包文件一起铺开
-    staged = stage_install(root, os.path.join(root, "dist"), exe)
-    print(f"STAGE_DONE=dist/ {staged}")
+    # dist/SuperStar/ 即「解压后的文件夹」：exe + runtime/ + 随包文件
+    staged = stage_install(root, app_dir, app_dir)
+    print(f"STAGE_DONE=dist/{INSTALL_DIRNAME}/ {staged}")
 
-    zip_path = make_zip(root, exe)
+    # 清理 onefile 时代的遗留产物：dist/SuperStar.exe（旧单文件 exe）
+    legacy_exe = os.path.join(root, "dist", EXE_NAME)
+    if os.path.isfile(legacy_exe):
+        os.remove(legacy_exe)
+
+    zip_path = make_zip(root, app_dir)
     zsize = os.path.getsize(zip_path) / 1024 / 1024
     print(f"ZIP_DONE={zip_path}  size={zsize:.1f}MB")
 

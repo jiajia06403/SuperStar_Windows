@@ -103,10 +103,6 @@ class DemoChaoxing:
         ]
         return jobs, {"notOpen": False}
 
-    def is_point_open(self, course, point):
-        """供「读取进度」逐章探测：演示模式下除指定章节外都视为已开放。"""
-        return str(point.get("id")) not in self.not_open_ids
-
     # ---- 学习动作：像真实平台一样，完成后把章节标记为已完成 ----
     def _finish(self, job) -> None:
         """把 job 所属章节点标记为已完成（模拟服务端进度落库）。"""

@@ -17,8 +17,11 @@
 存放结构（同一门课题目和答案相同 -> 只按课程分文件，全账号共享）
 --------------------------------------------------------------
     progress_cache/local_bank/
-        高等数学_246831735.json        <- 一门课一个文件
-        大学英语_247100002.json
+        246831735.json                 <- 一门课一个文件，文件名 = 课程 ID
+        247100002.json
+
+文件名一律用**课程 ID**（拿不到 ID 时才退回课程标题）：标题会随老师改课名而变，
+ID 不会；同名课（不同学期）也不会再互相覆盖。
 
 不按账号分文件夹：换账号做同一门课直接命中同一份文件，也不需要重复采集。
 同一道题若在多门课里出现，查询会先看当前课程文件，再兜底查其它课程文件。
@@ -76,8 +79,10 @@ _MIGRATED = False                  # 旧版单文件迁移每个进程只尝试�
 
 _WS_RE = re.compile(r"[\s\u3000]+")
 _LEAD_NO_RE = re.compile(r"^\s*\d+\s*[.、．)）]\s*")
+# 「1【单选题】题干」这种题号后面直接跟题型标签，没有分隔符
+_LEAD_NO_TAG_RE = re.compile(r"^\s*\d+\s*(?=[\[【(（])")
 _LEAD_PUNCT_RE = re.compile(r"^[.、．)）:：\-—\s]+")
-_LEAD_TAG_RE = re.compile(r"^[\[【(（]\s*(?:单选|多选|判断|填空|简答|论述|名词解释)题?\s*[\]】)）]\s*")
+_LEAD_TAG_RE = re.compile(r"^[\[【(（]\s*(?:单选|多选|选择|判断|填空|简答|论述|名词解释)题?\s*[\]】)）]\s*")
 _TAIL_SCORE_RE = re.compile(r"[（(]\s*\d+(?:\.\d+)?\s*分\s*[)）]\s*$")
 _TAIL_EMPTY_RE = re.compile(r"[（(]\s*[)）]\s*$")
 _OPTION_LETTER_RE = re.compile(r"^\s*([A-Za-z])\s*[.、．)）:：]?\s*")
@@ -97,9 +102,16 @@ def normalize_text(text: str) -> str:
     value = value.replace("\u200b", "").replace("\ufeff", "").replace("\xa0", " ")
     value = _TAIL_SCORE_RE.sub("", value)
     value = _TAIL_EMPTY_RE.sub("", value)
-    value = _LEAD_TAG_RE.sub("", value)
-    value = _LEAD_NO_RE.sub("", value)
-    value = _LEAD_PUNCT_RE.sub("", value)
+    # 题号与题型标签可能交替出现（实测："1【单选题】【选择题】题干"、"【判断题】1. 题干"），
+    # 所以反复剥到不再变化为止，保证作答页与成绩页的同一道题得到同一个指纹。
+    for _ in range(4):
+        before = value
+        value = _LEAD_NO_RE.sub("", value)
+        value = _LEAD_NO_TAG_RE.sub("", value)
+        value = _LEAD_TAG_RE.sub("", value)
+        value = _LEAD_PUNCT_RE.sub("", value)
+        if value == before:
+            break
     return _WS_RE.sub("", value).strip()
 
 
@@ -216,15 +228,17 @@ def safe_name(value: str, default: str = "", limit: int = 48) -> str:
 
 
 def course_filename(course: str = "", course_id: str = "") -> str:
-    """课程文件名：``标题_课程ID.json``（有哪个用哪个，都没有则「未命名课程」）。"""
-    title = safe_name(course, "")
+    """课程文件名：**优先用课程 ID**（``<课程ID>.json``，没有 ID 才退回课程标题）。
+
+    课程标题会改名（老师改课名 / 同名课不同学期），课程 ID 不会；
+    用 ID 当文件名既能避免重名互相覆盖，也不怕标题里带非法字符。
+    """
     cid = safe_name(course_id, "", limit=20)
-    if title and cid:
-        return f"{title}_{cid}.json"
-    if title:
-        return f"{title}.json"
     if cid:
         return f"{cid}.json"
+    title = safe_name(course, "")
+    if title:
+        return f"{title}.json"
     return f"{UNKNOWN_COURSE}.json"
 
 
@@ -709,7 +723,7 @@ class LocalBank:
 # 多账号 / 多课程题库目录
 # --------------------------------------------------------------------------- #
 class BankStore:
-    """``<根目录>/<课程>.json`` 结构的**共享**题库（不按账号分文件夹）。
+    """``<根目录>/<课程ID>.json`` 结构的**共享**题库（不按账号分文件夹）。
 
     同一门课的题目和答案对所有账号都一样，所以一门课一个文件、全账号共用：
     换账号做同一门课直接命中，也不需要重复采集。入库只写当前课程文件，
@@ -804,7 +818,7 @@ class BankStore:
 
     # ---------------- 路径 ----------------
     def path_for(self, course: str = "", course_id: str = "") -> str:
-        """``<根目录>/<课程>.json``（一门课一个文件，全账号共享）。"""
+        """``<根目录>/<课程ID>.json``（一门课一个文件，全账号共享）。"""
         return os.path.join(self.root, course_filename(course, course_id))
 
     def _bank(self, path: str) -> LocalBank:
@@ -1127,18 +1141,18 @@ class BankStore:
         return {"added": added, "merged": merged, "total": len(entries)}
 
     def clear(self, account: "str | None" = None, course: "str | None" = None) -> int:
-        """清空题库文件（默认清全部；可按课程限定）。返回移除的条数。"""
+        """清空题库文件（默认清全部；可按课程限定，课程标题或课程 ID 都能匹配）。"""
         removed = 0
         with _LOCK:
             files = self._scan(force=True)
             for info in files:
-                if course:
-                    bank = self._bank(info["path"])
-                    name = str(bank._data.get("course") or "")
-                    stem = os.path.splitext(info["file"])[0]
-                    if course not in name and course not in stem:
-                        continue
                 bank = self._bank(info["path"])
+                if course:
+                    name = str(bank._data.get("course") or "")
+                    cid = str(bank._data.get("course_id") or "")
+                    stem = os.path.splitext(info["file"])[0]
+                    if course not in (name, cid, stem) and course not in name:
+                        continue
                 removed += len(bank.snapshot())
                 try:
                     os.remove(info["path"])
@@ -1161,11 +1175,13 @@ class BankStore:
             pass
 
     def migrate_legacy(self) -> Optional[dict]:
-        """把旧结构与旧版单文件迁到 ``<根目录>/<课程>.json``。
+        """把旧结构与旧版单文件迁到 ``<根目录>/<课程ID>.json``。
 
         1. ``progress_cache/local_bank.json``（初版单文件）-> ``旧版题库.json``；
         2. ``<根目录>/<账号>/<课程>.json``（上一版按账号分文件夹）-> 按课程合并到
-           根目录下的同名文件，旧账号文件夹改名为 ``<账号>.migrated``（保留数据不删）。
+           根目录下的同名文件，旧账号文件夹改名为 ``<账号>.migrated``（保留数据不删）；
+        3. ``<根目录>/<课程标题>_<课程ID>.json``（上一版命名）-> ``<课程ID>.json``
+           （目标已存在则合并进去，避免两份文件各存一半题目）。
         """
         total = {"added": 0, "merged": 0, "migrated": 0}
         changed = False
@@ -1221,10 +1237,60 @@ class BankStore:
             except Exception as exc:  # noqa: BLE001
                 logger.error(f"迁移旧账号题库目录失败（已保留原目录 {folder}）：{exc}")
 
+        if self._rename_course_id_files(total):
+            changed = True
+
         if changed:
             self._invalidate()
             self._files = []
         return total if changed else None
+
+    def _rename_course_id_files(self, total: dict) -> bool:
+        """把旧命名 ``课程标题_课程ID.json`` 改存为 ``课程ID.json``。
+
+        按文件里记录的 ``course_id`` 判断目标名（不靠猜文件名）：目标已存在就合并进去
+        （同一门课可能已经有新名字的文件），合并成功才删旧文件——任何一步失败都保留原文件。
+        """
+        changed = False
+        try:
+            names = [n for n in sorted(os.listdir(self.root)) if n.lower().endswith(".json")]
+        except OSError:
+            return False
+        for name in names:
+            path = os.path.join(self.root, name)
+            if not os.path.isfile(path):
+                continue
+            try:
+                data = _read_json(path)
+            except Exception as exc:  # noqa: BLE001 - 单个文件坏了不影响其它文件改名
+                logger.error(f"题库文件改名时读取失败（已跳过 {name}）：{exc}")
+                continue
+            course = str(data.get("course") or "")
+            course_id = str(data.get("course_id") or "")
+            if not course_id:
+                continue
+            target = os.path.abspath(self.path_for(course, course_id))
+            if target == os.path.abspath(path):
+                continue
+            entries = data.get("entries")
+            bank = self._bank(target)
+            bank.set_meta(course=course or UNKNOWN_COURSE, course_id=course_id)
+            if isinstance(entries, dict) and entries:
+                part = self._merge_into(bank, entries)
+                total["added"] += part["added"]
+                total["merged"] += part["merged"]
+                total["migrated"] += 1
+            if not os.path.isfile(target):
+                continue                     # 目标没落地就别删旧文件
+            try:
+                os.remove(path)
+            except OSError as exc:
+                logger.error(f"旧题库文件改名后删除失败（已保留 {name}）：{exc}")
+                continue
+            self._banks.pop(os.path.abspath(path), None)
+            changed = True
+            logger.info(f"题库文件已改名为课程 ID：{name} -> {os.path.basename(target)}")
+        return changed
 
     def list_courses(self) -> List[dict]:
         """课程文件清单（界面展示 / 调试用）。"""

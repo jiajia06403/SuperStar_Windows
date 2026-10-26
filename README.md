@@ -35,19 +35,25 @@
   同时逐章探测章节是否开放，未开放的章节在列表里显示「未开放」而不是「待学」。
   整个过程异步进行：先出完成状态，再逐行点亮「未开放」，界面不卡；期间按钮禁用，切课程/开始刷课会中断探测。
 - **答题不合格自动重答**：章节检测提交后回读任务点，平台仍判未通过则重新作答，
-  次数由 `config_win.ini` 的 `[tiku] work_retry` 控制（默认 1，0 表示不重答）；
+  单次刷课内的次数由 `config_win.ini` 的 `[tiku] work_retry` 控制（默认 3，0 表示不重答）；
   重答后仍不合格的章节保留「未完成」，不计入已完成。
 - **未开放章节智能处理**：先回退检查上一章是否未完成并重做，再回到当前章验证是否解锁；
-  上一章已完成则每 15 秒轮询当前章，直到开放或用户停止。
+  **若上一章因答题不合格而一直不通过（当前章永远解不了锁），重答不设上限**，
+  每 5 秒再来一轮，直到平台判通过或用户点停止；上一章已完成则每 15 秒轮询当前章，直到开放或用户停止。
 - **视频状态日志**：观看视频时每 N 秒在日志输出一条进度
   （章节号 + 章节名 / 视频名 / 进度百分比 / 已播与总时长 / 倍速 / 预计剩余时间），
   便于判断是否卡住；间隔由 `config_win.ini` 的 `[common] video_log_interval` 控制（默认 30 秒，0 = 关闭），
   界面「设置」里也能改，刷课过程中改动立即生效。
+- **界面主题（Win11 观感）**：浅色 / 深色 / **跟随系统**三档，在「设置 → 外观」里切换，
+  也可改 `[ui] theme`（`system` / `light` / `dark`）。跟随系统时轮询注册表
+  `AppsUseLightTheme`，Windows 一改深浅色界面自动重刷；标题栏走 DWM
+  沉浸式深色 + Win11 圆角。深色下章节状态色、日志告警色成套替换（原深绿/深红在
+  深底上不可读）。工具栏在窄窗口/高 DPI 缩放下自动折成两行，不再裁掉右侧按钮。
 - **本地题库（只存正确答案）**：作业提交成功后向平台核验，**判对**的答案入库、
   **判错但页面给了正确答案的，把正确答案入库**；库里已有的答案若与平台给出的正确答案
   不一致（典型场景：用题库答案作答却被判错），会被**覆写纠正**。重做同一份作业、
   或用另一个账号做同一门课时优先命中，不再消耗题库/大模型额度。题库**按课程一个文件、
-  全账号共享**（`progress_cache/local_bank/<课程>.json`），只写「库里没有」或
+  全账号共享**（`progress_cache/local_bank/<课程ID>.json`），只写「库里没有」或
   「和平台不一致」的题，按选项文本重映射，选项乱序也能对上；支持导出/导入/合并共享。
   可在配置里一键停用。
 - **已完成账号批量采集**：主界面「采集题库」把历史作业的成绩页读一遍（只发 GET、不提交），
@@ -58,10 +64,12 @@
 
 ## 使用说明
 
-1. 解压发行包，双击 `SuperStar-<版本>.exe`（无需安装）；
+1. 解压发行包，双击 `SuperStar.exe`（无需安装）；
 2. 点「添加账号」登录（或勾选 cookies 登录）；
 3. 左侧点击课程名勾选要刷的课程，可「全选」；
-4. 设置倍速/并发，点「开始刷课」；右侧看章节状态，底部看日志，状态栏显示当前章节进度；
+4. 设置倍速/并发（默认 2.0 倍速 / 4 并发），点「开始刷课」；右侧看章节状态，底部看日志，状态栏显示当前章节进度；
+   这两项会写进 `config_user.ini` 的 `[common] speed / jobs`，下次启动自动恢复上次的取值
+   （范围 1.0~2.0 倍速 / 1~8 并发，超出范围会按边界值纠正）；
 5. 「读取进度」用服务端真实进度刷新缓存；「刷新列表/刷新章节」重新拉取课程与章节；
 6. 需要自动答题：点工具栏「设置」，在「答案提供方式」下拉中选（言溪 / LIKE / TikuAdapter / AI / DeepSeek / SiliconFlow），
    下方只会显示该方式需要的项（TOKEN、服务地址，或接口地址 + API Key + 模型）；
@@ -73,23 +81,30 @@
 
 ## 分发形态：整个文件夹，不是单个 exe
 
-运行期需要的 6 个条目**全部随压缩包分发**：
+运行期需要的条目**全部随压缩包分发**：
 
 | 条目 | 作用 |
 | --- | --- |
-| `SuperStar-<版本>.exe` | 主程序 |
+| `SuperStar.exe` | 主程序（文件名不带版本号，版本体现在压缩包名上） |
+| `runtime/` | 程序运行时文件（Python 运行时 / 依赖库 / 内嵌资源，**exe 启动必需，勿删**） |
 | `config_win.ini` | 默认配置（随包自带，升级时被覆盖，用户不要改） |
 | `config_user.ini` | 用户配置（首次启动自动生成，升级不覆盖） |
 | `chaoxing.log` | 运行日志（空文件，追加写入） |
-| `progress_cache/` | 进度缓存 / 账号 / cookies / 题库答案缓存 / **本地题库**（`local_bank/<账号>/<课程>.json`） |
+| `progress_cache/` | 进度缓存 / 账号 / cookies / 题库答案缓存 / **本地题库**（`local_bank/<课程ID>.json`） |
 | `使用说明.txt` | 随包说明 |
 | `LICENSE` | GPL-3.0 许可文本（二进制分发必须随附） |
 
 设计约束：
 
+- **用 PyInstaller onedir（不是 onefile）**：onefile 每次启动都要把上千个文件解压到 `%TEMP%`，
+  换机首次运行时这批新文件还要被杀毒软件逐个扫描 —— 这是「首次启动要好几秒」的主因；
+  onedir 直接就地加载，免掉解包与首轮全量扫描。代价是不能只拷一个 exe
+  （只拷 exe 会报 `Failed to load Python DLL`）；
+- `runtime/` 必须与 exe **平铺同级**（bootloader 只在 exe 同级找运行时目录）；
 - 运行期所有写入都收进上述位置（`paths.py` 统一解析），exe 目录顶层只多出 `config_user.ini`；
 - `config_win.ini` 不内嵌进 exe，只由压缩包随附；
 - 压缩包内**不套顶层目录**（解压即得主目录），zip 名即默认解压文件夹名；
+- 升级建议先删旧文件夹再解压新包（避免旧文件残留）；
 - 程序本身不做文件校验、不弹窗、不阻断启动，注意事项写在 `使用说明.txt`。
 
 ---
@@ -163,11 +178,12 @@ progress_cache/local_bank/
 
 查询顺序：当前课程文件 -> 其它课程文件（同一道题被多门课复用时也能命中）。
 旧结构会在启动时自动迁移：初版单文件 `local_bank.json` 和上一版的
-`<账号>/<课程>.json` 都会合并进课程文件，旧目录**改名**为 `.migrated` 保留，不删数据。
+`<账号>/<课程>.json` 都会合并进课程文件，旧目录**改名**为 `.migrated` 保留，不删数据；
+上一版命名 `<课程标题>_<课程ID>.json` 会在启动时自动改名为 `<课程ID>.json`（已存在则合并）。
 
 | 操作 | 位置 / 命令 |
 | --- | --- |
-| 存储 | `progress_cache/local_bank/<课程>.json`（`[tiku] local_bank_dir` 可改根目录） |
+| 存储 | `progress_cache/local_bank/<课程ID>.json`（`[tiku] local_bank_dir` 可改根目录） |
 | 界面 | 设置 →「本地题库…」：查看统计、导出、导入合并、打开目录、清空 |
 | 采集 | 主界面「采集题库」按钮，或 `python -m api.collect --course 关键词` |
 | 命令行 | `python -m api.local_bank stats` / `list` / `export out.json` / `import in.json` / `merge a.json b.json -o 目录` |
@@ -199,7 +215,9 @@ progress_cache/local_bank/
 | 给了「正确答案」 | 正确答案（最权威，判错也照收） |
 | 判对但没公布答案 | 页面上的「我的答案」（已被平台判对） |
 | 判错且没有正确答案 | 跳过（不知道对的是什么，不猜） |
-| 未批阅 / 作业已关闭 / 页面改版认不出 | 跳过并计入「无法识别」 |
+| 作业还没提交过 | 跳过，计入「未提交」（页面上只有作答区，没有答案可采） |
+| 已提交但未批阅 / 未公布答案 | 跳过，计入「未批阅」 |
+| 页面改版认不出 | 跳过并计入「无法识别」，原始页面存到 `progress_cache/collect_debug/`（报问题时发这个文件） |
 | 题库里已有答案且与页面一致 | 跳过（不重复写） |
 | 题库里已有答案但与页面不一致 | 覆写纠正（页面答案为准） |
 
@@ -211,7 +229,7 @@ progress_cache/local_bank/
   或 courseId 过滤）、`--max-works 3`（只读 3 份作业试跑）、`--uid <uid>`（指定已保存账号）。
   命令行复用本机已保存的账号密码（DPAPI 加密），所以要先在界面登录过一次。
 
-采集结果落在**课程文件**：`local_bank/<课程>.json`，所有账号共用。所以拿一个已刷完的老账号
+采集结果落在**课程文件**：`local_bank/<课程ID>.json`，所有账号共用。所以拿一个已刷完的老账号
 采集一轮，新账号做同一门课时就能直接用它；再采一次只写新题和与页面不一致的题，
 不会重复写入。
 
@@ -240,7 +258,8 @@ SuperStar_Windows/
 ├── config_win.ini          # 默认配置（随包自带，升级时覆盖 —— 用户不要改）
 ├── 使用说明.txt             # 随包分发的用户文档
 ├── LICENSE                 # GPL-3.0
-└── test/                   # 引擎单测、端到端冒烟、GUI 冒烟、路径约定
+└── test/                   # 分层测试（core/gui/slow）+ run_test.py 调度器
+    └── archive/            # 已完成使命的一次性探针脚本（不参与自动测试）
 ```
 
 ---
@@ -261,20 +280,21 @@ cookies 登录：把 `cookies.txt`（格式 `k=v;k2=v2`）放到 `progress_cache
 
 ## 构建与分发
 
-**版本号唯一来源：仓库根目录 `version.txt`**：exe 名、zip 名、Release 标题全部原样取它的内容
-（`1.0.0` 就出 `SuperStar-1.0.0.exe`，`1.0.0-rc.1` 就出 `SuperStar-1.0.0-rc.1.exe`）。
+**版本号唯一来源：仓库根目录 `version.txt`**：zip 名、Release 标题全部原样取它的内容
+（`1.0.0` 就出 `SuperStar-1.0.0-win64.zip`，`1.0.0-rc.1` 就出 `SuperStar-1.0.0-rc.1-win64.zip`）。
+**exe 文件名恒为 `SuperStar.exe`（不带版本号）**，版本区分由压缩包名承担。
 发新版 = 改 `version.txt` → 打成 tag 推上去（惯例 `v<版本>`），Release 由 CI 产出。
 
 ```bash
 python -m pip install pyinstaller
-python build.py              # dist/ 铺成安装目录 + dist/SuperStar-<版本>-win64.zip
+python build.py              # dist/ 铺成安装目录 + dist/SuperStar-<版本>-win64.zip（exe 恒为 SuperStar.exe）
 python build.py --clean      # 清理后重建
-python build.py --exe-only   # 只出 exe
+python build.py --exe-only   # 只出 onedir 产物目录（build/onedir/SuperStar/），不铺装不打 zip
 ```
 
 `python build.py` 做两件事：
 
-1. **铺装 `dist/`**：exe + 随包 4 项 —— `dist/` 即用户解压后看到的文件夹，可直接双击验证；
+1. **铺装 `dist/`**：exe + `runtime/` + 随包文件 —— `dist/` 即用户解压后看到的文件夹，可直接双击验证；
 2. **打 zip**：同等内容（含 `LICENSE`）直接放在 zip 根，解压即得主目录。
 
 产物**不含演示模式**：构建时 `--exclude-module demo_chaoxing gui.selftest`，
@@ -283,26 +303,37 @@ python build.py --exe-only   # 只出 exe
 ```bash
 python run.py --selftest   # 源码态界面自检，退出码 0 = 通过
 python run.py --demo       # 源码态演示模式
-dist/SuperStar-<版本>.exe --selftest   # 退出码 3：证明发行包已无演示能力
+dist/SuperStar/SuperStar.exe --selftest   # 退出码 3：证明发行包已无演示能力
 ```
 
 ---
 
 ## 测试
 
-```bash
-python test/run_test.py           # 一键跑全部（推荐）
-python test/run_test.py --dist    # 额外校验 dist 下发行 exe 拒绝 --selftest（退出码 3）
+测试按耗时与依赖分三层，**默认只跑 core**（日常改完跑这个即可）：
 
-python test/test_engine.py        # 引擎逻辑单测（mock，无网络）
-python test/test_demo_smoke.py    # 引擎端到端冒烟（假后端，无网络）
-python test/test_gui_smoke.py     # 界面冒烟：真实 Tk 窗口跑演示流程并断言控件
-python test/test_paths.py         # 路径约定：随包文件清单 + zip 内容
+| 层 | 内容 | 命令 | 参考耗时 |
+| --- | --- | --- | --- |
+| `core` | 纯逻辑单测，无窗口 / 无网络 | `python test/run_test.py` | ~45s |
+| `gui` | 真实 Tk 窗口（界面冒烟、设置窗、倍速并发、主题切换） | `python test/run_test.py --gui` | ~30s |
+| `slow` | 日志文案、构建产物与版本号约定 | `python test/run_test.py --slow` | ~15s |
+
+```bash
+python test/run_test.py              # core（默认）
+python test/run_test.py --all        # 全量：core + gui + slow
+python test/run_test.py --all --dist # 追加校验发行 exe 拒绝 --selftest（退出码 3）
+python test/run_test.py --list       # 只看分层清单
 ```
+
+分层靠每个测试文件首行的 `# layer: core|gui|slow` 标记，**新增测试缺省进 core**，不会漏跑。
+
+`gui` 层要真窗口：当前解释器没有 tkinter 时自动回落到 `.venv-build/Scripts/python.exe`，
+两者都没有则明确 SKIP 而不是报失败。
 
 `test_gui_smoke.py` 校验：课程/章节渲染、章节状态全部更新为「完成」、日志非空、
 开始按钮恢复可用、布局未被窗口裁切。
 
+> 一次性调试脚本归档在 `test/archive/`（说明见其中 `README.md`），不参与上述调度器。
 > 测试依赖仓库内的 `demo_chaoxing.py`，只能在源码目录运行，**也不在 CI 中执行**
 > （CI 只做构建与发行包基本校验，保持构建快速）。
 
@@ -342,8 +373,11 @@ CI 不做版本号格式校验、不校验 tag 与 `version.txt`、也不区分�
 - 本地题库的自动收录依赖「提交后页面能读出对错」：平台尚未批阅、或判分页改版时不会收录
   （只影响入库，不影响答题）；判错但页面给了「正确答案」时也会把正确答案收录（纠错）。
   需要「不管对错先存下来」时才把 `local_bank_trust` 设为 `true`。
-- 采集题库同样依赖页面权限：教师关闭「查看答案」、作业未批阅或已关闭时读不到答案，
-  只会计入「无法识别」并跳过（不影响答题与已有题库）。
+- 采集题库只对**已提交**的作业有效：没交过的作业页只有作答区，没有对错和答案可采
+  （日志里记为「未提交」）。所以先去刷课（刷课会提交章节测验）或自己交一遍，再采集。
+  教师关闭「查看答案」、作业未批阅时读不到答案，只会计入「未批阅」并跳过（不影响答题与已有题库）；
+  页面结构改版认不出时会把原始 HTML 存到 `progress_cache/collect_debug/`，
+  日志里给出路径，反馈问题时发那个文件即可。
 
 ---
 

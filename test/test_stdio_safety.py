@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# layer: core  # core=默认必跑 / gui=真窗口 / slow=仅 --all
 """无控制台（GUI 打包态）下的 stdio 容错回归测试。
 
 背景：PyInstaller --windowed / pythonw 启动时 sys.stdout、sys.stderr 均为 None，

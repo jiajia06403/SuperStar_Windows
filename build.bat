@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul
 setlocal
-REM 构建 SuperStar（默认发行包：dist\SuperStar-<版本>.exe + 随包文件 + 分发 zip，不含演示模式）
+REM 构建 SuperStar（默认发行包：dist\SuperStar\ 整个文件夹 + 分发 zip，不含演示模式）
 REM 测试包（含演示模式与自检）：build.bat --test-build
 REM
 REM 重要：必须用项目自带的 .venv-build 环境（Python 3.12，自带可用 tkinter）。

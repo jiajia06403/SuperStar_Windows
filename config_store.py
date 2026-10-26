@@ -37,13 +37,18 @@ USER_HEADER = [
     "; 要改配置请改本文件；改 config_win.ini 是无效的（下次升级必被覆盖）。",
 ]
 
-# 取值校验规则（只对 [tiku] / [common] 生效；空值一律视为合法）
+# 取值校验规则（对 [tiku] / [common] / [ui] 生效；空值一律视为合法）
 TIKU_FLOAT_KEYS = ("cover_rate", "delay", "min_interval_seconds")
 TIKU_INT_KEYS = ("work_retry", "likeapi_retry_times")
 TIKU_BOOL_KEYS = ("submit", "ignore_api_key", "likeapi_search", "likeapi_vision", "likeapi_retry",
                   "local_bank", "local_bank_verify")
 TIKU_PROVIDERS = ("", "TikuYanxi", "TikuLike", "TikuAdapter", "AI", "DeepSeek", "SiliconFlow")
-COMMON_INT_KEYS = ("video_log_interval",)
+COMMON_INT_KEYS = ("video_log_interval", "jobs")
+COMMON_FLOAT_KEYS = ("speed",)
+# 有取值范围的键：超出范围视为非法（回落默认值），避免手改成界面之外的值
+COMMON_RANGES = {"jobs": (1, 8), "speed": (1.0, 2.0)}
+# [ui] 段：主题只能是这三种（写错就回落默认的「跟随系统」）
+UI_THEME_VALUES = ("system", "light", "dark")
 
 _SECTION_RE = re.compile(r"^\s*\[(?P<name>[^\]]+)\]\s*$")
 _KV_RE = re.compile(r"^\s*(?P<key>[^#;=\s][^=]*?)\s*=(?P<rest>.*)$")
@@ -212,7 +217,21 @@ def _invalid(section: str, key: str, value: str) -> bool:
     value = value.strip()
     if section == "common":
         if key in COMMON_INT_KEYS:
-            return not re.fullmatch(r"\d+", value)
+            if not re.fullmatch(r"\d+", value):
+                return True
+            low, high = COMMON_RANGES.get(key, (None, None))
+            return low is not None and not (low <= int(value) <= high)
+        if key in COMMON_FLOAT_KEYS:
+            try:
+                number = float(value)
+            except ValueError:
+                return True
+            low, high = COMMON_RANGES.get(key, (None, None))
+            return low is not None and not (low <= number <= high)
+        return False
+    if section == "ui":
+        if key == "theme":
+            return value.lower() not in UI_THEME_VALUES
         return False
     if section != "tiku":
         return False

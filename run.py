@@ -2,15 +2,15 @@
 """SuperStar 桌面客户端启动入口。
 
 用法（发行包只支持第 1 种）：
-    SuperStar-<版本>.exe        # 正常启动
-    SuperStar-<版本>.exe --demo     # 演示模式（仅测试包）
-    SuperStar-<版本>.exe --selftest # 界面自检（仅测试包）
+    SuperStar.exe        # 正常启动
+    SuperStar.exe --demo     # 演示模式（仅测试包）
+    SuperStar.exe --selftest # 界面自检（仅测试包）
 
 演示/自检依赖内置的 demo_chaoxing 模块，发行包在构建时已排除该模块，
 因此相关参数在发行包中会直接以退出码 3 拒绝。
 
-发行包按「整个文件夹」分发（exe + config_win.ini + chaoxing.log + progress_cache/），
-注意事项写在随包的使用说明.txt 里；程序本身不校验、不弹窗。
+发行包按「整个文件夹」分发（exe + runtime/ + config_win.ini + chaoxing.log +
+progress_cache/），注意事项写在随包的使用说明.txt 里；程序本身不校验、不弹窗。
 """
 import os
 import sys
@@ -51,10 +51,10 @@ def _tell(msg: str) -> None:
 
 
 def _exe_name() -> str:
-    """当前可执行文件名（打包态带版本号；源码态给出版本化示例名）。"""
+    """当前可执行文件名（恒为 SuperStar.exe，不带版本号）。"""
     if getattr(sys, "frozen", False):
         return os.path.basename(sys.executable)
-    return "SuperStar-<版本>.exe"
+    return "SuperStar.exe"
 
 
 def main() -> None:

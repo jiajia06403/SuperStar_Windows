@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# layer: core  # core=默认必跑 / gui=真窗口 / slow=仅 --all
 """本地题库测试（api/local_bank.py + api/work_verify.py）。
 
 覆盖：
@@ -294,7 +295,7 @@ def test_files_are_split_by_course_only():
     stats = store.stats()
     rel = sorted(os.path.relpath(c["path"], store.root).replace("\\", "/")
                  for c in stats["courses"])
-    assert rel == ["大学英语_1002.json", "高等数学_1001.json"], rel
+    assert rel == ["1001.json", "1002.json"], rel
     assert stats["total"] == 3 and stats["files"] == 2
     assert not any(os.path.isdir(os.path.join(store.root, n))
                    for n in os.listdir(store.root)), "不应再产生账号子目录"
@@ -336,7 +337,7 @@ def test_legacy_single_file_is_migrated():
 
 
 def test_account_folders_are_migrated_into_course_files():
-    """上一版「<根>/<账号>/<课程>.json」自动合并成「<根>/<课程>.json」。"""
+    """上一版「<根>/<账号>/<课程>.json」自动合并成「<根>/<课程ID>.json」。"""
     root = os.path.join(TMP, "mig_accounts")
     os.makedirs(os.path.join(root, "13800000000"))
     entry = {"q": "题目一", "y": "single", "a": "B", "x": ["乙选项"],
@@ -351,12 +352,69 @@ def test_account_folders_are_migrated_into_course_files():
     result = store.migrate_legacy()
     assert result and result["migrated"] == 1, result
     assert store.lookup("题目一", "single", OPTS) == "B"
-    assert os.path.isfile(os.path.join(root, "高等数学_1001.json"))
+    assert os.path.isfile(os.path.join(root, "1001.json"))
     assert not os.path.isdir(os.path.join(root, "13800000000")), "旧账号目录应已改名"
     assert os.path.isdir(os.path.join(root, "13800000000" + lb.MIGRATED_SUFFIX)), \
         "旧目录应保留为 .migrated（不删数据）"
     # 重复调用不会再迁移一次
     assert store.migrate_legacy() is None
+
+
+def test_course_filename_prefers_course_id():
+    """文件名用课程 ID：改课名、同名课都不会互相覆盖。"""
+    assert lb.course_filename("高等数学", "1001") == "1001.json"
+    assert lb.course_filename("高等数学", "") == "高等数学.json"
+    assert lb.course_filename("", "1001") == "1001.json"
+    assert lb.course_filename("", "") == f"{lb.UNKNOWN_COURSE}.json"
+    # 标题里带 Windows 非法字符也不影响文件名
+    assert lb.course_filename("高等数学/上", "1001") == "1001.json"
+
+
+def test_old_title_id_filenames_are_renamed():
+    """上一版「<课程标题>_<课程ID>.json」启动时自动改名成「<课程ID>.json」。"""
+    root = os.path.join(TMP, "mig_names")
+    os.makedirs(root)
+    entry = {"q": "题目一", "y": "single", "a": "B", "x": ["乙选项"],
+             "o": OPTS, "ok": 1, "ts": 1}
+    key = lb.fingerprint("题目一", "single", OPTS)
+    old_file = os.path.join(root, "高等数学_1001.json")
+    with open(old_file, "w", encoding="utf8") as fh:
+        json.dump({"v": 2, "course": "高等数学", "course_id": "1001",
+                   "entries": {key: dict(entry)}}, fh, ensure_ascii=False)
+
+    store = lb.BankStore(root=root)
+    result = store.migrate_legacy()
+    assert result and result["migrated"] == 1, result
+    assert not os.path.exists(old_file), "旧命名文件应已改名"
+    assert os.path.isfile(os.path.join(root, "1001.json"))
+    assert store.lookup("题目一", "single", OPTS) == "B"
+    assert store.migrate_legacy() is None, "改名幂等，重复调用不再动文件"
+
+
+def test_rename_merges_into_existing_course_id_file():
+    """目标 ID 文件已存在时合并进去，两份数据都不丢。"""
+    root = os.path.join(TMP, "mig_names_merge")
+    os.makedirs(root)
+    e1 = {"q": "题目一", "y": "single", "a": "B", "x": ["乙选项"],
+          "o": OPTS, "ok": 1, "ts": 1}
+    e2 = {"q": "题目二", "y": "single", "a": "A", "x": ["甲选项"],
+          "o": OPTS, "ok": 1, "ts": 1}
+    with open(os.path.join(root, "1001.json"), "w", encoding="utf8") as fh:
+        json.dump({"v": 3, "course": "高等数学", "course_id": "1001",
+                   "entries": {lb.fingerprint("题目一", "single", OPTS): e1}},
+                  fh, ensure_ascii=False)
+    with open(os.path.join(root, "高等数学（旧名）_1001.json"), "w",
+              encoding="utf8") as fh:
+        json.dump({"v": 2, "course": "高等数学（旧名）", "course_id": "1001",
+                   "entries": {lb.fingerprint("题目二", "single", OPTS): e2}},
+                  fh, ensure_ascii=False)
+
+    store = lb.BankStore(root=root)
+    store.migrate_legacy()
+    store.set_scope(course="高等数学", course_id="1001")
+    assert store.lookup("题目一", "single", OPTS) == "B"
+    assert store.lookup("题目二", "single", OPTS) == "A"
+    assert sorted(os.listdir(root)) == ["1001.json"], os.listdir(root)
 
 
 def test_judgement_answer_letter_is_translated():
@@ -386,7 +444,7 @@ def test_export_import_keeps_course():
     assert result["added"] == 1 and result["total"] == 1, result
     rel = [os.path.relpath(c["path"], dst.root).replace("\\", "/")
            for c in dst.stats()["courses"]]
-    assert rel == ["高等数学_1001.json"], rel
+    assert rel == ["1001.json"], rel
 
 
 def test_import_old_account_bundle_merges_into_course_file():
@@ -406,7 +464,7 @@ def test_import_old_account_bundle_merges_into_course_file():
     store = _store()
     result = store.import_from(dump)
     assert result["files"] == 2 and result["total"] == 1, result
-    assert [c["file"] for c in store.stats()["courses"]] == ["高等数学_1001.json"]
+    assert [c["file"] for c in store.stats()["courses"]] == ["1001.json"]
     assert store.lookup("题目一", "single", OPTS) == "B"
 
 
@@ -517,23 +575,23 @@ def test_config_keys_are_validated():
 # --------------------------------------------------------------------------- #
 def test_parse_verdicts_from_markers():
     html = """
-    <div class="singleQuesId" data="11"><div class="TiMu"><span class="dui"></span></div></div>
-    <div class="singleQuesId" data="12"><div class="TiMu"><span class="cuo"></span></div></div>
+    <div class="singleQuesId" data="405717711"><div class="TiMu"><span class="dui"></span></div></div>
+    <div class="singleQuesId" data="405717712"><div class="TiMu"><span class="cuo"></span></div></div>
     """
-    assert wv.parse_verdicts(html) == {"11": True, "12": False}
+    assert wv.parse_verdicts(html) == {"405717711": True, "405717712": False}
 
 
 def test_parse_verdicts_from_scores():
     html = """
-    <div class="singleQuesId" data="11"><div>得分：2.0分 满分：2.0分</div></div>
-    <div class="singleQuesId" data="12"><div>得分：0.0分 满分：2.0分</div></div>
+    <div class="singleQuesId" data="405717711"><div>得分：2.0分 满分：2.0分</div></div>
+    <div class="singleQuesId" data="405717712"><div>得分：0.0分 满分：2.0分</div></div>
     """
-    assert wv.parse_verdicts(html) == {"11": True, "12": False}
+    assert wv.parse_verdicts(html) == {"405717711": True, "405717712": False}
 
 
 def test_parse_verdicts_from_right_answer():
-    html = '<div class="singleQuesId" data="11"><div>正确答案：B 我的答案：C</div></div>'
-    verdict = wv.parse_verdicts(html)["11"]
+    html = '<div class="singleQuesId" data="405717711"><div>正确答案：B 我的答案：C</div></div>'
+    verdict = wv.parse_verdicts(html)["405717711"]
     assert isinstance(verdict, dict), verdict
     assert verdict["answer"] == "B" and verdict["ok"] is None, verdict
 
@@ -541,21 +599,121 @@ def test_parse_verdicts_from_right_answer():
 def test_parse_verdicts_wrong_with_correct_answer():
     """判错 + 页面上有正确答案 -> 带上正确答案（本地题库据此纠错）。"""
     html = """
-    <div class="singleQuesId" data="11">
+    <div class="singleQuesId" data="405717711">
       <div class="TiMu"><span class="cuo"></span></div>
       <ul><li>A. 甲选项</li><li>B. 乙选项</li></ul>
       <div>正确答案：A 我的答案：B</div>
     </div>
     """
-    verdict = wv.parse_verdicts(html)["11"]
+    verdict = wv.parse_verdicts(html)["405717711"]
     assert verdict["ok"] is False and verdict["answer"] == "A", verdict
     assert verdict["options"].startswith("A. 甲选项"), verdict
 
 
 def test_parse_verdicts_empty_when_no_marks():
-    html = '<div class="singleQuesId" data="11"><div>教师未创建完成该测验</div></div>'
+    html = '<div class="singleQuesId" data="405717711"><div>教师未创建完成该测验</div></div>'
     assert wv.parse_verdicts(html) == {}
     assert wv.parse_verdicts("") == {}
+
+
+# 实测的「已提交」页面：我的答案在 div.myAnswer > div.answerCon，对错是 span.marking_dui。
+# 旧解析只认 ul>li 的字母前缀和「正确答案：」文本，遇到这个结构一题都读不出来。
+PAGE_REAL_GRADED = """
+<div class="singleQuesId" data="405804363" id="question405804363">
+  <div class="TiMu newTiMu" data="3">
+    <div class="Zy_TItle clearfix"><i class="fl">1</i>
+      <div class="font-cxsecret"><span class="newZy_TItle">【判断题】</span>加强大学生安全教育是重要依托。( )</div>
+    </div>
+    <ul class="Zy_ulTop"><li qid="405804363" qtype="3"><span class="num_option" data="A">A</span><a class="fl after">对</a></li>
+      <li qid="405804363" qtype="3"><span class="num_option" data="B">B</span><a class="fl after">错</a></li></ul>
+  </div>
+  <div class="newAnswerBx"><div class="myAnswerBx marBot16"><div class="myAnswer">
+      <span class="answerFont fl">我的答案：</span><div class="fl answerCon"> 对 </div><p class="clear"></p></div>
+      <div class="answerScore"><div class="CorrectOrNot fl"><span class="marking_dui"></span></div></div>
+  </div></div>
+</div>
+<div class="singleQuesId" data="405804361" id="question405804361">
+  <div class="TiMu newTiMu" data="1">
+    <div class="Zy_TItle clearfix"><i class="fl">3</i>
+      <div><span class="newZy_TItle">【多选题】</span>加强大学生安全教育的意义:( )(多选)</div></div>
+    <ul class="Zy_ulTop"><li qid="405804361" qtype="1"><span class="num_option" data="A">A</span><a class="fl after">掌握安全知识</a></li>
+      <li qid="405804361" qtype="1"><span class="num_option" data="B">B</span><a class="fl after">提高安全意识</a></li></ul>
+  </div>
+</div>
+"""
+
+PAGE_REAL_UNSUBMITTED = """
+<html><body>
+<div class="workTitle">章节测验（待完成）</div>
+<div class="singleQuesId" data="405803973" id="question405803973">
+  <div class="TiMu newTiMu" data="0">
+    <div class="Zy_TItle clearfix"><i class="fl">1</i>
+      <div><span class="newZy_TItle">【单选题】</span>【选择题】大学生安全教育的基本定义不包括( )</div></div>
+    <ul class="Zy_ulTop"><li qid="405803973" qtype="0"><span class="num_option choice405803973" data="A">A</span>
+      <a class="fl after">学习大学生安全教育是国家法律法规规定的</a></li></ul>
+    <input id="answer405803973" name="answer405803973" type="hidden" value=""/>
+  </div>
+</div>
+<a class="btnSubmit" href="javascript:;">提交</a>
+</body></html>
+"""
+
+
+def test_parse_real_graded_page():
+    """实测结构：marking_dui + div.answerCon（我的答案）。"""
+    verdicts = wv.parse_verdicts(PAGE_REAL_GRADED)
+    assert verdicts["405804363"] is True, verdicts
+    assert "405804361" not in verdicts, "没有对错标记的多选题不应被判分"
+    assert wv.parse_my_answers(PAGE_REAL_GRADED)["405804363"] == "对"
+    questions = wv.parse_questions(PAGE_REAL_GRADED)
+    assert questions["405804363"]["type"] == "judgement", questions["405804363"]
+    assert questions["405804361"]["type"] == "multiple", questions["405804361"]
+    assert len(questions) == 2
+
+
+def test_real_page_state_is_classified():
+    """未提交 / 已提交未批阅 / 结构不认识 要能区分（采集日志据此说明原因）。"""
+    assert wv.page_state(PAGE_REAL_GRADED, True, True) == wv.STATE_OK
+    assert wv.page_state(PAGE_REAL_GRADED, True, False) == wv.STATE_UNGRADED
+    assert wv.page_state(PAGE_REAL_UNSUBMITTED, True, False) == wv.STATE_UNSUBMITTED
+    assert wv.page_state("<html>参数验证不通过</html>", False, False) == wv.STATE_UNKNOWN
+
+
+def test_submitted_but_no_answer_is_ungraded():
+    """已交过但老师不公布答案的页，不能误报成未提交。
+
+    特征：有「重新作答」入口、没有对错/正确答案标记（marking 为空）。
+    """
+    page = """
+    <html><body>
+    <div class="singleQuesId" data="405803973" id="question405803973">
+      <div class="TiMu" data="0"><div class="Zy_TItle"><span class="newZy_TItle">【单选题】</span>题干</div></div>
+      <ul class="Zy_ulTop"><li><span class="num_option" data="A">A</span><a class="fl after">选项</a></li></ul>
+    </div>
+    <a class="btnReEdit" href="javascript:;">重新作答</a>
+    </body></html>
+    """
+    assert wv.is_unsubmitted_page(page) is False
+    assert wv.page_state(page, True, False) == wv.STATE_UNGRADED
+
+
+def test_closed_work_page_is_its_own_state():
+    """老师关掉作业后接口只回一句「作业已结束」（实测 31 字节），要单独归类。"""
+    closed = "<html><body>作业已结束</body></html>"
+    assert wv.is_closed_page(closed) is True
+    assert wv.page_state(closed, False, False) == wv.STATE_CLOSED
+    # 正常作业页里偶然出现这几个字，不能被当成关闭页（靠长度与是否有题目兜住）
+    long_page = PAGE_REAL_UNSUBMITTED + "<!-- 作业已结束 -->" * 300
+    assert wv.is_closed_page(long_page) is False
+    assert wv.page_state(long_page, True, False) == wv.STATE_UNSUBMITTED
+
+
+def test_normalize_strips_repeated_type_tags():
+    """题干「1【单选题】【选择题】x」与「1. x」必须归一成同一串（跨页面指纹一致）。"""
+    assert lb.normalize_text("1【单选题】【选择题】大学生安全教育( )") == \
+        lb.normalize_text("1. 大学生安全教育")
+    assert lb.normalize_text("【判断题】2. 题干") == lb.normalize_text("题干")
+    assert lb.normalize_text("2026年安全教育") == "2026年安全教育", "正文里的年份不能被当题号剥掉"
 
 
 def test_verify_work_swallows_errors():
@@ -615,9 +773,13 @@ def _run_study_work(verdict_html: str, bank: lb.LocalBank):
             return bank.learn(items, verdicts, course, course_id=course_id)
 
     def make_questions():
+        # qid 用真实长度（9 位数字）：解析器靠 ≥4 位数字区分 qid 与「题型码 data="0"」，
+        # 这里必须和 verdict_html 里 singleQuesId 的 data 一致才能关联判分结果。
+        qid = "405717701"
         return {"questions": [{
-            "id": "1", "type": "single", "title": "1. 题目一（2.0分）",
-            "options": "A. 甲选项\nB. 乙选项", "answerField": {"answer1": "", "answertype1": "0"},
+            "id": qid, "type": "single", "title": "1. 题目一（2.0分）",
+            "options": "A. 甲选项\nB. 乙选项",
+            "answerField": {f"answer{qid}": "", f"answertype{qid}": "0"},
         }]}
 
     session = _Session()
@@ -644,7 +806,7 @@ def test_study_work_stores_only_verified_answers():
     lb._BANK = bank
     try:
         result, session = _run_study_work(
-            '<div class="singleQuesId" data="1"><i class="dui"></i></div>', bank)
+            '<div class="singleQuesId" data="405717701"><i class="dui"></i></div>', bank)
         assert result == base.StudyResult.SUCCESS, result
         assert session.calls >= 2, "提交后应再拉一次页面核验判分"
         assert bank.lookup("题目一", "single", "A. 甲选项\nB. 乙选项") == "B"
@@ -658,7 +820,7 @@ def test_study_work_skips_learn_when_answer_wrong():
     lb._BANK = bank
     try:
         _run_study_work(
-            '<div class="singleQuesId" data="1"><i class="cuo"></i></div>', bank)
+            '<div class="singleQuesId" data="405717701"><i class="cuo"></i></div>', bank)
         assert bank.stats()["total"] == 0, "判错的题不能入库"
     finally:
         lb._BANK = old
@@ -670,7 +832,7 @@ def test_study_work_ignores_bank_when_disabled():
     lb._BANK = bank
     try:
         _run_study_work(
-            '<div class="singleQuesId" data="1"><i class="dui"></i></div>', bank)
+            '<div class="singleQuesId" data="405717701"><i class="dui"></i></div>', bank)
         assert bank.stats()["total"] == 0
         assert not os.path.isdir(bank.root), "关闭时不应创建题库目录"
     finally:
@@ -684,7 +846,7 @@ def test_study_work_stores_correct_answer_when_wrong():
     lb._BANK = bank
     try:
         html = """
-        <div class="singleQuesId" data="1">
+        <div class="singleQuesId" data="405717701">
           <div class="TiMu"><span class="cuo"></span></div>
           <ul><li>A. 甲选项</li><li>B. 乙选项</li></ul>
           <div>正确答案：A 我的答案：B</div>
@@ -698,17 +860,17 @@ def test_study_work_stores_correct_answer_when_wrong():
 
 
 def test_study_work_writes_into_course_file():
-    """入库文件落在 <课程>.json（不再按账号建目录）。"""
+    """入库文件落在 <课程ID>.json（不再按账号建目录）。"""
     bank = _bank()
     old = lb._BANK
     lb._BANK = bank
     try:
         _run_study_work(
-            '<div class="singleQuesId" data="1"><i class="dui"></i></div>', bank)
+            '<div class="singleQuesId" data="405717701"><i class="dui"></i></div>', bank)
         courses = bank.stats()["courses"]
         assert len(courses) == 1, courses
         rel = os.path.relpath(courses[0]["path"], bank.root).replace("\\", "/")
-        assert rel == "高等数学_C.json", rel
+        assert rel == "C.json", rel
     finally:
         lb._BANK = old
 
@@ -723,7 +885,7 @@ def test_study_work_verifies_even_when_bank_has_answer():
     lb._BANK = bank
     try:
         result, session = _run_study_work(
-            '<div class="singleQuesId" data="1"><i class="dui"></i></div>', bank)
+            '<div class="singleQuesId" data="405717701"><i class="dui"></i></div>', bank)
         import api.base as base
         assert result == base.StudyResult.SUCCESS, result
         assert session.calls == 2, "题库已有答案时仍应核验判分"
@@ -743,7 +905,7 @@ def test_study_work_overwrites_wrong_bank_answer():
     lb._BANK = bank
     try:
         html = """
-        <div class="singleQuesId" data="1">
+        <div class="singleQuesId" data="405717701">
           <div class="TiMu"><span class="cuo"></span></div>
           <ul><li>A. 甲选项</li><li>B. 乙选项</li></ul>
           <div>正确答案：A 我的答案：B</div>

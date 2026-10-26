@@ -31,6 +31,7 @@ FAIL_LABEL = {
     "start_enabled": "刷课结束后「开始刷课」未恢复可用",
     "running": "刷课结束后引擎仍在运行",
     "layout_ok": "界面布局被裁切（日志面板/列表不可见）",
+    "toolbar_fits": "工具栏被窗口裁切（右侧按钮不可见）",
 }
 
 
@@ -62,7 +63,7 @@ def run_selftest(timeout_s: float = 30.0, poll_ms: int = POLL_MS) -> dict:
             "log_lines": int(app.log_text.index("end-1c").split(".")[0]),
             "status": app.status_var.get(),
             "running": app.engine.is_running,
-            "start_enabled": str(app.start_btn["state"]) != "disabled",
+            "start_enabled": str(app.action_btn["state"]) != "disabled",
             # 布局完整性：日志面板不得被窗口底边裁切，两个列表需有可见高度
             "layout_boxes": (
                 app.course_tree.winfo_height(),
@@ -88,6 +89,8 @@ def run_selftest(timeout_s: float = 30.0, poll_ms: int = POLL_MS) -> dict:
             "start_enabled": stats["start_enabled"],
             "running": not stats["running"],
             "layout_ok": stats["layout_ok"],
+            # 工具栏（含「停止」）必须完整可见：窄窗口下应自动折行，不能被右边界切掉
+            "toolbar_fits": app.toolbar_fits() if mapped else True,
         }
         stats["failed_checks"] = [FAIL_LABEL[k] for k, ok in checks.items() if not ok]
         stats["passed"] = not stats["failed_checks"]
