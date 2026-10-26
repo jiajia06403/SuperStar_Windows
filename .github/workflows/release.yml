@@ -1,21 +1,14 @@
 name: Release
 
-# 版本号唯一来源：仓库根目录 version.txt（格式 X.Y.Z）
+# 版本号唯一来源：仓库根目录 version.txt（原样取用，不做格式校验、不做预发布判定）
+#  exe / zip / artifact 名全部等于 version.txt 的内容（后缀是什么就带什么）。
 # 触发方式：
-#   1. 发版：把 version.txt 里的版本号打成 tag 推上来
-#        git tag v$(Get-Content version.txt) && git push origin v$(Get-Content version.txt)
-#       tag 带后缀（v1.0.0-rc.1）视为预发布
+#   1. 发版：推 tag `v<版本>`（惯例是与 version.txt 保持一致）
 #   2. 试构建：Actions -> Release -> Run workflow（只构建出 Artifact，不发 Release）
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
-    inputs:
-      prerelease:
-        description: '是否标记为预发布'
-        required: false
-        type: boolean
-        default: false
 
 permissions:
   contents: write
@@ -26,7 +19,6 @@ jobs:
     runs-on: windows-latest
     outputs:
       version: ${{ steps.ver.outputs.version }}
-      prerelease: ${{ steps.ver.outputs.prerelease }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -46,21 +38,15 @@ jobs:
           pip install -r requirements_win.txt
           pip install pyinstaller
 
-      # 版本号从 version.txt 读出，后续 exe 名 / zip 名 / artifact 名全部由它推导
+      # 版本号从 version.txt 读出，后续 exe 名 / zip 名 / artifact 名全部由它推导；
+      # 内容原样使用（不校验格式、不区分正式版/预览版），写什么产物就叫什么
       - name: Resolve version
         id: ver
         shell: pwsh
         run: |
           $v = (Get-Content -Path version.txt -Raw).Trim()
-          if ($v -notmatch '^\d+\.\d+\.\d+$') { throw "version.txt 版本号应为 X.Y.Z，实际为：$v" }
+          if (-not $v) { throw "version.txt 为空" }
           "version=$v" >> $env:GITHUB_OUTPUT
-          if ($env:GITHUB_REF.StartsWith('refs/tags/v')) {
-            $tag = $env:GITHUB_REF -replace '^refs/tags/', ''
-            if ($tag -ne "v$v" -and $tag -notlike "v$v-*") {
-              throw "tag($tag) 与 version.txt($v) 不一致，先同步版本号再发版"
-            }
-            "prerelease=$(($tag -like '*-*').ToString().ToLower())" >> $env:GITHUB_OUTPUT
-          }
           Write-Host "VERSION=$v  REF=$env:GITHUB_REF"
 
       # 构建 + 产物自检：失败时把日志尾部提升为 Annotation，避免只看到一个退出码
@@ -131,9 +117,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref }}
-          name: SuperStar ${{ steps.notes.outputs.VERSION }}
+          # Release 标题与产物名统一取 version.txt 的版本
+          name: SuperStar ${{ needs.build-windows.outputs.version }}
           body: |
-            ## SuperStar ${{ steps.notes.outputs.VERSION }}
+            ## SuperStar ${{ needs.build-windows.outputs.version }}
 
             Windows x64，请**解压后**运行 `SuperStar-${{ needs.build-windows.outputs.version }}.exe`
             （压缩包内不再套一层目录，解压即得完整程序文件夹；单 exe 缺少随包配置与目录，不单独分发）。
@@ -141,7 +128,6 @@ jobs:
             ### 更新内容
             ${{ steps.notes.outputs.changes }}
           draft: false
-          prerelease: ${{ needs.build-windows.outputs.prerelease == 'true' || inputs.prerelease == 'true' }}
           files: dist/SuperStar-${{ needs.build-windows.outputs.version }}-win64.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

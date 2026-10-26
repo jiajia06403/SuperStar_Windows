@@ -135,7 +135,7 @@ SuperStar_Windows/
 │   └── selftest.py         # 界面自检：真实驱动演示流程并校验控件
 ├── demo_chaoxing.py        # 演示用假后端（仅源码存在，发行包构建时排除）
 ├── run.py                  # 启动入口（--demo / --selftest 仅源码态可用）
-├── version.txt             # 版本号唯一来源（X.Y.Z）：exe/zip 名与 Release tag 均由它推导
+├── version.txt             # 版本号唯一来源（X.Y.Z 或 X.Y.Z-rc.N）：exe/zip 名与 Release tag 均由它推导
 ├── build.py                # 构建 exe + 铺装目录 + 分发 zip
 ├── config_win.ini          # 默认配置（随包自带，升级时覆盖 —— 用户不要改）
 ├── 使用说明.txt             # 随包分发的用户文档
@@ -161,8 +161,9 @@ cookies 登录：把 `cookies.txt`（格式 `k=v;k2=v2`）放到 `progress_cache
 
 ## 构建与分发
 
-**版本号唯一来源：仓库根目录 `version.txt`（X.Y.Z）**。exe 名、zip 名、Release tag（`v<版本>`）
-发新版 = 改 `version.txt` → 打成 tag 推上去（`v<版本>`），Release 由 CI 产出。
+**版本号唯一来源：仓库根目录 `version.txt`**：exe 名、zip 名、Release 标题全部原样取它的内容
+（`1.0.0` 就出 `SuperStar-1.0.0.exe`，`1.0.0-rc.1` 就出 `SuperStar-1.0.0-rc.1.exe`）。
+发新版 = 改 `version.txt` → 打成 tag 推上去（惯例 `v<版本>`），Release 由 CI 产出。
 
 ```bash
 python -m pip install pyinstaller
@@ -213,14 +214,16 @@ python test/test_paths.py         # 路径约定：随包文件清单 + zip 内�
 
 | 触发 | 条件 |
 | --- | --- |
-| 发版 | 推 tag `v<版本>`（`git tag v$(cat version.txt) && git push origin v$(cat version.txt)`） |
+| 发版 | 推 tag `v<版本>`（惯例与 `version.txt` 一致：`$v=(Get-Content version.txt).Trim(); git tag "v$v"; git push origin "v$v"`） |
 | 试构建 | Actions → Release → Run workflow（只出 Artifact，不发 Release） |
 
-Tag 需与 `version.txt` 一致；带后缀（如 `v1.0.0-rc.1`）自动标为**预发布**。
+产物名只认 `version.txt`：写 `1.0.0-rc.1`，zip 就是 `SuperStar-1.0.0-rc.1-win64.zip`。
+CI 不做版本号格式校验、不校验 tag 与 `version.txt`、也不区分正式版/预览版
+（`prerelease` 标记与预览版提示已全部移除）。
 
 流程（两个 job）：
 
-1. **Build Windows executable**（windows-latest）：装依赖 → 校验 tag 与 `version.txt` →
+1. **Build Windows executable**（windows-latest）：装依赖 → 读 `version.txt` →
    `python build.py` → 确认 exe / zip 产出 → `upload-artifact` 上传 zip；
 2. **Publish GitHub Release**（ubuntu-latest）：取 tag 版本号 → 下载 Artifact →
    用「上一个 tag 至今的提交」生成 changelog → 创建 Release 并上传 zip（不单独上传裸 exe）。

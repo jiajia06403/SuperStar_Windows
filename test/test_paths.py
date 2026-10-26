@@ -98,16 +98,43 @@ def test_stage_install_contents():
         assert "Version 3, 29 June 2007" in lic
 
 
+# 允许预发布后缀：1.0.0 / 1.0.0-rc.1 / 1.2.0-rc3
+VERSION_RE = re.compile(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?")
+
+
 def test_version_file_is_single_source():
     """版本号只存在于 version.txt：构建脚本里不得再硬编码。"""
     version = build.read_version(ROOT)
-    assert re.fullmatch(r"\d+\.\d+\.\d+", version), f"版本号格式应为 X.Y.Z：{version!r}"
+    assert VERSION_RE.fullmatch(version), f"版本号格式应为 X.Y.Z[-预发布]：{version!r}"
     assert version == build.VERSION
     assert build.EXE_NAME == f"{build.APP_NAME}-{version}.exe"
     with open(os.path.join(ROOT, "build.py"), encoding="utf8") as fp:
         src = fp.read()
     assert 'VERSION = "' not in src, "build.py 不应再硬编码版本号"
     assert build.VERSION_FILE in src
+
+
+def test_prerelease_suffix_kept_in_artifact_names():
+    """预发布后缀（1.0.0-rc.1）必须出现在 exe / zip 名里，否则预览版与正式版重名。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, build.VERSION_FILE), "w", encoding="utf8") as fp:
+            fp.write("1.2.0-rc.1\n")
+        version = build.read_version(tmp)
+        assert version == "1.2.0-rc.1", version
+        assert build.is_prerelease(version)
+        assert build.exe_name(version) == "SuperStar-1.2.0-rc.1.exe"
+        assert build.zip_name(version) == "SuperStar-1.2.0-rc.1-win64.zip"
+        # 正式版不带后缀，且不能被判成预发布
+        assert not build.is_prerelease("1.2.0")
+        assert build.exe_name("1.2.0") == "SuperStar-1.2.0.exe"
+    # 非法版本号直接拒绝（避免 rc 后缀被静默丢弃）
+    for bad in ("1.0", "v1.0.0", "1.0.0-rc 1", "1.0.0_1", ""):
+        try:
+            build.parse_version(bad)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"非法版本号应被拒绝：{bad!r}")
 
 
 def test_missing_version_file_rejected():

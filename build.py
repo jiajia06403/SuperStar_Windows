@@ -7,7 +7,9 @@
     python build.py --clean     # 清空中间产物后重新构建
 
 发行包的形态（设计意图：让用户一眼看出「不是单个 exe 就能跑的程序」）：
-    SuperStar-<版本>.exe  主程序（文件名带版本号，取自 version.txt）
+    SuperStar-<版本>.exe  主程序（文件名带完整版本号，取自 version.txt；
+                          预发布形如 SuperStar-1.0.0-rc.1.exe，后缀不可丢）
+    SuperStar-<版本>-win64.zip  分发压缩包（同名规则）
     config_win.ini       默认配置（随包自带，升级时覆盖 —— 用户不要改）
                          用户配置 config_user.ini 由程序首次启动生成，不随包分发（防覆盖）
     chaoxing.log         运行日志（随包自带的空文件，追加写入）
@@ -20,6 +22,7 @@
 即 `python run.py --demo` / `python run.py --selftest`。
 """
 import os
+import re
 import shutil
 import sys
 import zipfile
@@ -32,6 +35,10 @@ except ImportError:  # pragma: no cover
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 VERSION_FILE = "version.txt"
 APP_NAME = "SuperStar"
+# 版本号格式：X.Y.Z 或 X.Y.Z-<预发布>（如 1.0.0-rc.1 / 1.2.0-rc3 / 2.0.0-beta.2）
+# 预发布后缀必须写进 version.txt —— exe 名、zip 名、Release tag 全部由它推导，
+# 否则预览版会和同号正式版重名（历史坑：tag 是 v1.0.0-rc.1，包却叫 SuperStar-1.0.0.exe）。
+VERSION_RE = re.compile(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?")
 # 只在源码/测试时使用的模块，发行包一律排除
 TEST_ONLY_MODULES = ("demo_chaoxing", "gui.selftest")
 
@@ -42,25 +49,53 @@ README_NAME = "使用说明.txt"
 LICENSE_NAME = "LICENSE"
 
 
+def parse_version(text: str, source: str = VERSION_FILE) -> str:
+    """校验并规范化版本号文本（首行去空白）。
+
+    合法：``1.0.0`` / ``1.0.0-rc.1`` / ``1.2.0-rc3`` / ``2.0.0-beta.2``。
+    预发布后缀原样保留，绝不在产物名里丢弃。
+    """
+    version = (text or "").strip()
+    if not version:
+        raise SystemExit(f"版本文件为空：{source}")
+    if not VERSION_RE.fullmatch(version):
+        raise SystemExit(
+            f"版本号格式应为 X.Y.Z 或 X.Y.Z-<预发布>（如 1.0.0-rc.1），实际为：{version!r}（{source}）"
+        )
+    return version
+
+
 def read_version(root: str = ROOT_DIR) -> str:
     """版本号唯一来源：项目根目录 ``version.txt``（取首行并去空白）。
 
     exe 文件名、zip 文件名、GitHub Release tag 全部由它推导；
-    改版本号只改这一个文件。
+    改版本号（含 -rc 等预发布后缀）只改这一个文件。
     """
     path = os.path.join(root, VERSION_FILE)
     try:
         with open(path, encoding="utf-8") as fp:
-            version = fp.readline().strip()
+            raw = fp.readline()
     except FileNotFoundError:
         raise SystemExit(f"缺少版本文件：{path}")
-    if not version:
-        raise SystemExit(f"版本文件为空：{path}")
-    return version
+    return parse_version(raw, path)
+
+
+def is_prerelease(version: str) -> bool:
+    """带预发布后缀（``1.0.0-rc.1``）即为预发布。"""
+    return "-" in version
+
+
+def exe_name(version: str) -> str:
+    return f"{APP_NAME}-{version}.exe"
+
+
+def zip_name(version: str) -> str:
+    return f"{APP_NAME}-{version}-win64.zip"
 
 
 VERSION = read_version()
-EXE_NAME = f"{APP_NAME}-{VERSION}.exe"
+EXE_NAME = exe_name(VERSION)
+ZIP_NAME = zip_name(VERSION)
 
 # 分发文档直接取自项目主目录的静态文件，构建脚本不再生成内容
 
@@ -157,7 +192,7 @@ def make_zip(root: str, exe: str) -> str:
 
     解压即主目录（解压器默认会按 zip 名建一层文件夹，用户看到的就是程序文件夹）。
     """
-    zip_path = os.path.join(root, "dist", f"{APP_NAME}-{VERSION}-win64.zip")
+    zip_path = os.path.join(root, "dist", ZIP_NAME)
     os.makedirs(os.path.dirname(zip_path), exist_ok=True)
     stage = os.path.join(root, "build", "dist_stage")
     shutil.rmtree(stage, ignore_errors=True)
@@ -194,6 +229,7 @@ def main() -> None:
     root = os.path.dirname(os.path.abspath(__file__))
     _force_utf8_stdio()
     print(f"VERSION={VERSION} (from {VERSION_FILE})")
+    print(f"PRERELEASE={str(is_prerelease(VERSION)).lower()}")
     exe = build_exe(root, clean="--clean" in sys.argv)
     size = os.path.getsize(exe) / 1024 / 1024
     print(f"BUILD_DONE={exe}  size={size:.1f}MB")
