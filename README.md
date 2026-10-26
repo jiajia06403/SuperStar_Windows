@@ -208,8 +208,8 @@ Tag 需与 `version.txt` 一致；带后缀（如 `v1.0.0-rc.1`）自动标为**
 2. **Publish GitHub Release**（ubuntu-latest）：取 tag 版本号 → 下载 Artifact →
    用「上一个 tag 至今的提交」生成 changelog → 创建 Release 并上传 zip（不单独上传裸 exe）。
 
-> CI 刻意不跑测试套件：`test_gui_smoke` 要建真实窗口，在 runner 上慢且易受环境影响，
-> 该部分只在本地 `python test/run_test.py` 执行（CI 里可用手动触发的 `run_tests` 选项临时开启）；
+> CI 不跑测试套件：`test_gui_smoke` 要建真实窗口，在 runner 上慢且易受环境影响，
+> 该部分只在本地 `python test/run_test.py` 执行；
 > zip 内容由 `build.py` 铺装逻辑保证，也不在 CI 里逐条校验。
 
 ---

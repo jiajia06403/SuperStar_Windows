@@ -11,11 +11,6 @@ on:
     tags: ['v*']
   workflow_dispatch:
     inputs:
-      run_tests:
-        description: '是否跑全套测试（含 GUI 自检，较慢）'
-        required: false
-        type: boolean
-        default: false
       prerelease:
         description: '是否标记为预发布'
         required: false
@@ -67,14 +62,6 @@ jobs:
             "prerelease=$(($tag -like '*-*').ToString().ToLower())" >> $env:GITHUB_OUTPUT
           }
           Write-Host "VERSION=$v  REF=$env:GITHUB_REF"
-
-      # 完整测试默认只在本地跑（python test/run_test.py）：GUI 自检要真实建窗口，
-      # 在无显示会话的 runner 上不稳定；需要时勾选 run_tests 或本地执行。
-      - name: Run full tests
-        if: ${{ inputs.run_tests }}
-        env:
-          PYTHONUTF8: '1'
-        run: python test/run_test.py
 
       # 构建 + 产物自检：失败时把日志尾部提升为 Annotation，避免只看到一个退出码
       - name: Build release package
