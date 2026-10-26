@@ -13,6 +13,7 @@ chaoxing.log
 *.log
 progress_cache/
 config_win.ini.bak
+config_user.ini
 
 # ---------- Test / lint cache ----------
 .pytest_cache/

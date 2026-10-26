@@ -39,6 +39,8 @@ class FakeChaoxing:
         self._uid = uid
         self.points = []
         self.job_info_seq = []   # 轮询时依次返回的 job_info
+        self.not_open_ids = set()   # 「未开放」章节（供 is_point_open 探测）
+        self.probe_error = False    # True 时探测失败（模拟网络异常）
 
     def get_uid(self):
         return self._uid
@@ -50,6 +52,11 @@ class FakeChaoxing:
         if self.job_info_seq:
             return [], self.job_info_seq.pop(0)
         return [], {"notOpen": False}
+
+    def is_point_open(self, course, point):
+        if self.probe_error:
+            return None
+        return str(point.get("id")) not in self.not_open_ids
 
 
 # --------------------------------------------------------------------------- #
@@ -110,6 +117,122 @@ def test_read_progress_clears_stale_local_done():
     # 落盘后重新加载仍然一致
     cache2 = ProgressCache(base_dir=str(tmp_path))
     assert cache2.is_done("666", "C9", "b") is False
+
+
+# --------------------------------------------------------------------------- #
+# 「读取进度」识别未开放章节
+# --------------------------------------------------------------------------- #
+def _read_progress_engine(fake, course=None):
+    tmp_path = tempfile.mkdtemp()
+    eng = StudyEngine(cache_dir=str(tmp_path), poll_interval=0.01)
+    eng.chaoxing = fake
+    eng.current_uid = fake.get_uid()
+    course = course or {"courseId": "C", "clazzId": "cz", "cpi": "cp", "title": "课"}
+    events = []
+    eng.on(eng.PROGRESS, lambda cid, pid, status: events.append((pid, status)))
+    points = eng.read_progress(course)
+    return eng, points, events, course
+
+
+def test_read_progress_marks_not_open():
+    """读取进度时未开放章节要标成 not_open，而不是 pending。"""
+    fake = FakeChaoxing("700")
+    fake.points = [
+        {"id": "a", "title": "第1章", "has_finished": True},
+        {"id": "b", "title": "第2章", "has_finished": False},
+        {"id": "c", "title": "第3章", "has_finished": False},
+    ]
+    fake.not_open_ids = {"b", "c"}
+    eng, points, events, _course = _read_progress_engine(fake)
+    assert [p.get("not_open") for p in points] == [None, True, True]
+    assert [s for _pid, s in events] == ["done", "not_open", "not_open"]
+    # 刷新章节时也能沿用已探测到的未开放状态
+    again = eng.get_course_points({"courseId": "C", "clazzId": "cz", "cpi": "cp", "title": "课"})
+    assert [p.get("not_open") for p in again] == [None, True, True]
+
+
+def test_read_progress_not_open_only_for_unfinished():
+    """已完成章节不算未开放；探测失败（无法判断）时保持 pending。"""
+    fake = FakeChaoxing("701")
+    fake.points = [
+        {"id": "a", "title": "第1章", "has_finished": True},
+        {"id": "b", "title": "第2章", "has_finished": False},
+    ]
+    fake.not_open_ids = {"a"}   # 服务端已完成，即使探测说未开放也不该标未开放
+    _eng, points, events, _course = _read_progress_engine(fake)
+    assert points[0].get("not_open") is None
+    assert points[1].get("not_open") is None
+    assert [s for _pid, s in events] == ["done", "pending"]
+
+    # 探测异常 -> 不误标
+    fake2 = FakeChaoxing("702")
+    fake2.points = [{"id": "x", "title": "第1章", "has_finished": False}]
+    fake2.probe_error = True
+    _eng2, points2, events2, _course = _read_progress_engine(fake2)
+    assert points2[0].get("not_open") is None
+    assert events2 == [("x", "pending")]
+
+
+def test_read_progress_clears_not_open_after_open():
+    """章节开放后再次读取进度应恢复为 pending（未开放标记要能撤销）。"""
+    fake = FakeChaoxing("703")
+    fake.points = [{"id": "a", "title": "第1章", "has_finished": False}]
+    fake.not_open_ids = {"a"}
+    eng, points, _events, course = _read_progress_engine(fake)
+    assert points[0]["not_open"] is True
+    fake.not_open_ids = set()
+    points2 = eng.read_progress(course)
+    assert points2[0].get("not_open") is None
+
+
+def test_read_progress_streams_not_open():
+    """异步两段式：先取完成状态，再逐章探测并逐章回调（界面可流式刷新）。"""
+    fake = FakeChaoxing("704")
+    fake.points = [
+        {"id": "a", "title": "第1章", "has_finished": True},
+        {"id": "b", "title": "第2章", "has_finished": False},
+        {"id": "c", "title": "第3章", "has_finished": False},
+    ]
+    fake.not_open_ids = {"c"}
+    tmp_path = tempfile.mkdtemp()
+    eng = StudyEngine(cache_dir=str(tmp_path), poll_interval=0.01)
+    eng.chaoxing = fake
+    eng.current_uid = fake.get_uid()
+    course = {"courseId": "C", "clazzId": "cz", "cpi": "cp", "title": "课"}
+
+    # 第一段：只取完成状态（不探测），此时未完成章节都还是 pending
+    points = eng.refresh_progress(course)
+    assert [StudyEngine._point_status(p) for p in points] == ["done", "pending", "pending"]
+
+    # 第二段：逐章探测，回调次数 = 未完成章节数，且能拿到中间进度
+    seen = []
+
+    def on_point(pid, not_open, idx, total):
+        seen.append((pid, not_open, idx, total))
+
+    found = eng.probe_not_open(course, points, on_point=on_point)
+    assert found == 1
+    assert [p.get("not_open") for p in points] == [None, None, True]
+    assert seen == [("b", False, 1, 2), ("c", True, 2, 2)]
+
+
+def test_probe_not_open_stop_early():
+    """should_stop 返回 True 时立即停止探测（切课程/开始刷课要能中断）。"""
+    fake = FakeChaoxing("705")
+    fake.points = [{"id": x, "title": x, "has_finished": False} for x in ("a", "b", "c")]
+    fake.not_open_ids = {"c"}
+    tmp_path = tempfile.mkdtemp()
+    eng = StudyEngine(cache_dir=str(tmp_path), poll_interval=0.01)
+    eng.chaoxing = fake
+    eng.current_uid = fake.get_uid()
+    course = {"courseId": "C", "clazzId": "cz", "cpi": "cp", "title": "课"}
+    points = eng.refresh_progress(course)
+    seen = []
+    found = eng.probe_not_open(course, points,
+                               on_point=lambda pid, st, i, n: seen.append(pid),
+                               should_stop=lambda: len(seen) >= 1)
+    assert seen == ["a"], f"应立即停止探测: {seen}"
+    assert found == 0
 
 
 def test_get_course_points_syncs_cache():

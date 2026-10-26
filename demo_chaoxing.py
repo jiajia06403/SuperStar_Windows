@@ -24,9 +24,11 @@ class _DummyLimiter:
 
 
 class DemoChaoxing:
-    def __init__(self):
+    def __init__(self, not_open_ids=()):
         self._uid = "demo_10086"
         self.rate_limiter = _DummyLimiter()
+        # 演示「未开放」章节：默认没有，测试可传 point id 造出未开放章节
+        self.not_open_ids = {str(x) for x in (not_open_ids or ())}
         self._courses = [
             {
                 "courseId": "C1001", "clazzId": "B2001", "cpi": "P3001",
@@ -78,6 +80,8 @@ class DemoChaoxing:
         return {"points": [dict(p) for p in pts]}
 
     def get_job_list(self, course, point):
+        if str(point.get("id")) in self.not_open_ids:
+            return [], {"notOpen": True}
         # 已完成的章节不再返回任务点（与真实平台 isPassed 语义一致）
         if point.get("has_finished"):
             return [], {"notOpen": False}
@@ -98,6 +102,10 @@ class DemoChaoxing:
             }
         ]
         return jobs, {"notOpen": False}
+
+    def is_point_open(self, course, point):
+        """供「读取进度」逐章探测：演示模式下除指定章节外都视为已开放。"""
+        return str(point.get("id")) not in self.not_open_ids
 
     # ---- 学习动作：像真实平台一样，完成后把章节标记为已完成 ----
     def _finish(self, job) -> None:

@@ -23,9 +23,8 @@ import paths  # noqa: E402
 import build  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# exe 文件名与 zip 顶层目录随版本号变化（version.txt 是唯一来源），这里统一推导
+# exe 文件名随版本号变化（version.txt 是唯一来源），这里统一推导
 EXE_NAME = getattr(build, "EXE_NAME", f"{build.APP_NAME}.exe")
-ZIP_PREFIX = f"{build.APP_NAME}-{build.VERSION}/"
 
 
 def _fake_frozen(exe_path: str):
@@ -138,12 +137,13 @@ def test_zip_layout():
         zip_path = build.make_zip(root, exe)
         with zipfile.ZipFile(zip_path) as zf:
             names = zf.namelist()
-        prefix = f"{build.APP_NAME}-{build.VERSION}/"
+        # zip 内不得再套一层顶层目录：解压即得主目录
         for expect in (build.EXE_NAME, build.CONFIG_NAME, build.LOG_NAME,
                        build.DATA_DIRNAME + "/", build.README_NAME,
                        build.LICENSE_NAME):
-            assert prefix + expect in names, f"zip 缺少 {expect}: {names}"
+            assert expect in names, f"zip 缺少 {expect}: {names}"
         assert not any(n.startswith("dist_stage") for n in names), names
+        assert not any("/" in n.rstrip("/") for n in names), f"zip 存在多余层级: {names}"
 
 
 def _main() -> int:

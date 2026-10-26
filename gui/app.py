@@ -9,7 +9,6 @@
 
 界面只调用 engine.StudyEngine 的公开接口，业务逻辑与 UI 保持解耦。
 """
-import configparser
 import ctypes
 import json
 import os
@@ -21,8 +20,8 @@ import tkinter.font as tkfont
 from tkinter import messagebox, ttk
 
 from api.logger import logger
+from config_store import USER_NAME, load_section, save_section, sync_with_default, user_path
 from engine import StudyEngine
-from paths import config_path
 
 APP_TITLE = "SuperStar · 学习通刷课"
 MAX_LOG_LINES = 1500          # 日志面板最大行数，超出裁剪，避免长跑占内存
@@ -33,13 +32,14 @@ STATE_TEXT = {
     "logged_in": "已登录", "switched": "已切换账号", "logging": "登录中",
     "running": "刷课中", "stopping": "停止中", "idle": "空闲",
     "backtrack": "回退重做", "polling": "等待章节开放",
-    "read_progress": "已读取进度", "ok": "就绪", "error": "错误", "warn": "提示",
+    "read_progress": "已读取进度", "reading": "读取进度", "ok": "就绪", "error": "错误", "warn": "提示",
 }
 
 # 章节状态 -> (展示文本, 前景色)
 CHAPTER_STYLE = {
     "done": ("完成", "#2e7d32"),
     "pending": ("待学", "#424242"),
+    "not_open": ("未开放", "#6a1b9a"),
     "studying": ("进行", "#ef6c00"),
     "error": ("失败", "#c62828"),
 }
@@ -97,38 +97,17 @@ def _apply_cjk_font(root: tk.Tk) -> str:
     return ""
 
 
-def resource_path(*parts: str) -> str:
-    """定位随程序分发的资源（兼容 PyInstaller 打包后的 _MEIPASS）。"""
-    base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base, *parts)
-
-
 def load_tiku_config() -> dict:
-    """读取随包分发的 config_win.ini；不存在则返回空（题库停用）。
-
-    查找顺序：程序目录（压缩包自带，用户可改）> 打包内嵌副本 > 开发态项目根。
-    """
-    name = "config_win.ini"
-    candidates = [config_path()]
-    if getattr(sys, "frozen", False):
-        meipass = getattr(sys, "_MEIPASS", "")
-        if meipass:
-            candidates.append(os.path.join(meipass, name))
-    candidates.append(resource_path(name))
-    for path in candidates:
-        if os.path.exists(path):
-            cfg = configparser.ConfigParser()
-            try:
-                cfg.read(path, encoding="utf8")
-            except Exception:  # noqa: BLE001
-                continue
-            return dict(cfg["tiku"]) if cfg.has_section("tiku") else {}
-    return {}
+    """生效的题库配置：随包默认配置打底 + 用户配置覆盖；都没有则返回空（题库停用）。"""
+    try:
+        return load_section("tiku")
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 def tiku_config_path() -> str:
-    """返回可写的题库配置文件路径（程序目录下的 config_win.ini，压缩包自带）。"""
-    return config_path()
+    """返回可写的题库配置文件路径（用户配置 config_user.ini，升级解压不会覆盖）。"""
+    return user_path()
 
 
 # --------------------------------------------------------------------------- #
@@ -203,103 +182,251 @@ class LoginDialog(tk.Toplevel):
 
 
 # --------------------------------------------------------------------------- #
-# 词库 / AI 答题设置对话框
+# 答题设置对话框
 # --------------------------------------------------------------------------- #
 class SettingsDialog(tk.Toplevel):
-    """词库 / AI 答题设置窗口；结果放在 ``self.result``（None 表示取消）。
+    """答题设置窗口；结果放在 ``self.result``（None 表示取消）。
 
-    仅编辑 ``[tiku]`` 段，其余段（如 ``[notification]``）原样保留。
+    只编辑 ``[tiku]`` 段，其余段（如 ``[notification]``）原样保留。
+
+    交互约定（对齐安卓端的做法）：
+      1. 上方下拉选「答案提供方式」，下方只显示该提供方真正会读取的配置项
+         （言溪/LIKE 要 TOKEN、TikuAdapter 要服务地址、大模型要地址+Key+模型）；
+      2. AI / DeepSeek / SiliconFlow 三种大模型方式各用各的配置键，
+         各自预填自己的默认地址与模型（OpenAI 官方 / deepseek-chat / DeepSeek-V3.2）；
+      3. 切换提供方只切换显示，不清空已填内容；未填过的项按该提供方的默认值回填。
     """
 
-    PROVIDERS = ["TikuYanxi", "TikuLike", "TikuAdapter", "AI", "SiliconFlow"]
-    DEFAULTS = {
-        "provider": "SiliconFlow",
+    DISABLED_LABEL = "（停用：只刷课，不答题）"
+    PROVIDERS = ("TikuYanxi", "TikuLike", "TikuAdapter", "AI", "DeepSeek", "SiliconFlow")
+
+    HINTS = {
+        "": "题库已停用：只完成视频/文档/阅读任务点，章节检测与作业不自动答题。",
+        "TikuYanxi": "言溪题库：只需 TOKEN（https://tk.enncy.cn/ 获取），多个用英文逗号分隔，按顺序使用。",
+        "TikuLike": "LIKE 知识库：需要 TOKEN（https://www.datam.site/ 获取）；可分别开关联网搜索与图片识别。",
+        "TikuAdapter": "TikuAdapter：填自建服务的查询地址，通常形如 http://127.0.0.1:5000/api/search。",
+        "AI": "AI（任意 OpenAI 兼容端点）：接口地址填 base_url，如 https://api.openai.com/v1；"
+              "本地/免鉴权端点可勾选「忽略 API Key」。",
+        "DeepSeek": "DeepSeek 官方：地址与模型已预填，只需填 API Key（https://platform.deepseek.com/）。",
+        "SiliconFlow": "硅基流动：地址与模型已预填，只需填 API Key（https://cloud.siliconflow.cn/account/ak）。",
+    }
+
+    # (key, 标签, 类型)；类型：text / secret（密码框）/ bool（勾选框）
+    COMMON_FIELDS = (
+        ("submit", "提交答题（取消勾选则仅保存不提交）", "bool"),
+        ("cover_rate", "最低题库覆盖率（0 表示不要求）", "text"),
+        ("delay", "搜题间隔(秒)", "text"),
+        ("work_retry", "不合格重答次数（0 不重答）", "text"),
+        ("true_list", "判断题正确项", "text"),
+        ("false_list", "判断题错误项", "text"),
+    )
+    # 大模型方式共用的小项（同一份配置键，切换方式时值保留）
+    LLM_SHARED_FIELDS = (
+        ("min_interval_seconds", "最小请求间隔(秒)", "text"),
+        ("http_proxy", "HTTP 代理(可留空)", "text"),
+    )
+    PROVIDER_FIELDS = {
+        "TikuYanxi": (
+            ("tokens", "言溪 TOKEN（多个用英文逗号分隔）", "secret"),
+        ),
+        "TikuLike": (
+            ("tokens", "LIKE 知识库 TOKEN（多个用英文逗号分隔）", "secret"),
+            ("likeapi_model", "LIKE 模型名", "text"),
+            ("likeapi_search", "启用联网搜索", "bool"),
+            ("likeapi_vision", "启用视觉能力（识别图片题）", "bool"),
+            ("likeapi_retry", "请求失败自动重试", "bool"),
+            ("likeapi_retry_times", "最大重试次数", "text"),
+        ),
+        "TikuAdapter": (
+            ("url", "TikuAdapter 服务地址", "text"),
+        ),
+        "AI": (
+            ("endpoint", "接口地址(base_url)", "text"),
+            ("key", "API Key", "secret"),
+            ("model", "模型", "text"),
+            ("ignore_api_key", "忽略 API Key（自建/免鉴权端点）", "bool"),
+        ) + LLM_SHARED_FIELDS,
+        "DeepSeek": (
+            ("deepseek_endpoint", "接口地址(base_url)", "text"),
+            ("deepseek_key", "API Key", "secret"),
+            ("deepseek_model", "模型", "text"),
+        ) + LLM_SHARED_FIELDS,
+        "SiliconFlow": (
+            ("siliconflow_endpoint", "接口地址(含 /chat/completions)", "text"),
+            ("siliconflow_key", "API Key", "secret"),
+            ("siliconflow_model", "模型", "text"),
+            ("min_interval_seconds", "最小请求间隔(秒)", "text"),
+        ),
+    }
+    COMMON_DEFAULTS = {
         "submit": "true",
         "cover_rate": "0",
         "delay": "1.0",
-        "siliconflow_key": "",
-        "siliconflow_model": "deepseek-ai/DeepSeek-V3.2",
-        "siliconflow_endpoint": "https://api.siliconflow.cn/v1/chat/completions",
-        "min_interval_seconds": "3",
-        "http_proxy": "",
         "work_retry": "1",
         "true_list": "正确,对,√,是",
         "false_list": "错误,错,×,否,不对,不正确",
     }
-    # (key, 标签, show)；show 用于密码框
-    TEXT_FIELDS = (
-        ("cover_rate", "最低覆盖率"),
-        ("delay", "搜题间隔(秒)"),
-        ("work_retry", "不合格重答次数"),
-        ("true_list", "判断题正确项"),
-        ("false_list", "判断题错误项"),
-        ("siliconflow_key", "API Key", "*"),
-        ("siliconflow_model", "模型"),
-        ("siliconflow_endpoint", "接口地址"),
-        ("min_interval_seconds", "最小请求间隔(秒)"),
-        ("http_proxy", "HTTP 代理(可留空)"),
-    )
+    # 各提供方专属默认值：决定「切换方式后预填什么」
+    PROVIDER_DEFAULTS = {
+        "TikuYanxi": {"tokens": ""},
+        "TikuLike": {
+            "likeapi_search": "false",
+            "likeapi_vision": "true",
+            "likeapi_model": "glm-4.5-air",
+            "likeapi_retry": "true",
+            "likeapi_retry_times": "3",
+        },
+        "TikuAdapter": {"url": ""},
+        "AI": {
+            "endpoint": "https://api.openai.com/v1",
+            "key": "",
+            "model": "gpt-3.5-turbo",
+            "ignore_api_key": "false",
+            "min_interval_seconds": "3",
+            "http_proxy": "",
+        },
+        "DeepSeek": {
+            "deepseek_endpoint": "https://api.deepseek.com/v1",
+            "deepseek_key": "",
+            "deepseek_model": "deepseek-chat",
+        },
+        "SiliconFlow": {
+            "siliconflow_endpoint": "https://api.siliconflow.cn/v1/chat/completions",
+            "siliconflow_key": "",
+            "siliconflow_model": "deepseek-ai/DeepSeek-V3.2",
+        },
+    }
 
     def __init__(self, master: tk.Misc):
         super().__init__(master)
-        self.title("词库 / AI 答题设置")
-        self.resizable(False, False)
+        self.title("答题设置")
         self.result = None
+        self.vars: "dict[str, tuple[str, tk.Variable]]" = {}
+        self.panels: "dict[str, ttk.Frame]" = {}
+        self._positioned = False
 
-        cfg = {}
-        path = tiku_config_path()
-        if os.path.exists(path):
-            parser = configparser.ConfigParser()
-            try:
-                parser.read(path, encoding="utf8")
-                if parser.has_section("tiku"):
-                    cfg = dict(parser["tiku"])
-            except Exception:  # noqa: BLE001
-                pass
-        self._vals = {k: cfg.get(k, v) for k, v in self.DEFAULTS.items()}
+        cfg = load_tiku_config()
+        self._base = dict(cfg)                 # 原样保留未在界面出现的键
+        self._values = self._resolve_values(cfg)
 
-        body = ttk.Frame(self, padding=14)
+        body = ttk.Frame(self, padding=(14, 12))
         body.pack(fill="both", expand=True)
-        body.columnconfigure(1, weight=1)
 
-        self.provider_var = tk.StringVar(value=self._vals["provider"])
-        ttk.Label(body, text="题库提供方").grid(row=0, column=0, sticky="w", pady=2)
-        ttk.Combobox(body, textvariable=self.provider_var, values=self.PROVIDERS,
-                     width=22, state="readonly").grid(row=0, column=1, sticky="w", padx=(8, 0), pady=2)
+        head = ttk.Frame(body)
+        head.pack(fill="x")
+        ttk.Label(head, text="答案提供方式").pack(side="left")
+        current = str(cfg.get("provider", "") or "").strip()
+        self.provider_var = tk.StringVar(
+            value=current if current in self.PROVIDERS else self.DISABLED_LABEL)
+        self.provider_cb = ttk.Combobox(
+            head, textvariable=self.provider_var, width=26, state="readonly",
+            values=(self.DISABLED_LABEL,) + self.PROVIDERS)
+        self.provider_cb.pack(side="left", padx=(8, 0))
+        self.provider_cb.bind("<<ComboboxSelected>>", lambda _e: self._on_provider_change())
 
-        self.submit_var = tk.BooleanVar(value=self._vals["submit"].lower() == "true")
-        ttk.Checkbutton(body, text="提交答题（取消勾选则仅保存不提交）",
-                        variable=self.submit_var).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 4))
+        self.hint_var = tk.StringVar()
+        self.hint_lbl = ttk.Label(body, textvariable=self.hint_var, style="Status.TLabel",
+                                  wraplength=560, justify="left")
+        self.hint_lbl.pack(fill="x", pady=(8, 0))
 
-        self.vars: "dict[str, tk.StringVar]" = {}
-        row = 2
-        for item in self.TEXT_FIELDS:
-            key, label, *rest = item
-            show = rest[0] if rest else None
-            ttk.Label(body, text=label).grid(row=row, column=0, sticky="w", pady=2)
-            var = tk.StringVar(value=self._vals[key])
-            self.vars[key] = var
-            ttk.Entry(body, textvariable=var, width=46, show=show).grid(
-                row=row, column=1, sticky="ew", padx=(8, 0), pady=2)
-            row += 1
+        self.common_frame = ttk.LabelFrame(body, text="通用设置（所有方式都生效）", padding=(10, 6))
+        self.common_frame.pack(fill="x", pady=(10, 0))
+        self._build_fields(self.common_frame, self.COMMON_FIELDS)
 
-        sep_row = row
-        ttk.Separator(body, orient="horizontal").grid(
-            row=sep_row, column=0, columnspan=2, sticky="ew", pady=(10, 6))
-        ttk.Label(
-            body, text="说明：SiliconFlow / AI 共用地址·Key·模型；AI=OpenAI 兼容端点（如 DeepSeek 官方）。其余忽略。",
-            style="Status.TLabel",
-        ).grid(row=sep_row + 1, column=0, columnspan=2, sticky="w", pady=(0, 2))
+        self.specific_frame = ttk.LabelFrame(body, text="提供方专属设置", padding=(10, 6))
+        for name in self.PROVIDERS:
+            panel = ttk.Frame(self.specific_frame)
+            self.panels[name] = panel
+            self._build_fields(panel, self.PROVIDER_FIELDS[name])
+        # 宽度取所有提供方里最宽的一档，避免切换时窗口横向跳动（高度仍按内容收放）
+        self.update_idletasks()
+        self._width = max([self.winfo_reqwidth()] + [p.winfo_reqwidth() + 40 for p in self.panels.values()])
 
         btns = ttk.Frame(body)
-        btns.grid(row=sep_row + 2, column=0, columnspan=2, sticky="e", pady=(14, 0))
-        ttk.Button(btns, text="取消", command=self.destroy).pack(side="left", padx=(0, 8))
-        ttk.Button(btns, text="保存", command=self._on_save).pack(side="left")
+        btns.pack(fill="x", pady=(12, 0))
+        ttk.Label(btns, text="保存后立即作用于当前登录账号", style="Status.TLabel").pack(side="left")
+        ttk.Button(btns, text="保存", command=self._on_save).pack(side="right")
+        ttk.Button(btns, text="取消", command=self.destroy).pack(side="right", padx=(0, 8))
 
         self.transient(master)
-        self.grab_set()
+        try:
+            self.grab_set()
+        except tk.TclError:      # 窗口尚未上屏时抓焦点会报错，不影响使用
+            pass
         self.bind("<Escape>", lambda _e: self.destroy())
+        self._on_provider_change()
         self._center(master)
+
+    # ---------------- 初始化 ----------------
+    @classmethod
+    def _resolve_values(cls, cfg: dict) -> dict:
+        """初始值 = 提供方默认值打底 + 配置文件里的非空取值覆盖。"""
+        values: dict = dict(cls.COMMON_DEFAULTS)
+        for name in cls.PROVIDERS:
+            for key, value in cls.PROVIDER_DEFAULTS.get(name, {}).items():
+                values.setdefault(key, value)
+        for key in list(values):
+            raw = str(cfg.get(key, "") or "").strip()
+            if raw:
+                values[key] = raw
+        return values
+
+    def _build_fields(self, parent: tk.Misc, fields) -> None:
+        parent.columnconfigure(1, weight=1)
+        for row, (key, label, kind) in enumerate(fields):
+            if key not in self.vars:          # 首次出现：按初值建变量
+                current = str(self._values.get(key, "") or "")
+                if kind == "bool":
+                    var = tk.BooleanVar(value=current.strip().lower() in ("true", "1", "yes", "on"))
+                else:
+                    var = tk.StringVar(value=current)
+                self.vars[key] = (kind, var)
+            # 同一个配置键可能出现在多个面板（如最小请求间隔）：必须共用一个变量，
+            # 否则两边各改各的，保存时只有后建的那份生效。
+            kind, var = self.vars[key]
+            if kind == "bool":
+                ttk.Checkbutton(parent, text=label, variable=var).grid(
+                    row=row, column=0, columnspan=2, sticky="w", pady=1)
+            else:
+                ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=2)
+                ttk.Entry(parent, textvariable=var, width=44,
+                          show="*" if kind == "secret" else "").grid(
+                    row=row, column=1, sticky="ew", padx=(8, 0), pady=2)
+
+    # ---------------- 提供方切换 ----------------
+    def _current_provider(self) -> str:
+        text = self.provider_var.get().strip()
+        return "" if text == self.DISABLED_LABEL else text
+
+    def _on_provider_change(self) -> None:
+        """只显示当前提供方会读取的项；窗口高度随内容收放。"""
+        name = self._current_provider()
+        self.hint_var.set(self.HINTS.get(name, ""))
+        for key, panel in self.panels.items():
+            if key == name:
+                panel.pack(fill="x")
+            else:
+                panel.pack_forget()
+        if name:
+            self.specific_frame.configure(text=f"{name} 专属设置")
+            if not self.specific_frame.winfo_manager():
+                self.specific_frame.pack(fill="x", pady=(10, 0), after=self.common_frame)
+        else:
+            self.specific_frame.pack_forget()
+        self._fit()
+
+    # ---------------- 窗口尺寸 / 位置 ----------------
+    def _fit(self) -> None:
+        """按当前显示的项重设窗口大小，避免切到项少的提供方时留下大片空白。"""
+        width = max(self._width, 560)
+        # 提示文字按窗口宽度换行：先定换行宽度，能量出准确高度
+        self.hint_lbl.configure(wraplength=max(width - 48, 320))
+        self.update_idletasks()
+        height = self.winfo_reqheight()
+        if self._positioned:
+            self.geometry(f"{width}x{height}+{self.winfo_x()}+{self.winfo_y()}")
+        else:
+            self.geometry(f"{width}x{height}")
 
     def _center(self, master: tk.Misc) -> None:
         self.update_idletasks()
@@ -307,37 +434,35 @@ class SettingsDialog(tk.Toplevel):
             x = master.winfo_rootx() + (master.winfo_width() - self.winfo_width()) // 2
             y = master.winfo_rooty() + (master.winfo_height() - self.winfo_height()) // 3
             self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception:  # noqa: BLE001 - 居中失败不影响使用
+            return
+        self._positioned = True
 
+    # ---------------- 保存 ----------------
     def _on_save(self) -> None:
-        cfg = dict(self._vals)
-        cfg["provider"] = self.provider_var.get()
-        cfg["submit"] = "true" if self.submit_var.get() else "false"
-        for key, var in self.vars.items():
-            cfg[key] = var.get().strip()
-        self._save(cfg)
-        self.result = cfg
-        self.destroy()
+        provider = self._current_provider()
+        cfg = dict(self._base)            # 隐藏提供方的旧值原样保留，不写入其界面默认值
+        cfg["provider"] = provider
+        keys = [key for key, _label, _kind in self.COMMON_FIELDS]
+        if provider:
+            keys.extend(key for key, _label, _kind in self.PROVIDER_FIELDS[provider])
+        for key in dict.fromkeys(keys):
+            kind, var = self.vars[key]
+            cfg[key] = ("true" if var.get() else "false") if kind == "bool" else str(var.get()).strip()
+        # 「忽略 API Key」是 AI 专属开关：换个方式就关掉，避免留下失效开关
+        if provider != "AI":
+            cfg["ignore_api_key"] = "false"
+        if self._save(cfg):
+            self.result = cfg
+            self.destroy()
 
-    def _save(self, tiku_cfg: dict) -> None:
-        path = tiku_config_path()
-        parser = configparser.ConfigParser()
-        if os.path.exists(path):
-            try:
-                parser.read(path, encoding="utf8")
-            except Exception:  # noqa: BLE001
-                pass
-        if not parser.has_section("tiku"):
-            parser.add_section("tiku")
-        for k, v in tiku_cfg.items():
-            parser.set("tiku", k, str(v))
+    def _save(self, tiku_cfg: dict) -> bool:
         try:
-            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-            with open(path, "w", encoding="utf8") as fp:
-                parser.write(fp)
+            save_section("tiku", tiku_cfg)
+            return True
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("保存失败", f"无法写入配置文件：{exc}", parent=self)
+            return False
 
 
 # --------------------------------------------------------------------------- #
@@ -346,7 +471,8 @@ class SettingsDialog(tk.Toplevel):
 class App:
     """主窗口控制器：界面构建 + 引擎事件编排。"""
 
-    def __init__(self, master: tk.Tk, cache_dir: str | None = None):
+    def __init__(self, master: tk.Tk, cache_dir: str | None = None,
+                 sync_config: bool = True):
         self.root = master
         self.engine = StudyEngine() if cache_dir is None else StudyEngine(cache_dir=cache_dir)
         self.events: "queue.Queue[tuple]" = queue.Queue()
@@ -356,12 +482,16 @@ class App:
         self._chapter_rows: dict[str, str] = {}   # point_id -> tree iid
         self._log_sink_id = None
         self._loading_cid = None                  # 正在读取章节的课程（去重）
+        self._read_gen = 0                        # 「读取进度」代数：切换课程/开始刷课时作废旧任务
+        self._reading = False                     # 是否正在读取/探测进度
         self._acc_uids: dict[str, str] = {}       # 账号下拉显示文本 -> uid
         self.silent = False                       # True 时不弹模态框（截图/自检）
 
         self._build_ui()
         self._wire_engine()
         self._install_log_sink()
+        if sync_config:
+            self._sync_user_config()
         # 先把已保存账号填进下拉框（无需等待自动登录结果）
         self._ev_accounts(list(self.engine.accounts.keys()))
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -378,6 +508,29 @@ class App:
         e.on(e.STATUS, lambda st, msg: q(("status", st, msg)))
         e.on(e.ACCOUNTS, lambda uids: q(("accounts", uids)))
         e.on(e.FINISHED, lambda: q(("finished",)))
+
+    def _sync_user_config(self) -> None:
+        """启动时拿最新的默认配置校验用户配置（升级后自动补齐/废弃/修正）。
+
+        用户配置（config_user.ini）与随包默认配置（config_win.ini）分离：
+        升级解压覆盖默认配置不会动到用户填过的取值。
+        """
+        try:
+            report = sync_with_default()
+        except Exception as exc:  # noqa: BLE001 - 配置问题不得拖垮启动
+            self.log(f"【配置】校验失败，已按默认配置继续: {exc}")
+            return
+        if not report.get("changed"):
+            return
+        if report.get("created"):
+            self.log(f"【配置】已生成用户配置 {USER_NAME}（升级解压不会覆盖它）")
+        for section, keys in report.get("added", {}).items():
+            self.log(f"【配置】新版本新增配置项已补齐 [{section}]：{'、'.join(keys)}")
+        for section, keys in report.get("obsolete", {}).items():
+            self.log(f"【配置】新版本已移除的配置项转入 [obsolete] [{section}]：{'、'.join(keys)}")
+        for section, fixes in report.get("fixed", {}).items():
+            for key, (old, new) in fixes.items():
+                self.log(f"【配置】[{section}] {key} 取值非法（{old}），已回落为 {new}")
 
     def _install_log_sink(self) -> None:
         self._log_sink_id = logger.add(
@@ -659,7 +812,7 @@ class App:
                 self.log("【设置】题库/AI 答题配置已即时生效")
             except Exception as exc:  # noqa: BLE001
                 self.log(f"【设置】配置应用失败（将在下次登录生效）: {exc}")
-        self._tips("题库/AI 答题设置已保存（config_win.ini）")
+        self._tips(f"题库/AI 答题设置已保存（{USER_NAME}）")
 
     # ---------------- 课程列表 ----------------
     def _acc_label(self, uid: str) -> str:
@@ -784,6 +937,7 @@ class App:
         course = next((c for c in self.courses if str(c["courseId"]) == cid), None)
         if not course or self._loading_cid == cid:
             return
+        self._cancel_reading()       # 切课程后旧的探测结果不再适用
         self._loading_cid = cid
         self.current_course = course
         self.chapter_hint.configure(text=f"当前课程：{course['title']} · 读取中…")
@@ -802,16 +956,32 @@ class App:
         self._loading_cid = None
         self.chapter_tree.delete(*self.chapter_tree.get_children())
         self._chapter_rows.clear()
-        done = 0
         for point in points:
             pid = str(point["id"])
-            # 章节状态以服务端为准：平台判定「未完成/需重新作答」时不能显示为已完成
-            state = "done" if point.get("has_finished") else "pending"
-            done += state == "done"
+            # 章节状态以服务端为准：平台判定「未完成/需重新作答」时不能显示为已完成；
+            # 已探测到未开放的章节显示「未开放」，不要笼统地显示「待学」
+            state = self._chapter_state(point)
             self.chapter_tree.insert("", "end", iid=pid, values=self._chapter_values(state, point["title"]),
                                      tags=(state,))
             self._chapter_rows[pid] = pid
-        self.chapter_hint.configure(text=f"{course['title']} · 已完成 {done}/{len(points)} 章")
+        self.chapter_hint.configure(text=self._chapter_hint_text(course["title"]))
+
+    @staticmethod
+    def _chapter_state(point: dict) -> str:
+        if point.get("has_finished"):
+            return "done"
+        if point.get("not_open"):
+            return "not_open"
+        return "pending"
+
+    def _chapter_hint_text(self, title: str) -> str:
+        children = self.chapter_tree.get_children()
+        done = sum(1 for p in children if self.chapter_tree.set(p, "state") == CHAPTER_STYLE["done"][0])
+        locked = sum(1 for p in children if self.chapter_tree.set(p, "state") == CHAPTER_STYLE["not_open"][0])
+        text = f"{title} · 已完成 {done}/{len(children)} 章"
+        if locked:
+            text += f" · 未开放 {locked} 章"
+        return text
 
     @staticmethod
     def _chapter_values(state: str, title: str) -> tuple:
@@ -820,6 +990,7 @@ class App:
     def on_refresh_chapters(self) -> None:
         if not self.current_course:
             return self._tips("请先在左侧选择一门课程")
+        self._cancel_reading()
         self._refresh_chapters_async(self.current_course)
 
     def _refresh_chapters_async(self, course: dict) -> None:
@@ -828,15 +999,70 @@ class App:
     def on_read_progress(self) -> None:
         if not self.current_course:
             return self._tips("请先在左侧选择一门课程")
-        threading.Thread(target=self._do_read_progress, args=(self.current_course,), daemon=True).start()
+        if self._reading:
+            return self._tips("正在读取进度，请稍候")
+        if self.engine.is_running:
+            return self._tips("刷课进行中，请先停止再读取进度")
+        self._read_gen += 1
+        gen = self._read_gen
+        self._set_reading(True)
+        threading.Thread(target=self._do_read_progress, args=(self.current_course, gen),
+                         daemon=True).start()
 
-    def _do_read_progress(self, course: dict) -> None:
+    def _do_read_progress(self, course: dict, gen: int) -> None:
+        """异步读取进度：先取完成状态（1 次请求）渲染，再后台逐章探测「未开放」并逐行刷新。
+
+        探测是限速的（每章 0.5s），全部做完可能十几秒——所以不能等它跑完才刷新界面：
+        界面先显示「完成 / 待学」，每探明一章就地把那一行改成「未开放」。
+        ``gen`` 用于作废：用户切课程 / 开始刷课时旧任务自行退出，不再改界面。
+        """
+        cid = str(course["courseId"])
+
+        def stale() -> bool:
+            return gen != self._read_gen
+
         try:
-            self.events.put(("status", "read_progress", f"课程 {course['title']}"))
-            points = self.engine.read_progress(course)
+            self.events.put(("status", "reading", f"{course['title']}（读取完成状态）"))
+            points = self.engine.refresh_progress(course)
+            if stale():
+                return
             self.events.put(("points", course, points))
+
+            def on_point(pid: str, not_open, idx: int, total: int) -> None:
+                if stale() or not_open is None:
+                    return
+                self.events.put(("progress", cid, pid, "not_open" if not_open else "pending"))
+                if idx == total or idx % 5 == 0:
+                    self.events.put(("status", "reading",
+                                     f"{course['title']}（探测未开放 {idx}/{total}）"))
+
+            found = self.engine.probe_not_open(course, points, on_point=on_point,
+                                               should_stop=stale)
+            if stale():
+                return
+            if found:
+                self.events.put(("log", f"【读取进度】{course['title']}：识别到 {found} 个未开放章节"))
+            self.events.put(("status", "read_progress",
+                             f"课程 {course['title']}" + (f"，未开放 {found} 章" if found else "")))
         except Exception as exc:  # noqa: BLE001
             self.events.put(("status", "error", f"读取进度失败: {exc}"))
+        finally:
+            self.events.put(("read_done", gen))
+
+    def _set_reading(self, reading: bool) -> None:
+        self._reading = reading
+        self.read_btn.configure(state="disabled" if reading else "normal")
+
+    def _ev_read_done(self, gen: int) -> None:
+        """读取任务结束（只认最新一代，旧任务的收尾不得动按钮）。"""
+        if gen == self._read_gen:
+            self._set_reading(False)
+
+    def _cancel_reading(self) -> None:
+        """作废正在进行的读取任务（切课程 / 开始刷课时调用）。"""
+        if self._reading:
+            self._read_gen += 1
+            self._set_reading(False)
 
     # ---------------- 开始 / 停止 ----------------
     def on_start(self) -> None:
@@ -850,6 +1076,7 @@ class App:
             jobs = int(float(self.jobs_var.get()))
         except ValueError:
             return self._tips("倍速/并发参数无效")
+        self._cancel_reading()       # 刷课期间不再后台探测进度，避免抢请求/抢状态
         self._set_running(True)
         self.engine.start_study(selected, speed=speed, jobs=max(1, jobs))
 
@@ -878,11 +1105,7 @@ class App:
         children = self.chapter_tree.get_children()
         if not children or not self.current_course:
             return
-        done_text = CHAPTER_STYLE["done"][0]
-        done = sum(1 for p in children if self.chapter_tree.set(p, "state") == done_text)
-        self.chapter_hint.configure(
-            text=f"{self.current_course['title']} · 已完成 {done}/{len(children)} 章"
-        )
+        self.chapter_hint.configure(text=self._chapter_hint_text(self.current_course["title"]))
 
     def _ev_finished(self) -> None:
         self._set_running(False)
@@ -912,7 +1135,8 @@ class App:
 def build(demo: bool = False, cache_dir: str | None = None) -> App:
     """创建主窗口（不进入事件循环），供 main / 自检复用。
 
-    ``cache_dir`` 为空时使用程序目录下的 ``progress_cache/``（压缩包自带）。
+    ``cache_dir`` 为空时使用程序目录下的 ``progress_cache/``（压缩包自带）；
+    指定临时目录（自检/测试）时不做配置迁移，避免在源码目录里生成用户配置。
     ``demo`` 仅在测试包（内置 demo_chaoxing）中可用。
     """
     if demo and not demo_available():
@@ -923,7 +1147,7 @@ def build(demo: bool = False, cache_dir: str | None = None) -> App:
     root.geometry("980x660")
     root.minsize(840, 560)
     _apply_cjk_font(root)
-    app = App(root, cache_dir=cache_dir)
+    app = App(root, cache_dir=cache_dir, sync_config=cache_dir is None)
     if demo:
         app.load_demo()
     return app

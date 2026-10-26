@@ -37,7 +37,28 @@ def _openai_client(base_url: str, api_key: str, proxy: Optional[str] = None):
         return OpenAI(http_client=httpx.Client(proxy=proxy), base_url=base_url, api_key=api_key)
     return OpenAI(base_url=base_url, api_key=api_key)
 
-__all__ = ["CacheDAO", "Tiku", "TikuYanxi", "TikuLike", "TikuAdapter", "AI", "SiliconFlow"]
+__all__ = ["CacheDAO", "Tiku", "TikuYanxi", "TikuLike", "TikuAdapter", "AI", "DeepSeek",
+           "SiliconFlow"]
+
+
+def _normalize_base_url(raw: str) -> str:
+    """OpenAI 客户端要的是 base_url（如 https://api.deepseek.com/v1）。
+
+    用户常把完整地址 .../chat/completions 粘进来，若原样当 base_url 会变成
+    .../chat/completions/chat/completions 而 404，这里统一去掉该后缀。
+    """
+    url = str(raw or "").strip().rstrip("/")
+    suffix = "/chat/completions"
+    if url.lower().endswith(suffix):
+        url = url[: -len(suffix)].rstrip("/")
+    return url
+
+
+def _strip_md_json_wrapper(md_str: str) -> str:
+    """去掉大模型输出里可能存在的 Markdown/JSON 代码块包装。"""
+    pattern = r'^\s*```(?:json)?\s*(.*?)\s*```\s*$'
+    match = re.search(pattern, str(md_str or ""), re.DOTALL)
+    return match.group(1).strip() if match else str(md_str or "").strip()
 
 
 def _default_cache_file() -> str:
@@ -160,16 +181,31 @@ class CacheDAO:
 
 # TODO: 重构此部分代码，将此类改为抽象类，加载题库方法改为静态方法，禁止直接初始化此类
 class Tiku:
-    CONFIG_PATH = os.path.join(os.getcwd(), "config.ini")  # TODO: 从运行参数中获取config路径
+    # 兜底读取路径：GUI/引擎不传配置时用用户配置 config_user.ini（默认配置 config_win.ini 只读）
+    CONFIG_PATH = ""  # 运行时由 config_store.user_path() 解析
     DISABLE = False     # 停用标志
     SUBMIT = False      # 提交标志
     COVER_RATE = 0.8    # 覆盖率
     true_list = []
     false_list = []
+    # 大模型类题库标记（AI / DeepSeek / SiliconFlow 置 True）：异常失败会计入「连续失败」，
+    # 超阈值后本轮停用。其余题库「搜不到答案」属正常，不受影响。
+    LLM_PROVIDER = False
+    MAX_CONSECUTIVE_FAILURES = 3
+    # 未配置 API Key 时能否放行：默认不行；仅 AI（自建 OpenAI 兼容端点）可由配置显式打开
+    ALLOW_EMPTY_KEY = False
+    EMPTY_KEY_OPTION = "ignore_api_key"
     def __init__(self) -> None:
         self._name = None
         self._api = None
         self._conf = None
+        # ---- 大模型可用性 ----
+        # 只在首次答题前连通测试一次；不可用则本轮所有题目直接随机作答，
+        # 不再逐题访问大模型（此前是每道题都去请求，端点不通时既慢又刷满错误日志）。
+        self._availability_lock = threading.RLock()
+        self._availability_checked = False
+        self._unavailable_reason = ""
+        self._failure_count = 0
 
     @property
     def name(self):
@@ -218,11 +254,13 @@ class Tiku:
 
     def _get_conf(self):
         """
-        从默认配置文件查询配置, 如果未能查到, 停用题库
+        从用户配置文件查询配置, 如果未能查到, 停用题库
         """
         try:
+            from config_store import user_path
+            path = self.CONFIG_PATH or user_path()
             config = configparser.ConfigParser()
-            config.read(self.CONFIG_PATH, encoding="utf8")
+            config.read(path, encoding="utf8")
             return config['tiku']
         except (KeyError, FileNotFoundError):
             logger.info("未找到tiku配置, 已忽略题库功能")
@@ -239,25 +277,39 @@ class Tiku:
         q_info['title'] = sub(r'（\d+\.\d+分）$', '', q_info['title'])
         logger.debug(f"处理后标题：{q_info['title']}")
 
-        # 先过缓存
+        # 先过缓存（本地缓存不消耗任何远程额度，大模型不可用时也应继续命中）
         cache_dao = CacheDAO()
         answer = cache_dao.get_cache(q_info['title'])
         if answer:
             logger.info(f"从缓存中获取答案：{q_info['title']} -> {answer}")
             return answer.strip()
-        else:
-            answer = self._query(q_info)
-            if answer:
-                answer = answer.strip()
-                logger.info(f"从{self.name}获取答案：{q_info['title']} -> {answer}")
-                if check_answer(answer, q_info['type'], self):
-                    cache_dao.add_cache(q_info['title'], answer)
-                    return answer
-                else:
-                    logger.info(f"从{self.name}获取到的答案类型与题目类型不符，已舍弃")
-                    return None
 
-            logger.error(f"从{self.name}获取答案失败：{q_info['title']}")
+        # 大模型不可用（未配置 Key / 连接检查失败 / 连续失败）：不再发起任何请求，
+        # 直接返回 None，由上层随机作答。
+        if self._unavailable_reason:
+            logger.debug(f"{self.name}不可用，跳过远程查询：{self._unavailable_reason}")
+            return None
+
+        try:
+            answer = self._query(q_info)
+        except Exception as e:  # noqa: BLE001 - 任何异常都不能中断刷课，交给随机作答兜底
+            logger.error(f"{self.name}查询异常：{type(e).__name__}: {e}")
+            self._record_failure()
+            return None
+
+        if answer:
+            self._failure_count = 0
+            answer = answer.strip()
+            logger.info(f"从{self.name}获取答案：{q_info['title']} -> {answer}")
+            if check_answer(answer, q_info['type'], self):
+                cache_dao.add_cache(q_info['title'], answer)
+                return answer
+            else:
+                logger.info(f"从{self.name}获取到的答案类型与题目类型不符，已舍弃")
+                return None
+
+        logger.error(f"从{self.name}获取答案失败：{q_info['title']}")
+        self._record_failure()
         return None
 
 
@@ -318,6 +370,81 @@ class Tiku:
             return ""
         else:
             return "1"
+
+    @property
+    def unavailable(self) -> bool:
+        """是否因 Key 缺失 / 连接失败而停用（停用后 query() 不再发起任何远程请求）。"""
+        return bool(self._unavailable_reason)
+
+    def _mark_unavailable(self, reason: str) -> None:
+        """停用大模型题库；本轮剩余题目全部走随机作答。"""
+        if self._unavailable_reason:
+            return
+        self._unavailable_reason = reason
+        logger.error(
+            f"{self.name}已停用：{reason}。本轮剩余题目将直接随机作答，不再访问大模型"
+            "（修正配置后在「设置」保存一次即可恢复）"
+        )
+
+    def _record_failure(self) -> None:
+        """记录一次查询异常；连续失败达阈值后停用本轮的远程查询（仅大模型类题库）。"""
+        if not self.LLM_PROVIDER:
+            return
+        self._failure_count += 1
+        logger.warning(
+            f"{self.name}连续第 {self._failure_count} 次请求失败"
+            f"（阈值 {self.MAX_CONSECUTIVE_FAILURES}）"
+        )
+        if self._failure_count >= self.MAX_CONSECUTIVE_FAILURES:
+            self._mark_unavailable(f"连续 {self._failure_count} 次请求失败")
+
+    def _require_api_key(self, key: str, label: str) -> bool:
+        """API Key 校验：缺失即刻停用，一个网络请求都不发。
+
+        SiliconFlow 必须带 Key；AI 指向自建 OpenAI 兼容端点时，
+        可在 [tiku] 里设 ``ignore_api_key=true`` 显式放行。
+        """
+        if str(key or "").strip():
+            return True
+        if self.ALLOW_EMPTY_KEY and self._conf_truthy(self.EMPTY_KEY_OPTION):
+            logger.warning(
+                f"已勾选「忽略 API Key」：{label}将以无鉴权方式访问（请确保该端点确实不需要鉴权）"
+            )
+            return True
+        tail = "" if self.ALLOW_EMPTY_KEY else "；如需免鉴权请改用 provider=AI 并勾选「忽略 API Key」"
+        self._mark_unavailable(f"未配置{label}的 API Key{tail}")
+        return False
+
+    def _conf_truthy(self, key: str) -> bool:
+        """配置里开关是否打开（true/1/yes/on 均视为开）。"""
+        return str((self._conf or {}).get(key, "") or "").strip().lower() in ("true", "1", "yes", "on")
+
+    def _conf_bool(self, key: str, default: bool = False) -> bool:
+        """配置开关，缺项/留空用 default；其余按 true/1/yes/on 解析。
+
+        与 ``_conf_truthy`` 的区别：字符串 "false" 必须解析为 False。
+        图形界面写回配置时是 "true"/"false" 文本，直接 bool("false") 会误判成打开。
+        """
+        raw = (self._conf or {}).get(key)
+        if raw is None or str(raw).strip() == "":
+            return default
+        return str(raw).strip().lower() in ("true", "1", "yes", "on")
+
+    def ensure_available(self) -> bool:
+        """任务开始时调用：整个任务只对大模型做一次连通性检查，之后不再重复。
+
+        非大模型题库（未覆写 check_llm_connection）恒为 True，不产生额外请求。
+        """
+        if self.DISABLE or self._unavailable_reason:
+            return False
+        if self._availability_checked:
+            return True
+        with self._availability_lock:
+            if not self._availability_checked:
+                self._availability_checked = True
+                if not self.check_llm_connection():
+                    self._mark_unavailable("连接检查失败（地址/Key/模型/网络不可达）")
+        return not self._unavailable_reason
 
     def check_llm_connection(self) -> bool:
         """
@@ -682,12 +809,15 @@ class TikuLike(Tiku):
             logger.warning(f'{self.name}未加载任何有效的Token')
 
     def load_config(self) -> None:
-        # 从配置中获取参数，提供默认值
-        self._search = self._conf.get('likeapi_search', False)
-        self._model = self._conf.get('likeapi_model', None)
-        self._vision = self._conf.get('likeapi_vision', True)
-        self._retry = self._conf.get("likeapi_retry", True)
-        self._retry_times = int(self._conf.get("likeapi_retry_times", 3))
+        # 从配置中获取参数，提供默认值（图形界面写的是 "true"/"false" 文本，统一按开关解析）
+        self._search = self._conf_bool('likeapi_search', False)
+        self._model = self._conf.get('likeapi_model', None) or None
+        self._vision = self._conf_bool('likeapi_vision', True)
+        self._retry = self._conf_bool('likeapi_retry', True)
+        try:
+            self._retry_times = int(str(self._conf.get("likeapi_retry_times", 3)).strip() or 3)
+        except (TypeError, ValueError):
+            self._retry_times = 3
 
     def _init_tiku(self) -> None:
         self.load_config()
@@ -747,119 +877,83 @@ class TikuAdapter(Tiku):
         self.api = self._conf['url']
 
 class AI(Tiku):
-    # AI大模型答题实现
+    # AI大模型答题实现（OpenAI 兼容端点，例如 DeepSeek 官方 / 自建 Ollama）
+    LLM_PROVIDER = True
+    ALLOW_EMPTY_KEY = True      # 自建端点不需要鉴权时，配置里 ignore_api_key=true 放行
+    # 各题型的系统提示词：要求输出 {"Answer": [...]} 的纯 JSON
+    SYSTEM_PROMPTS = {
+        "single": "本题为单选题，你只能选择一个选项，请根据题目和选项回答问题，以json格式输出正确的选项内容，示例回答：{\"Answer\": [\"答案\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料",
+        "multiple": "本题为多选题，你必须选择两个或以上选项，请根据题目和选项回答问题，以json格式输出正确的选项内容，示例回答：{\"Answer\": [\"答案1\",\n\"答案2\",\n\"答案3\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料",
+        "completion": "本题为填空题，你必须根据语境和相关知识填入合适的内容，请根据题目回答问题，以json格式输出正确的答案，示例回答：{\"Answer\": [\"答案\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料",
+        "judgement": "本题为判断题，你只能回答正确或者错误，请根据题目回答问题，以json格式输出正确的答案，示例回答：{\"Answer\": [\"正确\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料",
+    }
+    # 未知题型（目前仅知有简答题）走这个兜底提示词
+    FALLBACK_PROMPT = "本题为简答题，你必须根据语境和相关知识填入合适的内容，请根据题目回答问题，以json格式输出正确的答案，示例回答：{\"Answer\": [\"这是我的答案\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料"
+
     def __init__(self) -> None:
         super().__init__()
         self.name = 'AI大模型答题'
         self.last_request_time = None
 
+    def _wait_interval(self) -> None:
+        """按最小请求间隔限速，避免打爆端点。"""
+        if not self.last_request_time:
+            return
+        interval_time = time.time() - self.last_request_time
+        if interval_time < self.min_interval_seconds:
+            sleep_time = self.min_interval_seconds - interval_time
+            logger.debug(f"API请求间隔过短, 等待 {sleep_time} 秒")
+            time.sleep(sleep_time)
+
     def _query(self, q_info: dict):
-        def remove_md_json_wrapper(md_str):
-            # 使用正则表达式匹配Markdown代码块并提取内容
-            pattern = r'^\s*```(?:json)?\s*(.*?)\s*```\s*$'
-            match = re.search(pattern, md_str, re.DOTALL)
-            return match.group(1).strip() if match else md_str.strip()
+        user_content = f"题目：{q_info['title']}"
+        if q_info['type'] in ("single", "multiple"):
+            # 去除选项字母，防止大模型直接输出字母而非内容
+            options_list = q_info['options'].split('\n')
+            cleaned_options = [re.sub(r"^[A-Z]\s*", "", option) for option in options_list]
+            user_content += f"\n选项：{'\n'.join(cleaned_options)}"
 
-        client = _openai_client(self.endpoint, self.key, self.http_proxy)
-        # 去除选项字母，防止大模型直接输出字母而非内容
-        options_list = q_info['options'].split('\n')
-        cleaned_options = [re.sub(r"^[A-Z]\s*", "", option) for option in options_list]
-        options = "\n".join(cleaned_options)
-        # 判断题目类型
-        if q_info['type'] == "single":
-            completion = client.chat.completions.create(
-                model = self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "本题为单选题，你只能选择一个选项，请根据题目和选项回答问题，以json格式输出正确的选项内容，示例回答：{\"Answer\": [\"答案\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料"
-                    },
-                    {
-                        "role": "user",
-                        "content": f"题目：{q_info['title']}\n选项：{options}"
-                    }
-                ]
-            )
-        elif q_info['type'] == 'multiple':
-            completion = client.chat.completions.create(
-                model = self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "本题为多选题，你必须选择两个或以上选项，请根据题目和选项回答问题，以json格式输出正确的选项内容，示例回答：{\"Answer\": [\"答案1\",\n\"答案2\",\n\"答案3\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料"
-                    },
-                    {
-                        "role": "user",
-                        "content": f"题目：{q_info['title']}\n选项：{options}"
-                    }
-                ]
-            )
-        elif q_info['type'] == 'completion':
-            completion = client.chat.completions.create(
-                model = self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "本题为填空题，你必须根据语境和相关知识填入合适的内容，请根据题目回答问题，以json格式输出正确的答案，示例回答：{\"Answer\": [\"答案\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料"
-                    },
-                    {
-                        "role": "user",
-                        "content": f"题目：{q_info['title']}"
-                    }
-                ]
-            )
-        elif q_info['type'] == 'judgement':
-            completion = client.chat.completions.create(
-                model = self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "本题为判断题，你只能回答正确或者错误，请根据题目回答问题，以json格式输出正确的答案，示例回答：{\"Answer\": [\"正确\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料"
-                    },
-                    {
-                        "role": "user",
-                        "content": f"题目：{q_info['title']}"
-                    }
-                ]
-            )
-        else:
-            completion = client.chat.completions.create(
-                model = self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "本题为简答题，你必须根据语境和相关知识填入合适的内容，请根据题目回答问题，以json格式输出正确的答案，示例回答：{\"Answer\": [\"这是我的答案\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料"
-                    },
-                    {
-                        "role": "user",
-                        "content": f"题目：{q_info['title']}"
-                    }
-                ]
-            )
-
+        self._wait_interval()
         try:
-            if self.last_request_time:
-                interval_time = time.time() - self.last_request_time
-                if interval_time < self.min_interval_seconds:
-                    sleep_time = self.min_interval_seconds - interval_time
-                    logger.debug(f"API请求间隔过短, 等待 {sleep_time} 秒")
-                    time.sleep(sleep_time)
-            self.last_request_time = time.time()
-            response = json.loads(remove_md_json_wrapper(completion.choices[0].message.content))
-            sep = "\n"
-            return sep.join(response['Answer']).strip()
-        except:
-            logger.error("无法解析大模型输出内容")
+            client = _openai_client(self.endpoint, str(self.key or ''), self.http_proxy)
+            completion = client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": self.SYSTEM_PROMPTS.get(q_info['type'], self.FALLBACK_PROMPT),
+                    },
+                    {"role": "user", "content": user_content},
+                ]
+            )
+        except Exception as e:  # noqa: BLE001 - 端点不通/鉴权失败都要落到随机作答，不能中断刷课
+            logger.error(f"{self.name}请求失败：{type(e).__name__}: {e}")
+            return None
+        self.last_request_time = time.time()
+
+        content = getattr(completion.choices[0].message, "content", "") or ""
+        try:
+            response = json.loads(_strip_md_json_wrapper(content))
+            return "\n".join(response['Answer']).strip()
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"无法解析大模型输出内容：{e}\n{content}")
             return None
 
     def _init_tiku(self):
-        # 与 SiliconFlow 共用界面上的「接口地址 / API Key / 模型」三个字段：
-        # 优先读 AI 专用键，缺失时回落到 siliconflow_* 键，避免 GUI 保存的配置缺项。
-        self.endpoint = self._conf.get('endpoint') or self._conf.get('siliconflow_endpoint', '')
+        # 与 SiliconFlow 共用回退键：优先读 AI 专用键，缺失时回落到 siliconflow_* 键，
+        # 避免老用户只填过 siliconflow_* 时切到 AI 直接不可用。
+        self.endpoint = _normalize_base_url(
+            self._conf.get('endpoint') or self._conf.get('siliconflow_endpoint', '')
+        )
         self.key = self._conf.get('key') or self._conf.get('siliconflow_key', '')
         self.model = self._conf.get('model') or self._conf.get('siliconflow_model', '')
         self.http_proxy = self._conf.get('http_proxy', '')
-        self.min_interval_seconds = int(self._conf.get('min_interval_seconds', 3) or 3)
+        try:
+            self.min_interval_seconds = float(self._conf.get('min_interval_seconds', 3) or 3)
+        except (TypeError, ValueError):
+            self.min_interval_seconds = 3.0
+        # 未配置 Key 时立即停用（不发起任何请求）；自建端点可显式勾选忽略 Key
+        self._require_api_key(self.key, "AI 端点")
 
     def check_llm_connection(self) -> bool:
         """
@@ -896,6 +990,8 @@ class AI(Tiku):
 
 class SiliconFlow(Tiku):
     """硅基流动大模型答题实现"""
+    LLM_PROVIDER = True
+    ALLOW_EMPTY_KEY = False     # 硅基流动必须带 Key，留空一律不发请求
     def __init__(self):
         super().__init__()
         self.name = '硅基流动大模型'
@@ -904,9 +1000,7 @@ class SiliconFlow(Tiku):
     def _query(self, q_info: dict):
         def remove_md_json_wrapper(md_str):
             # 解析可能存在的JSON包装
-            pattern = r'^\s*```(?:json)?\s*(.*?)\s*```\s*$'
-            match = re.search(pattern, md_str, re.DOTALL)
-            return match.group(1).strip() if match else md_str.strip()
+            return _strip_md_json_wrapper(md_str)
 
         # 构造请求头
         headers = {
@@ -978,12 +1072,17 @@ class SiliconFlow(Tiku):
     def _init_tiku(self):
         # 从配置文件读取参数
         self.api_endpoint = self._conf.get('siliconflow_endpoint', 'https://api.siliconflow.cn/v1/chat/completions')
-        self.api_key = self._conf['siliconflow_key']
+        self.api_key = self._conf.get('siliconflow_key', '')
 
         self.model_name = self._conf.get('siliconflow_model', 'deepseek-ai/DeepSeek-V3')
 
 
-        self.min_interval = int(self._conf.get('min_interval_seconds', 3))
+        try:
+            self.min_interval = float(self._conf.get('min_interval_seconds', 3) or 3)
+        except (TypeError, ValueError):
+            self.min_interval = 3.0
+        # 未配置 Key 时立即停用：不会向硅基流动发起任何请求，题目直接随机作答
+        self._require_api_key(self.api_key, "硅基流动")
 
     def check_llm_connection(self) -> bool:
         """
@@ -1034,3 +1133,32 @@ class SiliconFlow(Tiku):
         except Exception as e:
             logger.error(f'{self.name} 连接检查失败：{e}')
             return False
+
+
+class DeepSeek(AI):
+    """DeepSeek 官方端点答题实现。
+
+    与 AI 走同一套 OpenAI 兼容请求逻辑与提示词，只是配置键独立
+    （deepseek_endpoint / deepseek_key / deepseek_model），
+    这样界面上 AI / DeepSeek / SiliconFlow 三种方式可以各存各的配置与默认值。
+    """
+    ALLOW_EMPTY_KEY = False     # DeepSeek 官方必须带 Key
+    DEFAULT_ENDPOINT = "https://api.deepseek.com/v1"
+    DEFAULT_MODEL = "deepseek-chat"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.name = 'DeepSeek大模型'
+
+    def _init_tiku(self):
+        self.endpoint = _normalize_base_url(
+            self._conf.get('deepseek_endpoint') or self.DEFAULT_ENDPOINT
+        )
+        self.key = self._conf.get('deepseek_key', '')
+        self.model = self._conf.get('deepseek_model') or self.DEFAULT_MODEL
+        self.http_proxy = self._conf.get('http_proxy', '')
+        try:
+            self.min_interval_seconds = float(self._conf.get('min_interval_seconds', 3) or 3)
+        except (TypeError, ValueError):
+            self.min_interval_seconds = 3.0
+        self._require_api_key(self.key, "DeepSeek 端点")

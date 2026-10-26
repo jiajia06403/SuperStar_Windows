@@ -18,11 +18,19 @@ import sys
 EXIT_DEMO_UNAVAILABLE = 3
 
 
+try:  # 必须在任何 GUI / api 模块导入之前补齐标准流
+    from safeio import ensure_stdio
+except Exception:  # noqa: BLE001
+    ensure_stdio = None
+
+
 def _force_utf8_stdio() -> None:
     """统一 stdio 编码：旧 Windows 控制台用 cp1252 等本地代码页，打印中文会 UnicodeEncodeError。
 
     发行包是 GUI（--windowed），从控制台启动时 stdio 仍可能是 None，统一容错处理。
     """
+    if ensure_stdio is not None:
+        ensure_stdio()
     for stream in (sys.stderr, sys.stdout):
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure is not None:

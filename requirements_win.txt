@@ -15,6 +15,6 @@ tqdm>=4.67.1
 # ---- 加密题库字体解码 ----
 fonttools>=4.60.1
 
-# ---- AI 大模型答题（provider=AI / SiliconFlow 使用，已随发行包内置）----
+# ---- AI 大模型答题（provider=AI / DeepSeek / SiliconFlow 使用，已随发行包内置）----
 openai>=1.109.1
 httpx>=0.28.1

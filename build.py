@@ -8,7 +8,8 @@
 
 发行包的形态（设计意图：让用户一眼看出「不是单个 exe 就能跑的程序」）：
     SuperStar-<版本>.exe  主程序（文件名带版本号，取自 version.txt）
-    config_win.ini       题库/通知配置（随包自带，用户可编辑）
+    config_win.ini       默认配置（随包自带，升级时覆盖 —— 用户不要改）
+                         用户配置 config_user.ini 由程序首次启动生成，不随包分发（防覆盖）
     chaoxing.log         运行日志（随包自带的空文件，追加写入）
     progress_cache\\      进度缓存 / 账号 / cookies（随包自带的空目录）
     使用说明.txt
@@ -80,7 +81,7 @@ def build_exe(root: str, clean: bool = False) -> str:
         "--workpath", os.path.join(root, "build"),
         # spec 是构建中间产物：统一写进 build/SuperStar.spec，项目根不再堆 *.spec
         "--specpath", os.path.join(root, "build"),
-        # 注意：config_win.ini 不再内嵌进 exe —— 它必须由压缩包随附，
+        # 注意：config_win.ini 不再内嵌进 exe —— 它必须由压缩包随附（作为默认配置基准），
         # 否则「只拷 exe」也能跑，就失去了「不能单文件运行」的约束。
         "--add-data", sep.join([os.path.join(root, "resource"), "resource"]),
         "--hidden-import", "api",
@@ -88,6 +89,9 @@ def build_exe(root: str, clean: bool = False) -> str:
         "--hidden-import", "engine",
         "--hidden-import", "account_store",
         "--hidden-import", "paths",
+        "--hidden-import", "config_store",
+        # GUI 无控制台兜底（缺失标准流会让 tqdm 崩刷课线程）
+        "--hidden-import", "safeio",
         "--hidden-import", "fontTools.ttLib",
         # AI 答题（provider=AI）依赖，api/answer.py 里是 try-import，显式声明更稳
         "--hidden-import", "openai",
@@ -149,23 +153,25 @@ def stage_install(root: str, target_dir: str, exe: str) -> "list[str]":
 
 
 def make_zip(root: str, exe: str) -> str:
-    """由 stage_install 的产物打包；zip 内统一带 ``SuperStar-<版本>/`` 顶层目录。"""
+    """由 stage_install 的产物打包；zip 内不再套 ``SuperStar-<版本>/`` 顶层目录。
+
+    解压即主目录（解压器默认会按 zip 名建一层文件夹，用户看到的就是程序文件夹）。
+    """
     zip_path = os.path.join(root, "dist", f"{APP_NAME}-{VERSION}-win64.zip")
     os.makedirs(os.path.dirname(zip_path), exist_ok=True)
     stage = os.path.join(root, "build", "dist_stage")
     shutil.rmtree(stage, ignore_errors=True)
     stage_install(root, stage, exe)
 
-    prefix = f"{APP_NAME}-{VERSION}/"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
         # 空目录不会被自动收录，必须显式写目录条目
-        info = zipfile.ZipInfo(prefix + DATA_DIRNAME + "/")
+        info = zipfile.ZipInfo(DATA_DIRNAME + "/")
         info.external_attr = (0o40755 << 16) | 0x10
         zf.writestr(info, b"")
         for name in sorted(os.listdir(stage)):
             full = os.path.join(stage, name)
             if os.path.isfile(full):
-                zf.write(full, arcname=prefix + name)
+                zf.write(full, arcname=name)
     shutil.rmtree(stage, ignore_errors=True)
     return zip_path
 

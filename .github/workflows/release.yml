@@ -148,8 +148,8 @@ jobs:
           body: |
             ## SuperStar ${{ steps.notes.outputs.VERSION }}
 
-            Windows x64，请**解压整个文件夹**后运行 `SuperStar-${{ needs.build-windows.outputs.version }}.exe`
-            （单 exe 缺少随包配置与目录，不单独分发）。
+            Windows x64，请**解压后**运行 `SuperStar-${{ needs.build-windows.outputs.version }}.exe`
+            （压缩包内不再套一层目录，解压即得完整程序文件夹；单 exe 缺少随包配置与目录，不单独分发）。
 
             ### 更新内容
             ${{ steps.notes.outputs.changes }}

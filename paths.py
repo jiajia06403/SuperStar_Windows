@@ -2,8 +2,9 @@
 """运行时路径解析：所有运行期文件都落在「程序目录」下的固定位置。
 
     程序目录 /
-    ├── SuperStar-<版本>.exe    主程序
-    ├── config_win.ini          题库/通知配置（随包自带，用户可编辑）
+    ├── SuperStar-<版本>.exe     主程序
+    ├── config_win.ini           默认配置（随包自带，升级时被覆盖，用户不要改）
+    ├── config_user.ini          用户配置（首次启动生成，升级不覆盖）
     ├── chaoxing.log            运行日志（随包自带的空文件，追加写入）
     └── progress_cache/         进度缓存 / 账号 / 题库答案缓存 / cookies（随包自带的空目录）
 
@@ -18,6 +19,7 @@ import os
 import sys
 
 CONFIG_NAME = "config_win.ini"
+USER_CONFIG_NAME = "config_user.ini"
 LOG_NAME = "chaoxing.log"
 DATA_DIRNAME = "progress_cache"
 
@@ -30,8 +32,13 @@ def app_dir() -> str:
 
 
 def config_path() -> str:
-    """题库 / 通知配置文件（随包自带，用户可编辑）。"""
+    """默认配置文件（随包自带，升级时会被覆盖，用户不要改）。"""
     return os.path.join(app_dir(), CONFIG_NAME)
+
+
+def user_config_path() -> str:
+    """用户配置文件（首次启动由默认配置生成，升级不覆盖）。"""
+    return os.path.join(app_dir(), USER_CONFIG_NAME)
 
 
 def log_path() -> str:

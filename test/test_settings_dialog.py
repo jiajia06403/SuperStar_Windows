@@ -1,0 +1,255 @@
+# -*- coding: utf-8 -*-
+"""答题设置窗口的行为测试（真实 Tk 窗口，无需账号/网络）。
+
+校验四条约定：
+  1. 下拉切换「答案提供方式」后，下方**只显示该提供方真正会读取的配置项**；
+  2. AI / DeepSeek / SiliconFlow 预填的地址与模型各不相同；
+  3. 保存写进用户配置；换提供方再保存不会清掉别家的值；
+  4. 窗口高度随内容收放，且内容不被窗口底边裁切。
+"""
+import os
+import sys
+import tempfile
+import tkinter as tk
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from ci_annotate import annotate, annotate_exc  # noqa: E402
+
+import config_store  # noqa: E402
+import paths  # noqa: E402
+from gui.app import SettingsDialog  # noqa: E402
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+class _FakeAppDir:
+    """把程序目录临时指向 tmp，模拟「解压后的安装目录」。"""
+
+    def __init__(self, tmp: str):
+        self.tmp = tmp
+        self._old = None
+
+    def __enter__(self):
+        self._old = (getattr(sys, "frozen", None), sys.executable)
+        sys.frozen = True
+        sys.executable = os.path.join(self.tmp, "SuperStar-1.2.3.exe")
+        return self.tmp
+
+    def __exit__(self, *exc):
+        old_frozen, old_exe = self._old
+        if old_frozen is None:
+            del sys.frozen
+        else:
+            sys.frozen = old_frozen
+        sys.executable = old_exe
+        return False
+
+
+def _prepare_dir(tmp: str) -> None:
+    """复制仓库里的默认配置，保证测试跑的是真实默认值。"""
+    with open(os.path.join(ROOT, paths.CONFIG_NAME), encoding="utf8") as fp:
+        text = fp.read()
+    with open(os.path.join(tmp, paths.CONFIG_NAME), "w", encoding="utf8") as fp:
+        fp.write(text)
+
+
+def _open(root: tk.Misc):
+    dlg = SettingsDialog(root)
+    dlg.update()
+    return dlg
+
+
+def _select(dlg, name: str) -> None:
+    dlg.provider_var.set(SettingsDialog.DISABLED_LABEL if name == "" else name)
+    dlg._on_provider_change()
+    dlg.update()
+
+
+def _entry_at(dlg, provider: str, key: str):
+    """取某个提供方面板里某配置项对应的输入框控件（按 grid 行号定位）。"""
+    from tkinter import ttk
+    fields = [f[0] for f in SettingsDialog.PROVIDER_FIELDS[provider]]
+    row = fields.index(key)
+    for widget in dlg.panels[provider].winfo_children():
+        if isinstance(widget, ttk.Entry) and int(widget.grid_info().get("row", -1)) == row:
+            return widget
+    raise AssertionError(f"{provider} 面板里找不到 {key} 的输入框")
+
+
+def _value(dlg, key: str) -> str:
+    kind, var = dlg.vars[key]
+    value = var.get()
+    return ("true" if value else "false") if kind == "bool" else str(value)
+
+
+def test_only_relevant_fields_shown():
+    with tempfile.TemporaryDirectory() as tmp:
+        _prepare_dir(tmp)
+        with _FakeAppDir(tmp):
+            root = tk.Tk()
+            try:
+                dlg = _open(root)
+                for name in SettingsDialog.PROVIDERS:
+                    _select(dlg, name)
+                    visible = [k for k, p in dlg.panels.items() if p.winfo_manager()]
+                    assert visible == [name], f"{name} 应只显示自己的面板，实际 {visible}"
+                    assert dlg.specific_frame.winfo_manager(), f"{name} 的专属设置区应可见"
+                    keys = [f[0] for f in SettingsDialog.PROVIDER_FIELDS[name]]
+                    for key in keys:
+                        assert key in dlg.vars, f"{name} 缺少配置项 {key}"
+
+                # 停用：不显示任何提供方面板，只剩通用项
+                _select(dlg, "")
+                assert not [p for p in dlg.panels.values() if p.winfo_manager()]
+                assert not dlg.specific_frame.winfo_manager(), "停用时专属区应隐藏"
+                dlg.destroy()
+            finally:
+                root.destroy()
+
+
+def test_ai_defaults_differ_per_provider():
+    with tempfile.TemporaryDirectory() as tmp:
+        _prepare_dir(tmp)
+        with _FakeAppDir(tmp):
+            root = tk.Tk()
+            try:
+                dlg = _open(root)
+                expect = {
+                    "AI": ("endpoint", "https://api.openai.com/v1", "model", "gpt-3.5-turbo"),
+                    "DeepSeek": ("deepseek_endpoint", "https://api.deepseek.com/v1",
+                                 "deepseek_model", "deepseek-chat"),
+                    "SiliconFlow": ("siliconflow_endpoint",
+                                    "https://api.siliconflow.cn/v1/chat/completions",
+                                    "siliconflow_model", "deepseek-ai/DeepSeek-V3.2"),
+                }
+                for name, (ekey, evalue, mkey, mvalue) in expect.items():
+                    _select(dlg, name)
+                    assert _value(dlg, ekey) == evalue, f"{name} 默认地址异常: {_value(dlg, ekey)}"
+                    assert _value(dlg, mkey) == mvalue, f"{name} 默认模型异常: {_value(dlg, mkey)}"
+                dlg.destroy()
+            finally:
+                root.destroy()
+
+
+def test_save_keeps_other_providers_values():
+    with tempfile.TemporaryDirectory() as tmp:
+        _prepare_dir(tmp)
+        with _FakeAppDir(tmp):
+            root = tk.Tk()
+            try:
+                dlg = _open(root)
+                _select(dlg, "SiliconFlow")
+                dlg.vars["siliconflow_key"][1].set("sk-sf")
+                dlg._on_save()
+                assert dlg.result["provider"] == "SiliconFlow", dlg.result
+
+                dlg2 = _open(root)
+                _select(dlg2, "DeepSeek")
+                # 切到 DeepSeek 不应清掉硅基流动已填的 Key
+                assert _value(dlg2, "siliconflow_key") == "sk-sf", "切换提供方不应丢已填内容"
+                dlg2.vars["deepseek_key"][1].set("sk-ds")
+                dlg2._on_save()
+
+                cfg = config_store.load_section("tiku")
+                assert cfg["provider"] == "DeepSeek", cfg
+                assert cfg["deepseek_key"] == "sk-ds", cfg
+                assert cfg["siliconflow_key"] == "sk-sf", cfg
+                assert cfg["ignore_api_key"] == "false", "非 AI 方式下该开关应被关掉"
+                for key in ("true_list", "false_list", "cover_rate", "work_retry"):
+                    assert key in cfg, f"通用项 {key} 丢了"
+                dlg2.destroy()
+            finally:
+                root.destroy()
+
+
+def test_shared_field_edits_are_kept():
+    """同一配置键（最小请求间隔 / HTTP 代理）出现在多个面板时，改一处别的面板也要跟着变。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        _prepare_dir(tmp)
+        with _FakeAppDir(tmp):
+            root = tk.Tk()
+            try:
+                dlg = _open(root)
+                _select(dlg, "AI")
+                # 真实控件编辑（而不是直接改变量）：能抓出「两个面板各建了一份变量」的 bug
+                entry = _entry_at(dlg, "AI", "min_interval_seconds")
+                entry.delete(0, "end")
+                entry.insert(0, "7")
+                _select(dlg, "SiliconFlow")
+                assert _value(dlg, "min_interval_seconds") == "7", \
+                    f"AI 面板的编辑没同步到 SiliconFlow，实际 {_value(dlg, 'min_interval_seconds')!r}"
+                _select(dlg, "DeepSeek")
+                entry = _entry_at(dlg, "DeepSeek", "http_proxy")
+                entry.delete(0, "end")
+                entry.insert(0, "http://127.0.0.1:7890")
+                _select(dlg, "AI")
+                assert _value(dlg, "http_proxy") == "http://127.0.0.1:7890", "代理设置未共用"
+                dlg.destroy()
+            finally:
+                root.destroy()
+
+
+def test_save_keeps_hidden_provider_defaults_empty():
+    """保存当前提供方时，不得把隐藏面板的预填默认值写入配置。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        _prepare_dir(tmp)
+        with _FakeAppDir(tmp):
+            root = tk.Tk()
+            try:
+                dlg = _open(root)
+                _select(dlg, "SiliconFlow")
+                dlg._on_save()
+                cfg = config_store.load_section("tiku")
+                assert cfg["endpoint"] == "", "保存 SiliconFlow 不应注入 AI 的 OpenAI 地址"
+                assert cfg["model"] == "", "保存 SiliconFlow 不应注入 AI 的默认模型"
+            finally:
+                root.destroy()
+
+
+def test_layout_not_clipped():
+    with tempfile.TemporaryDirectory() as tmp:
+        _prepare_dir(tmp)
+        with _FakeAppDir(tmp):
+            root = tk.Tk()
+            try:
+                dlg = _open(root)
+                body = dlg.winfo_children()[0]
+                for name in SettingsDialog.PROVIDERS:
+                    _select(dlg, name)
+                    dlg.update_idletasks()
+                    bottom = max(k.winfo_y() + k.winfo_height() for k in body.winfo_children()
+                                 if k.winfo_manager())
+                    assert bottom <= dlg.winfo_height(), \
+                        f"{name} 内容被窗口裁切（内容底 {bottom} > 窗口高 {dlg.winfo_height()}）"
+                dlg.destroy()
+            finally:
+                root.destroy()
+
+
+if __name__ == "__main__":
+    cases = [
+        test_only_relevant_fields_shown,
+        test_ai_defaults_differ_per_provider,
+        test_save_keeps_other_providers_values,
+        test_shared_field_edits_are_kept,
+        test_save_keeps_hidden_provider_defaults_empty,
+        test_layout_not_clipped,
+    ]
+    failed = []
+    for case in cases:
+        try:
+            case()
+            print(f"PASS  {case.__name__}")
+        except AssertionError as exc:
+            failed.append(case.__name__)
+            print(f"FAIL  {case.__name__}: {exc}")
+            annotate_exc(f"test_settings_dialog.py::{case.__name__}")
+        except Exception:  # noqa: BLE001
+            failed.append(case.__name__)
+            annotate_exc(f"test_settings_dialog.py::{case.__name__}")
+    if failed:
+        annotate("test_settings_dialog.py", "失败用例: " + ", ".join(failed))
+        sys.exit(1)
+    sys.exit(0)

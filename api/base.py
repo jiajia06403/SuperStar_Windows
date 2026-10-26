@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 import functools
+import os
 import random
 import re
+import sys
 import threading
 import time
 from enum import Enum
@@ -27,6 +29,21 @@ from api.decode import (
     decode_questions_info,
 )
 from api.exceptions import MaxRetryExceeded
+
+
+def _progress_stream():
+    """tqdm 的输出目标。
+
+    GUI 打包态（PyInstaller --windowed）没有控制台，sys.stderr / sys.stdout 都是 None，
+    直接构造 tqdm 会在首次刷新时抛 AttributeError（NoneType has no attribute 'write'），
+    刷课线程会因此中断。这里保证返回一个可写流。
+    """
+    try:
+        from safeio import ensure_stdio, safe_stream
+        ensure_stdio()
+        return safe_stream(sys.stderr, sys.stdout)
+    except Exception:  # noqa: BLE001
+        return open(os.devnull, "w", encoding="utf-8", errors="replace")
 
 
 def get_timestamp():
@@ -280,6 +297,40 @@ class Chaoxing:
 
         return job_list, job_info
 
+    def is_point_open(self, course: dict, point: dict) -> Optional[bool]:
+        """单次请求探测章节是否已开放（供「读取进度」批量标注章节状态）。
+
+        ``get_job_list`` 为凑任务卡片数会连发多次请求，不适合逐章探测；
+        这里只取一次卡片页，靠解析器给出的 notOpen 标记判断。
+
+        Returns:
+            True = 已开放 / False = 未开放（平台返回「章节未开放」）/ None = 无法判断。
+        """
+        _session = SessionManager.get_session()
+        self.rate_limiter.limit_rate()
+        try:
+            _resp = _session.get(
+                "https://mooc1.chaoxing.com/mooc-ans/knowledge/cards",
+                params={
+                    "clazzid": course["clazzId"],
+                    "courseid": course["courseId"],
+                    "knowledgeid": point["id"],
+                    "ut": "s",
+                    "cpi": course["cpi"],
+                    "v": "2025-0424-1038-3",
+                    "mooc2": 1,
+                    "num": 0,
+                },
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"探测章节开放状态失败 -> {e}")
+            return None
+        if _resp.status_code != 200:
+            logger.warning(f"探测章节开放状态失败 -> [{_resp.status_code}] {point.get('title', '')}")
+            return None
+        _, _job_info = decode_course_card(_resp.text)
+        return not (isinstance(_job_info, dict) and _job_info.get("notOpen", False))
+
     def get_enc(self, clazzId, jobid, objectId, playingTime, duration, userid):
         return md5(
             f"[{clazzId}][{userid}][{jobid}][{objectId}][{playingTime * 1000}][d_yHJ!$pdA~5][{duration * 1000}][0_{duration}]".encode()
@@ -476,7 +527,8 @@ class Chaoxing:
         logger.info(f"开始任务: {_job['name']}, 总时长: {duration}s, 已进行: {play_time}s")
 
         pbar = tqdm(total=duration, initial=play_time, desc=_job["name"],
-                    unit_scale=True, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}')
+                    unit_scale=True, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}',
+                    file=_progress_stream())
 
         forbidden_retry = 0
         max_forbidden_retry = 2
@@ -768,6 +820,14 @@ class Chaoxing:
         # 搜题
         total_questions = len(questions["questions"])
         found_answers = 0
+        # 大模型类题库（AI / DeepSeek / SiliconFlow）：整个任务只在这里做一次可用性检查，
+        # 连不通则本题及后续题目直接随机作答，不再逐题请求大模型（见 Tiku.ensure_available）。
+        _ensure = getattr(self.tiku, "ensure_available", None)
+        if callable(_ensure) and not _ensure():
+            logger.error(
+                "大模型不可用，本章所有题目将随机作答"
+                f"（如需恢复：修正配置后在「设置」里保存一次）: {getattr(self.tiku, 'name', '题库')}"
+            )
         for q in questions["questions"]:
             logger.debug(f"当前题目信息 -> {q}")
             # 添加搜题延迟 #428 - 默认0s延迟

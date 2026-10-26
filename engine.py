@@ -7,6 +7,7 @@ SuperStar Windows 引擎
      以用服务端真实进度重新缓存。
      **章节是否完成一律以服务端为准**：本地缓存只是辅助记录，平台若仍要求重新作答
      （判分不合格、未提交等）会清除本地标记并重新处理，避免误判为已完成。
+     「读取进度」还会逐章探测开放状态，未开放章节标记 ``not_open``（界面显示「未开放」）。
   2. 章节检测提交后回读任务点校验；平台判不合格时重新作答（次数由 work_retry 控制），
      重答后仍不通过则保留为未完成（ChapterResult.UNVERIFIED），绝不标记完成。
   3. 切换章节时若发现章节未开放：
@@ -118,6 +119,24 @@ def _work_still_pending(chaoxing: Chaoxing, course: dict, point: dict) -> Option
         # 章节突然变回未开放，属于异常情况，不参与完成校验
         return None
     return any(j.get("type") == "workid" for j in jobs)
+
+
+def _probe_not_open(chaoxing: Chaoxing, course: dict, point: dict) -> Optional[bool]:
+    """探测单章是否为「未开放」（单请求）。
+
+    返回 True=未开放 / False=已开放 / None=无法判断（后端不支持该探测或网络异常）。
+    """
+    probe = getattr(chaoxing, "is_point_open", None)
+    if probe is None:
+        return None
+    try:
+        opened = probe(course, point)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"探测章节开放状态失败（{point.get('title', '')}）: {e}")
+        return None
+    if opened is None:
+        return None
+    return not opened
 
 
 def process_chapter(chaoxing: Chaoxing, course: dict, point: dict, speed: float,
@@ -335,6 +354,8 @@ class StudyEngine:
         self._stop = False
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.RLock()
+        # 已知「未开放」章节：courseId -> {pointId}（仅供界面展示，不落盘）
+        self._not_open: dict[str, set[str]] = {}
         # 运行状态
         self.speed = 1.0
         self.jobs = 1
@@ -480,14 +501,16 @@ class StudyEngine:
             use_cookies=acc["use_cookies"], tiku_config=tiku_config, remember=True,
         )
 
-    def login_demo(self) -> str:
+    def login_demo(self, not_open_ids=()) -> str:
         """演示登录：加载本地假后端 DemoChaoxing，无需真实账号/网络。
 
         用于本地预览、GUI 联调与自检验证（仅测试包内置该后端）。行为与真实 login 一致：
         建立 chaoxing、设置 current_uid、登记账号、切换进度缓存并上报事件。
+
+        ``not_open_ids``：把指定章节 id 造为「未开放」，便于验证该状态的展示。
         """
         from demo_chaoxing import DemoChaoxing
-        self.chaoxing = DemoChaoxing()
+        self.chaoxing = DemoChaoxing(not_open_ids=not_open_ids)
         self.current_uid = self.chaoxing.get_uid()
         with self._lock:
             self.accounts[self.current_uid] = {
@@ -524,6 +547,7 @@ class StudyEngine:
 
         取到服务端章节状态后会与本地缓存双向对齐：平台说未完成的章节会清掉本地
         「已完成」记录，避免界面/后续刷课把需重新作答的章节误判成已完成。
+        已知「未开放」的章节会附带 ``not_open`` 标记（由「读取进度」探测得到）。
         """
         uid = self.current_uid
         point_list = self.chaoxing.get_course_point(
@@ -534,21 +558,114 @@ class StudyEngine:
         self.cache.sync_with_points(uid, cid, points)
         for p in points:
             p["cache_done"] = self.cache.is_done(uid, cid, str(p["id"]))
+        self._apply_not_open(course, points)
         return points
 
-    def read_progress(self, course: dict) -> list[dict]:
-        """手动读取进度按钮：从服务端重新读取并对齐该课程进度。"""
+    # ---- 「未开放」章节标记 ----
+    def _apply_not_open(self, course: dict, points: list[dict]) -> None:
+        """把已探测到的「未开放」状态打到章节上（已完成章节不再算未开放）。"""
+        locked = self._not_open.get(str(course["courseId"]), set())
+        for p in points:
+            pid = str(p.get("id"))
+            if p.get("has_finished"):
+                locked.discard(pid)
+                continue
+            if pid in locked:
+                p["not_open"] = True
+
+    def refresh_progress(self, course: dict, emit: bool = True) -> list[dict]:
+        """只从服务端读取完成状态并对齐缓存（单请求，可先渲染界面）。
+
+        与 ``read_progress`` 相比不做逐章探测，因此耗时≈1 次请求；
+        界面可以先用它把「完成/待学」刷出来，再在后台流式探测「未开放」。
+        ``emit=False`` 时不发逐章 PROGRESS（由调用方统一上报）。
+        """
         assert self.chaoxing is not None, "请先登录"
         points = self.cache.read_progress_from_server(
             self.chaoxing, course, uid=self.current_uid
         )
-        # 上报进度变化，让界面刷新
+        self._apply_not_open(course, points)   # 沿用上次探测结果，避免状态闪烁
+        if emit:
+            cid = str(course["courseId"])
+            for p in points:
+                self._emit(self.PROGRESS, cid, str(p["id"]), self._point_status(p))
+        return points
+
+    def probe_not_open(self, course: dict, points: list[dict],
+                       on_point: Optional[Callable[[str, Optional[bool], int, int], None]] = None,
+                       should_stop: Optional[Callable[[], bool]] = None) -> int:
+        """逐章探测「未开放」状态，返回探测到的未开放章节数。
+
+        只探测服务端标记为未完成的章节（已完成章节无需探测）。每章一次请求；
+        连续两次探测失败即中止，避免网络异常时逐章干等。探测失败时保留原状态
+        （界面显示「待学」），绝不把无法判断的章节误标为未开放。
+
+        ``on_point(pid, not_open, index, total)``：每探测完一章回调一次（``not_open``
+        为 None 表示无法判断），供界面流式刷新单行；``should_stop()`` 返回 True 时提前结束
+        （用户切课程 / 开始刷课）。
+        """
+        if self.chaoxing is None:
+            return 0
+        cid = str(course["courseId"])
+        locked = self._not_open.setdefault(cid, set())
+        targets = []
+        for point in points:
+            pid = str(point.get("id"))
+            if point.get("has_finished"):
+                locked.discard(pid)
+                continue
+            targets.append(point)
+        total = len(targets)
+        found = 0
+        misses = 0
+        for idx, point in enumerate(targets, 1):
+            if should_stop is not None and should_stop():
+                break
+            if misses >= 2:
+                break
+            pid = str(point.get("id"))
+            state = _probe_not_open(self.chaoxing, course, point)
+            if state is None:
+                misses += 1
+                if on_point is not None:
+                    on_point(pid, None, idx, total)
+                continue
+            misses = 0
+            if state:
+                locked.add(pid)
+                point["not_open"] = True
+                found += 1
+            else:
+                locked.discard(pid)
+                point.pop("not_open", None)
+            if on_point is not None:
+                on_point(pid, bool(state), idx, total)
+        return found
+
+    def read_progress(self, course: dict, probe: bool = True) -> list[dict]:
+        """手动读取进度按钮（同步版）：读取完成状态 + 逐章探测未开放。
+
+        界面走异步两段式（``refresh_progress`` → ``probe_not_open``）以免阻塞；
+        本方法供 CLI / 测试等需要一次拿到最终结果的场景使用。
+        """
+        points = self.refresh_progress(course, emit=False)
+        found = self.probe_not_open(course, points) if probe else 0
+        if found:
+            logger.info(f"识别到 {found} 个未开放章节: {course['title']}")
         cid = str(course["courseId"])
         for p in points:
-            self._emit(self.PROGRESS, cid, str(p["id"]),
-                       "done" if self.cache.is_done(self.current_uid, cid, str(p["id"])) else "pending")
+            self._emit(self.PROGRESS, cid, str(p["id"]), self._point_status(p))
         self._emit(self.STATUS, "read_progress", f"课程={course['title']}")
         return points
+
+    @staticmethod
+    def _point_status(point: dict) -> str:
+        """章节状态字符串：done / not_open / pending（界面按此渲染）。"""
+        if point.get("has_finished"):
+            return "done"
+        if point.get("not_open"):
+            return "not_open"
+        return "pending"
 
     # ---- 启动 / 停止 ----
     def start_study(self, course_list: list[dict], speed: float = 1.0, jobs: int = 1) -> None:
@@ -596,6 +713,7 @@ class StudyEngine:
         )
         points = point_list.get("points", [])
         total = len(points)
+        locked = self._not_open.setdefault(cid, set())
         logger.info(f"开始学习课程: {course['title']}（共 {total} 个章节）")
 
         i = 0
@@ -616,6 +734,7 @@ class StudyEngine:
             if point.get("has_finished"):
                 if not self.cache.is_done(uid, cid, pid):
                     self.cache.mark_done(uid, cid, pid)
+                locked.discard(pid)
                 logger.info(f"章节已完成(服务端): {point['title']}")
                 self._emit(self.PROGRESS, cid, pid, "done")
                 i += 1
@@ -633,6 +752,7 @@ class StudyEngine:
 
             if result == ChapterResult.SUCCESS:
                 point["has_finished"] = True
+                locked.discard(pid)
                 self.cache.mark_done(uid, cid, pid)
                 self._emit(self.PROGRESS, cid, pid, "done")
                 logger.info(f"章节完成: {point['title']}")
@@ -640,8 +760,12 @@ class StudyEngine:
                 continue
 
             if result == ChapterResult.NOT_OPEN:
+                # 让界面显示「未开放」而不是「待学」
+                locked.add(pid)
+                self._emit(self.PROGRESS, cid, pid, "not_open")
                 opened = self._handle_not_open(course, points, i, cid, uid)
                 if opened:
+                    locked.discard(pid)
                     # 章节已开放，保持在 i 重新处理本章
                     continue
                 # 软件关闭 / 停止
@@ -667,6 +791,7 @@ class StudyEngine:
                                     work_retry=self.work_retry)
                 if r == ChapterResult.SUCCESS:
                     point["has_finished"] = True
+                    locked.discard(pid)
                     self.cache.mark_done(uid, cid, pid)
                     self._emit(self.PROGRESS, cid, pid, "done")
                     i += 1
