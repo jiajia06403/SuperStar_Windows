@@ -120,7 +120,7 @@ class _Chaoxing:
     def get_course_point(self, courseid, clazzid, cpi):
         return {"points": [dict(p) for p in self.points]}
 
-    def get_job_list(self, course, point, stop_early=False):
+    def get_job_list(self, course, point, stop_early=False, **kwargs):
         self.job_calls.append((point["id"], stop_early))
         return [dict(j) for j in self.jobs.get(point["id"], [])], {
             "knowledgeid": "913820156", "ktoken": "ktoken-value", "cpi": "338350298"}

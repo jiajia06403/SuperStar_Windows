@@ -87,6 +87,7 @@ CHAPTER_COLORS = {
 
 _ACTIVE = "light"          # 当前生效的主题名（无 ThemeManager 时的兜底）
 _MANAGER: "ThemeManager | None" = None
+_COMBO_FIX_INSTALLED = False   # combobox 焦点修正是否已挂上（类绑定是解释器级的）
 
 
 # --------------------------------------------------------------------------- #
@@ -474,6 +475,76 @@ class ThemeManager:
             style.map(f"{orient}.TScrollbar",
                       background=[("active", p["text_dim"]), ("pressed", p["text_dim"])],
                       arrowcolor=[("active", p["accent"])])
+
+
+def _hand_off_focus(root: tk.Misc, cb_path: str, x: int, y: int) -> None:
+    """把焦点从 ``cb_path`` 这个 combobox 上摘掉（下拉被点外部关掉之后）。
+
+    ``x/y`` 是那下点击的屏幕坐标：焦点优先交给光标底下的控件（课程列表 / 日志框
+    之类），它不吃焦点时才退给所在窗口。
+    """
+    try:
+        focused = root.focus_get()
+    except (tk.TclError, AttributeError):
+        return
+    if focused is None or str(focused) != cb_path:
+        return                                  # 焦点已经不在它身上了
+    target = None
+    try:
+        target = root.winfo_containing(x, y)
+    except tk.TclError:
+        target = None
+    if target is not None:
+        if str(target) == cb_path:
+            return                              # 又点了一下自己（收起下拉）：焦点留着
+        try:
+            target.focus_set()
+        except tk.TclError:
+            pass
+    try:
+        still = root.focus_get()
+    except (tk.TclError, AttributeError):
+        return
+    if still is not None and str(still) == cb_path:
+        try:                                    # 光标下的控件不吃焦点：退给所在窗口
+            focused.winfo_toplevel().focus_set()
+        except tk.TclError:
+            pass
+
+
+def install_combobox_focus_fix(root: tk.Misc) -> None:
+    """修掉「点开下拉、再点别处关掉后 combobox 仍亮着强调色描边」。
+
+    ttk::combobox 展开时会给 popdown 上全局 grab：外面那一下点击被吞掉（只用来
+    Unpost），焦点随后又自动回到 combobox —— 可用户点的是别处，于是描边一直亮着，
+    看着像卡住了。这里在 popdown 收到 ``<Button>``（即「点外部关闭」）之后把焦点
+    交给光标底下的控件；它不吃焦点就退给所在窗口。
+
+    只对「点击关闭」生效：选中项（``LBSelected`` 里显式 ``focus $cb``）和 Esc 取消
+    都保留焦点在 combobox 上，跟 Windows 原生一致。
+    """
+    global _COMBO_FIX_INSTALLED
+    if _COMBO_FIX_INSTALLED:
+        return                                  # 类绑定是解释器级的，装一次够了
+
+    def _on_dismiss(event=None):
+        try:
+            cb_path = root.tk.call("winfo", "parent", str(event.widget))
+        except (tk.TclError, AttributeError):
+            return
+        x, y = getattr(event, "x_root", None), getattr(event, "y_root", None)
+        if x is None:
+            try:
+                x, y = root.winfo_pointerxy()   # 兜底：拿不到事件坐标就用当前光标位置
+            except tk.TclError:
+                return
+        root.after_idle(lambda: _hand_off_focus(root, cb_path, x, y))
+
+    try:
+        root.bind_class("ComboboxPopdown", "<Button>", _on_dismiss, add="+")
+        _COMBO_FIX_INSTALLED = True
+    except tk.TclError:
+        pass
 
 
 def manager() -> "ThemeManager | None":

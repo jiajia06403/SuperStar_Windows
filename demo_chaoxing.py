@@ -79,7 +79,7 @@ class DemoChaoxing:
         pts = self._points.get(cid, [])
         return {"points": [dict(p) for p in pts]}
 
-    def get_job_list(self, course, point):
+    def get_job_list(self, course, point, **kwargs):
         if str(point.get("id")) in self.not_open_ids:
             return [], {"notOpen": True}
         # 已完成的章节不再返回任务点（与真实平台 isPassed 语义一致）

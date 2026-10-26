@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import functools
+import inspect
 import os
 import random
 import re
@@ -8,7 +9,7 @@ import threading
 import time
 from enum import Enum
 from hashlib import md5
-from typing import Self, Optional, Literal
+from typing import Callable, Self, Optional, Literal
 
 import requests
 from loguru import logger
@@ -28,7 +29,7 @@ from api.decode import (
     decode_course_folder,
     decode_questions_info,
 )
-from api.exceptions import MaxRetryExceeded
+from api.exceptions import MaxRetryExceeded, StudyRequestError
 from api import cancel, local_bank, work_verify
 
 
@@ -49,6 +50,29 @@ def _progress_stream():
 
 def get_timestamp():
     return str(int(time.time() * 1000))
+
+
+def _tiku_query(tiku, q_info: dict, course: str = "", course_id: str = "") -> Optional[str]:
+    """查题：把课程信息**显式**传给题库（本地题库靠它定位课程文件）。
+
+    自定义题库可能还是旧签名 ``query(q_info)``，这里按签名判断：
+    认得 ``course`` 就带上，认不得就退回单参数调用（本地题库查询退化为
+    「跨文件找」，仍正确，只是少了当前课程优先）。
+    """
+    if not course and not course_id:
+        return tiku.query(q_info)
+    query = getattr(tiku, "query", None)
+    if query is None:
+        return None
+    try:
+        params = inspect.signature(query).parameters
+        accepts = "course" in params or "course_id" in params or any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+    except (TypeError, ValueError):  # 内置/无法内省 -> 保守退回旧签名
+        accepts = False
+    if accepts:
+        return query(q_info, course=course, course_id=course_id)
+    return query(q_info)
 
 
 def _clip_text(text, limit: int) -> str:
@@ -100,37 +124,138 @@ def _normalize_play_time(raw, duration) -> int:
     return 0
 
 
+# 任务点请求的重试策略：最多 3 次、指数退避（1s -> 2s）
+# （测试里可下调 REQUEST_BACKOFF_BASE 加速；两者都是模块级常量，改一处即全局生效）
+REQUEST_MAX_RETRIES = 3
+REQUEST_BACKOFF_BASE = 1.0
+
+
+def _request_json(session, method, url, *, what, params=None, data=None, headers=None,
+                  max_retries: Optional[int] = None, base_delay: Optional[float] = None):
+    """带状态码检查 + 有限重试的 JSON 请求（任务点级别的网络护栏）。
+
+    - 非 200 / 网络异常 / 响应不是合法 JSON 都会重试，最多 ``max_retries`` 次，
+      退避间隔指数增长（base_delay, 2*base_delay, ...）；
+    - **每次重试前都会 ``cancel.check()``**：点了「停止」立刻中断，不会继续发请求、
+      也不会在退避里睡满；
+    - 重试耗尽抛出 :class:`StudyRequestError`，由上层收敛为 ``StudyResult.ERROR``，
+      单点失败不至于穿透到刷课主循环。
+
+    注意：不要在这里传 ``timeout`` —— SessionManager 已用
+    ``functools.partial(request, timeout=5)`` 固定，再传会触发重复关键字实参报错。
+    """
+    retries = max(1, int(max_retries if max_retries is not None else REQUEST_MAX_RETRIES))
+    delay0 = max(0.0, float(base_delay if base_delay is not None else REQUEST_BACKOFF_BASE))
+    last_reason = ""
+    for attempt in range(1, retries + 1):
+        if attempt > 1:
+            cancel.check()
+            delay = delay0 * (2 ** (attempt - 2))
+            logger.warning(f"{what}失败，{delay:g}s 后重试({attempt}/{retries}): {last_reason}")
+            if cancel.wait(delay):
+                raise cancel.Cancelled()
+        try:
+            if method == "post":
+                resp = session.post(url, data=data, params=params, headers=headers)
+            else:
+                resp = session.get(url, params=params, headers=headers)
+        except RequestException as exc:
+            last_reason = f"{type(exc).__name__}: {exc}"
+            continue
+        status = getattr(resp, "status_code", None)
+        if status != 200:
+            last_reason = f"HTTP {status}: {str(getattr(resp, 'text', '') or '')[:200]}"
+            continue
+        try:
+            return resp.json()
+        except ValueError as exc:
+            last_reason = f"响应不是合法 JSON: {exc}"
+            continue
+    raise StudyRequestError(f"{what}失败（已重试 {retries} 次）: {last_reason}")
+
+
 class SessionManager:
+    """进程内唯一的 ``requests.Session`` 持有者（单例 + 惰性构造）。
+
+    坑（已修）：``__new__`` 只能保证「实例对象」唯一，``__init__`` 在每次
+    ``SessionManager()`` 时都会照常执行。原实现把建会话写在 ``__init__`` 里，
+    于是 ``get_session()`` 每调用一次就：新建 Session → 重挂 adapter →
+    再包一层 timeout partial → 从 cookies.txt 重新 load 一遍。
+    后果是连接池 / TLS 每请求重建，且服务端刚下发的 Set-Cookie 会被磁盘上的
+    旧值覆盖（会话漂移，403 / 验证码的诱因之一）。
+
+    现在构造逻辑下沉到 ``_build()``，由锁保护且只跑一次；``__init__`` 只走
+    一次属性判断的空转。语义不变：``update_cookies()`` 仍是把磁盘 cookie 合并进
+    当前会话，``clear_session()`` 仍是丢弃当前会话（下次访问时重建）。
+    """
+
     _instance = None
+    _lock = threading.Lock()
 
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
-            cls._instance = super().__new__(cls)
+            with cls._lock:
+                if cls._instance is None:
+                    instance = super().__new__(cls)
+                    instance._session = None
+                    cls._instance = instance
         return cls._instance
 
     def __init__(self):
-        self._session = requests.Session()
-        self._session.mount("https://", HTTPAdapter(max_retries=10))
-        self._session.mount("http://", HTTPAdapter(max_retries=10))
-        self._session.request = functools.partial(self._session.request, timeout=5)
-        # For debug purposes
-        # self._session.verify=False
-        self._session.headers.clear()
-        self._session.headers.update(gc.HEADERS)
-        self._session.cookies.update(use_cookies())
+        self._build()
+
+    def _build(self) -> requests.Session:
+        """创建会话（只执行一次）；返回当前会话。"""
+        session = getattr(self, "_session", None)
+        if session is not None:
+            return session
+        with self._lock:
+            session = getattr(self, "_session", None)
+            if session is not None:
+                return session
+
+            session = requests.Session()
+            session.mount("https://", HTTPAdapter(max_retries=10))
+            session.mount("http://", HTTPAdapter(max_retries=10))
+            # timeout 只允许包一层：partial 叠加会让每次请求多一层无谓封装
+            if not isinstance(getattr(session, "request", None), functools.partial):
+                session.request = functools.partial(session.request, timeout=5)
+            # For debug purposes
+            # session.verify=False
+            session.headers.clear()
+            session.headers.update(gc.HEADERS)
+            session.cookies.update(use_cookies())
+            self._session = session
+            return session
 
     @classmethod
     def get_instance(cls) -> Self:
-        return cls()
+        instance = cls()
+        instance._build()
+        return instance
 
     @classmethod
     def get_session(cls) -> requests.Session:
-        instance = cls.get_instance()
-        return instance._session
+        return cls.get_instance()._build()
 
     @classmethod
     def update_cookies(cls):
-        cls.get_instance()._session.cookies.update(use_cookies())
+        """把 cookies.txt 的内容合并进当前会话（不删会话里已有的其他 cookie）。"""
+        cls.get_session().cookies.update(use_cookies())
+
+    @classmethod
+    def clear_session(cls):
+        """丢弃当前会话并关闭其连接池，下次访问时按当前磁盘 cookie 重建。"""
+        with cls._lock:
+            instance = cls._instance
+            session = getattr(instance, "_session", None) if instance else None
+            if instance is not None:
+                instance._session = None
+        if session is not None:
+            try:
+                session.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 class Account:
@@ -181,6 +306,16 @@ class StudyResult(Enum):
         return self != StudyResult.SUCCESS
 
 class Chaoxing:
+    # 章节任务卡片序号：服务端按 num=0..N 分页给任务卡片（一个章节可能有多个卡片，
+    # 老师在小节里「加一张卡片」就会 +1）。绝大多数章节只有 1 张，逐个探测到上限为止。
+    CARD_NUMS_ALL = "0123456"
+    # 只探测第一张卡片：判断「章节是否开放」不需要其余卡片 —— 未开放时第 0 张就会
+    # 返回「章节未开放」，已开放时第 0 张返回正常卡片数据。
+    CARD_NUMS_FIRST = "0"
+    # 整章读取时，连续多少张「没有任何任务点」的卡片就认为后面没有了。
+    # 给 1 张以上的容忍度是因为多卡片章节里可能掺有纯文本卡 / 已全部通过的卡片，
+    # 宁可多请求一张，也不能像 stop_early 那样一遇空卡就停而漏掉后面的任务点。
+    CARD_MAX_EMPTY = 2
     def __init__(self, account: Account = None, tiku: Tiku = None, **kwargs):
         self.account = account
         self.cipher = AESCipher()
@@ -310,16 +445,45 @@ class Chaoxing:
         return decode_course_point(_resp.text)
 
     def get_job_list(self, course: dict, point: dict,
-                     stop_early: bool = False) -> tuple[list[dict], dict]:
+                     stop_early: bool = False,
+                     nums: Optional[str] = None,
+                     stop_when: Optional[Callable[[list, dict], bool]] = None,
+                     track_cards: bool = False) -> tuple[list[dict], dict]:
         """读取章节任务点。
 
-        ``stop_early``：一遇到空卡片就停（采集题库时用；整章刷课仍走原来的
-        「凑满 7 张卡片」逻辑，避免漏掉多卡片章节的任务点）。
+        三个「少请求」开关（风控考虑：原来每章固定打满 7 张卡片，且一次调用只限流一次）：
+
+        - ``nums``：只请求给定的卡片序号（``None`` = 全部 ``CARD_NUMS_ALL``）。
+          比如查「章节是否开放」只需要 ``CARD_NUMS_FIRST``，回读章节检测状态只需要
+          上次读到 workid 的那几张卡片。``nums`` 不等于全集时视为**部分读取**：
+          拿不到任务点也不会被当成「空章节」（不打空页、不写 ``empty``）——
+          因为我们根本没看全，断言「本章没有任务点」是错的。
+        - ``stop_when(job_slice, card_info)``：命中即返回，不再请求后续卡片。
+        - ``track_cards``：在 ``job_info["card_of_job"]`` 里给出
+          ``{jobid: 卡片序号}``，供调用方下回只回读相关卡片。
+
+        ``stop_early``：一遇到空卡片就停（采集题库时用）。整章刷课不用它，改由
+        ``CARD_MAX_EMPTY`` 容忍若干张空卡后再收手，避免漏掉多卡片章节的任务点。
+
+        失败态（读不到任务点）在 ``job_info`` 里用 ``unreadable=True`` 标记，
+        **不再返回空列表冒充成功**：非 200、掉登录/验证码/403 页、mArg 解析失败
+        都会命中。真正「本章没有任务点」会走 study_emptypage 并带 ``empty=True``。
+        章节未开放仍为 ``notOpen=True``（语义不变）。
         """
         _session = SessionManager.get_session()
+        job_list: list[dict] = []
+        job_info: dict = {}
+        card_of_job: dict[str, str] = {}
+        readable = False     # 是否至少有一张卡片被成功解析
+        empty_run = 0        # 连续空卡片计数
+
+        card_nums = self.CARD_NUMS_ALL if nums is None else str(nums)
+        if not card_nums:
+            card_nums = self.CARD_NUMS_ALL
+        # 只看了一部分卡片：不能据此断言「本章没有任务点」
+        partial = card_nums != self.CARD_NUMS_ALL
+
         self.rate_limiter.limit_rate()
-        job_list = []
-        job_info = {}
         cards_params = {
             "clazzid": course["clazzId"],
             "courseid": course["courseId"],
@@ -331,7 +495,11 @@ class Chaoxing:
         }
 
         # 学习界面任务卡片数, 很少有3个的, 但是对于章节解锁任务点少一个都不行, 可以从API /mooc-ans/mycourse/studentstudyAjax获取值, 或者干脆直接加, 但二者都会造成额外的请求
-        for _possible_num in "0123456":
+        for _card_index, _possible_num in enumerate(card_nums):
+            if _card_index:
+                # 逐张限流（同一个 rate_limiter、同样的 0.5s 语义）：过去一次调用只在
+                # 开头限流一次，7 张卡片等于一口气连发 7 个请求，很容易撞风控。
+                self.rate_limiter.limit_rate()
 
             logger.trace("开始读取章节所有任务点...")
 
@@ -340,7 +508,7 @@ class Chaoxing:
             if _resp.status_code != 200:
                 logger.error(f"未知错误: {_resp.status_code} 正在跳过")
                 logger.error(_resp.text)
-                return [], {}
+                return [], {"unreadable": True}
 
             _job_list, _job_info = decode_course_card(_resp.text)
             if _job_info.get("notOpen", False):
@@ -348,15 +516,57 @@ class Chaoxing:
                 logger.info("该章节未开放")
                 return [], _job_info
 
-            if stop_early and not _job_list and _possible_num != "0":
-                # 卡片序号从 0 连续排列：第 1 张之后还空就说明没有更多卡片了
-                break
+            if _job_info.get("unreadable", False):
+                # 卡片页不可读（掉登录 / 验证码 / 403 / 解析失败），没有任务点可言
+                logger.warning(f"章节任务点卡片 {_possible_num} 读取失败（可能是掉登录或风控页）")
+                empty_run = 0
+                if stop_early and _possible_num != card_nums[0]:
+                    break
+                continue
+
+            readable = True
+            if track_cards:
+                for _job in _job_list:
+                    _jobid = str(_job.get("jobid") or _job.get("id") or "")
+                    if _jobid:
+                        card_of_job.setdefault(_jobid, _possible_num)
 
             job_list += _job_list
             job_info.update(_job_info)
 
+            if stop_when is not None and stop_when(_job_list, dict(_job_info)):
+                # 命中即收手：后续卡片不用再请求了
+                logger.trace(f"任务点读取在第 {_possible_num} 张卡片命中，停止后续请求")
+                break
+
+            if not _job_list:
+                empty_run += 1
+                # 卡片序号从 0 连续排列：第 1 张之后还空就说明没有更多卡片了
+                if stop_early and _possible_num != card_nums[0]:
+                    break
+                if empty_run >= self.CARD_MAX_EMPTY:
+                    logger.trace(f"连续 {empty_run} 张卡片没有任务点，判定后面没有卡片了")
+                    break
+            else:
+                empty_run = 0
+
+        if track_cards:
+            job_info["card_of_job"] = card_of_job
+
         if not job_list:
+            if not readable:
+                # 一张卡片都没解析成功：绝不能当成「本章无任务点」，否则上层会把
+                # 整章记为已完成（一次网络抖动就永久跳过该章）。
+                logger.error("章节任务点读取失败：未能解析出任何卡片数据")
+                return [], {"unreadable": True}
+            if partial:
+                # 只看了部分卡片就没任务点：什么都不做，交回上层按「没读到」自决。
+                # 这里绝不能走 study_emptypage —— 那等于凭半份数据宣称本章无任务点。
+                logger.debug(f"部分卡片读取(nums={card_nums})未取到任务点，跳过空章节判定")
+                return job_list, job_info
+            # 确实是空章节（卡片全解析成功但没有任务点），按空页处理
             self.study_emptypage(course, point)
+            job_info["empty"] = True
         # logger.trace(f"原始任务点列表内容:\n{_resp.text}")
         logger.info("章节任务点读取成功...")
 
@@ -568,14 +778,23 @@ class Chaoxing:
             logger.debug(f"视频状态日志输出失败: {exc}")
 
     def study_video(self, _course, _job, _job_info, _speed: float = 1.0, _type: Literal["Video", "Audio"] = "Video") -> StudyResult:
+        """视频任务点。
+
+        元数据请求走 :func:`_request_json`：状态码异常/网络异常/脏 JSON 最多重试 3 次，
+        仍失败抛 :class:`StudyRequestError`，由 ``engine.process_job`` 收敛成
+        ``StudyResult.ERROR``（只丢这一个任务点，不中断整章/整轮）。
+        """
         _session = SessionManager.get_session()
 
         headers = gc.VIDEO_HEADERS if _type == "Video" else gc.AUDIO_HEADERS
         _info_url = f"https://mooc1.chaoxing.com/ananas/status/{_job['objectid']}?k={self.get_fid()}&flag=normal"
-        _video_info = _session.get(_info_url, headers=headers).json()
+        # 状态码检查 + 有限重试都在这里；耗尽后抛 StudyRequestError（不在这里吞掉，
+        # 交给上层统一按 ERROR 处理，保证「单点失败 != 整轮中止」）
+        _video_info = _request_json(_session, "get", _info_url, headers=headers,
+                                    what=f"读取视频信息(objectId={_job.get('objectid')})")
 
-        if _video_info["status"] != "success":
-            logger.error(f"Unknown status: {_video_info['status']}")
+        if _video_info.get("status") != "success":
+            logger.error(f"Unknown status: {_video_info.get('status')}")
             return StudyResult.ERROR
 
         _dtoken = _video_info["dtoken"]
@@ -621,7 +840,10 @@ class Chaoxing:
 
         try:
             cancel.check()
-            passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration, play_time, _type,headers=headers)
+            # 只上报一次：过去这里连着发两条（playTime 续播点 + duration），第一条的
+            # (passed, state) 立刻被第二条覆盖，唯一的差别只是多了一次网络请求
+            # （服务端多记一次续播位置、本地多等一次 video_log_limiter 随机退避）。
+            # 生效的判定始终来自这条 duration 上报，删掉被覆盖的那条不改变任何后续逻辑。
             passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration, duration, _type, headers=headers)
 
             if passed:
@@ -735,11 +957,11 @@ class Chaoxing:
         if self.tiku.DISABLE or not self.tiku:
             return StudyResult.SUCCESS
         # 本地题库按课程存放（同一门课的题目和答案对所有账号都一样）：
-        # 查询时优先查这门课的文件，入库也写进这门课的文件
-        local_bank.set_scope(
-            course=str(_course.get("title") or "") if isinstance(_course, dict) else "",
-            course_id=str(_course.get("courseId") or "") if isinstance(_course, dict) else "",
-        )
+        # 查询时优先查这门课的文件，入库也写进这门课的文件。
+        # 课程信息**逐次显式传参**（不再写进程级 set_scope）：多线程刷课时
+        # 同章节多个作业并发，全局作用域会被互相覆盖，答案会写错课程文件。
+        _course_title = str(_course.get("title") or "") if isinstance(_course, dict) else ""
+        _course_id = str(_course.get("courseId") or "") if isinstance(_course, dict) else ""
         _ORIGIN_HTML_CONTENT = ""  # 用于配合输出网页源码, 帮助修复#391错误
 
         def random_answer(options: str) -> str:
@@ -937,7 +1159,7 @@ class Chaoxing:
             # 添加搜题延迟 #428 - 默认0s延迟
             query_delay = self.kwargs.get("query_delay", 0)
             time.sleep(query_delay)
-            res = self.tiku.query(q)
+            res = _tiku_query(self.tiku, q, _course_title, _course_id)
             answer = ""
             if not res:
                 # 随机答题
@@ -1040,7 +1262,10 @@ class Chaoxing:
 
         del questions["questions"]
 
-        res = _session.post(
+        # 提交/保存请求：状态码检查 + 有限重试（同 study_video 的元数据请求），
+        # 失败抛 StudyRequestError，由上层按 ERROR 处理 —— 一次网络抖动不该废掉整轮刷课。
+        res_json = _request_json(
+            _session, "post",
             "https://mooc1.chaoxing.com/mooc-ans/work/addStudentWorkNew",
             data=questions,
             headers={
@@ -1059,19 +1284,16 @@ class Chaoxing:
                 # "Referer": "https://mooc1.chaoxing.com/mooc-ans/work/doHomeWorkNew?courseId=246831735&workAnswerId=52680423&workId=37778125&api=1&knowledgeid=913820156&classId=107515845&oldWorkId=07647c38d8de4c648a9277c5bed7075a&jobid=work-07647c38d8de4c648a9277c5bed7075a&type=&isphone=false&submit=false&enc=1d826aab06d44a1198fc983ed3d243b1&cpi=338350298&mooc2=1&skipHeader=true&originJobId=work-07647c38d8de4c648a9277c5bed7075a",
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,ja;q=0.5",
             },
+            what="章节检测提交",
         )
+
         action = "提交" if questions["pyFlag"] == "" else "保存"
-        if res.status_code == 200:
-            res_json = res.json()
-            if res_json["status"]:
-                # 面板只看这一条汇总；逐题的「题目 -> 答案」明细在 debug 级别
-                logger.info(f'章节检测已{action}（共 {total_questions} 题，'
-                            f'题库命中 {found_answers} 题）')
-            else:
-                logger.error(f'{action}答题失败 -> {res_json["msg"]}')
-                return StudyResult.ERROR
+        if res_json.get("status"):
+            # 面板只看这一条汇总；逐题的「题目 -> 答案」明细在 debug 级别
+            logger.info(f'章节检测已{action}（共 {total_questions} 题，'
+                        f'题库命中 {found_answers} 题）')
         else:
-            logger.error(f'{action}答题失败 -> {res.text}')
+            logger.error(f'{action}答题失败 -> {res_json.get("msg")}')
             return StudyResult.ERROR
 
         if need_reanswer:

@@ -147,6 +147,108 @@ def answer_letters(answer: str) -> str:
     return "".join(sorted({c.upper() for c in letters}))
 
 
+# 判断题的各种写法（题库/采集来的答案可能是「对」「正确」「true」……）
+JUDGE_TRUE = {"true", "1", "t", "yes", "对", "正确", "是", "√"}
+JUDGE_FALSE = {"false", "0", "f", "no", "错", "错误", "否", "×"}
+
+
+def judgement_key(answer: Any) -> str:
+    """判断题答案 -> ``"T"`` / ``"F"``（认得各种写法）。"""
+    text = str(answer if answer is not None else "").strip().lower()
+    if text in {x.lower() for x in JUDGE_TRUE}:
+        return "T"
+    if text in {x.lower() for x in JUDGE_FALSE}:
+        return "F"
+    return normalize_text(answer)
+
+
+def pure_letters(answer: Any) -> Optional[str]:
+    """``"B"`` / ``"A,C"`` / ``"AC"`` 这种纯字母串 -> ``"AC"``；其它形态返回 None。
+
+    选项正文里也可能带字母（``Python``），所以不能只看有没有字母，得看**整串**
+    是不是由选项字母构成。
+    """
+    text = str(answer if answer is not None else "").strip()
+    if not text:
+        return None
+    if not re.fullmatch(r"[A-Ha-h]([,，、\s]*[A-Ha-h])*", text):
+        return None
+    return "".join(sorted({c.upper() for c in re.findall(r"[A-Ha-h]", text)}))
+
+
+def _text_by_letter(letter: str, lines: "List[str]") -> str:
+    """字母 -> 选项正文（找不到就返回字母本身）。"""
+    for line in lines:
+        if option_letter(line) == letter:
+            return option_text(line) or letter
+    return letter
+
+
+def answer_key(qtype: str, answer: Any, options: str = "") -> str:
+    """把任意形态的答案归一成**可比较的键**。
+
+    * 单选 / 多选：取选中选项的**正文**（``"甲选项"``）；多选用 ``|`` 连接后排序，
+      这样选项顺序变了也还是同一个键；
+    * 判断题：``"T"`` / ``"F"``；
+    * 填空 / 简答：归一化后的原文。
+
+    ``answer`` 既可以是字母串（题库/采集来的），也可以是选项正文（AI 返回的）；
+    多选还可能是「一行一个选项正文」的多行文本。
+    """
+    qtype = str(qtype or "").strip().lower()
+    text = str(answer if answer is not None else "").strip()
+    if qtype == "judgement":
+        return judgement_key(text)
+    if qtype in ("single", "multiple"):
+        lines = option_lines(options)
+        letters = pure_letters(text)
+        if letters:
+            picked = [_text_by_letter(char, lines) for char in letters]
+            return "|".join(sorted(picked))
+        # 多选：AI 常常一次返回多个选项正文（换行分隔），逐行映射再合并
+        parts = [p.strip() for p in re.split(r"[\r\n]+", text) if p.strip()]
+        if len(parts) > 1:
+            texts = []
+            for part in parts:
+                matched = _match_letter(part, lines)
+                texts.append(_text_by_letter(matched, lines) if matched
+                             else normalize_text(part))
+            return "|".join(sorted(texts))
+        # 正文形态：先按正文找对应选项，找不到就归一化正文本身
+        matched = _match_letter(text, lines)
+        if matched:
+            return _text_by_letter(matched, lines)
+        return normalize_text(text)
+    return normalize_text(text)[:200]
+
+
+def entry_key(entry: dict, qtype: str) -> str:
+    """题库条目 -> 与 :func:`answer_key` 同口径的键（用于比对是不是同一个答案）。"""
+    qtype = str(qtype or "").strip().lower()
+    if qtype in ("single", "multiple"):
+        texts = [str(t) for t in (entry.get("x") or []) if str(t).strip()]
+        if texts:
+            return "|".join(sorted(texts))
+        options = str(entry.get("o") or "")
+        if options:
+            return answer_key(qtype, entry.get("a"), options)
+        return str(entry.get("a") or "")
+    if qtype == "judgement":
+        return judgement_key(entry.get("a"))
+    return normalize_text(entry.get("a"))[:200]
+
+
+def verdict_of(verdicts: dict, qid: Any) -> Any:
+    """取某题的核验结果（页面 qid 是字符串、提交表单里可能是数字，两种都试）。"""
+    if not verdicts:
+        return None
+    try:
+        value = verdicts.get(qid)
+        return value if value is not None else verdicts.get(str(qid))
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _match_letter(text: str, lines: "List[str]") -> str:
     """按选项文本在当前选项里找字母：先精确，再互相包含（容忍标点差异）。"""
     target = normalize_text(text)
@@ -650,6 +752,21 @@ class LocalBank:
             self._data["entries"] = dict(entries)
             self._write()
 
+    def remove_entry(self, key: str) -> bool:
+        """删掉某个指纹的条目（平台判错时用）。返回是否真的删了。"""
+        with _LOCK:
+            self._refresh_if_changed()
+            entries = self._data.get("entries", {})
+            if key not in entries:
+                return False
+            entries.pop(key, None)
+            try:
+                self._write()
+            except Exception as exc:  # noqa: BLE001
+                logger.error(f"题库条目删除失败：{exc}")
+                return False
+            return True
+
     # ---------------- 导出 / 导入 / 合并 ----------------
     def export_to(self, path: str) -> dict:
         """导出为独立题库文件（可直接发给别人导入）。"""
@@ -802,7 +919,15 @@ class BankStore:
 
     def set_scope(self, account: "str | None" = None, course: "str | None" = None,
                   course_id: "str | None" = None) -> None:
-        """设定当前课程（决定入库文件与查询优先级）。
+        """**已废弃**：设定进程级「当前课程」。
+
+        这是跨线程共享的可变状态（单例 ``get_bank()`` 的字段），并发刷课时
+        多个作业会互相覆盖，答案可能写进别的课程文件。
+        **新代码一律显式传参**：:meth:`lookup` / :meth:`known` / :meth:`missing`
+        / :meth:`learn` 都带 ``course`` / ``course_id``。
+
+        保留只为兼容旧的串行调用方（CLI、历史单测）：当且仅当调用方没给
+        ``course`` 也没给 ``course_id`` 时，才退回这里的值。
 
         ``account`` 已废弃（题库全账号共享），保留形参只为兼容旧调用方。
         """
@@ -815,6 +940,19 @@ class BankStore:
     @property
     def scope(self) -> dict:
         return dict(self._scope)
+
+    def _resolve(self, course: str = "", course_id: str = "") -> "tuple[str, str]":
+        """解析入库/查询的课程归属：**显式参数优先**，两者都缺才退回废弃的作用域。
+
+        只要调用方给了其中一个，就完全按调用方的来——绝不与 :meth:`set_scope`
+        的进程级状态混用，避免并发下张冠李戴。
+        """
+        crs = str(course or "")
+        cid = str(course_id or "")
+        if crs or cid:
+            return crs, cid
+        scope = self._scope
+        return scope["course"], scope["course_id"]
 
     # ---------------- 路径 ----------------
     def path_for(self, course: str = "", course_id: str = "") -> str:
@@ -854,9 +992,7 @@ class BankStore:
         return files
 
     def _current_path(self, course: str = "", course_id: str = "") -> str:
-        course = course or self._scope["course"]
-        if course == self._scope["course"]:
-            course_id = course_id or self._scope["course_id"]
+        course, course_id = self._resolve(course, course_id)
         return os.path.abspath(self.path_for(course, course_id))
 
     def _priority(self, course: str = "", course_id: str = "") -> List[dict]:
@@ -875,13 +1011,19 @@ class BankStore:
 
     # ---------------- 查询 ----------------
     def lookup(self, title: str, qtype: str, options: str = "",
-               account: str = "", course: str = "") -> Optional[str]:
-        """跨文件查题：命中返回可直接提交的答案；未命中/停用返回 None。"""
+               account: str = "", course: str = "",
+               course_id: str = "") -> Optional[str]:
+        """跨文件查题：命中返回可直接提交的答案；未命中/停用返回 None。
+
+        ``course`` / ``course_id`` 是**本次查询的课程**（显式传入，不读进程级
+        作用域）；都留空时才退回 :meth:`set_scope` 的兼容值。
+        ``account`` 已废弃（题库共享），保留仅为兼容。
+        """
         if not self.enabled:
             return None
         try:
             key = fingerprint(title, qtype, options)
-            for info in self._priority(course):
+            for info in self._priority(course, course_id):
                 bank = self._bank(info["path"])
                 entry = bank.entry(key)
                 if not entry:
@@ -977,17 +1119,16 @@ class BankStore:
     def learn(self, items: Iterable[dict], verdicts: "dict | None" = None,
               course: str = "", allow_unverified: bool = False,
               account: str = "", course_id: str = "", only_missing: bool = True) -> int:
-        """把平台确认过的正确答案写进「当前课程」对应的文件。
+        """把平台确认过的正确答案写进「指定课程」对应的文件。
 
-        参数含义与 :meth:`LocalBank.learn` 相同（库里答案与平台不一致时会被覆写纠正）；
-        ``course`` / ``course_id`` 留空时用 :meth:`set_scope` 设定的作用域。
+        参数含义与 :meth:`LocalBank.learn` 相同（库里答案与平台不一致时会被覆写纠正）。
+        ``course`` / ``course_id`` **必须显式传入**（并发安全：不用进程级作用域）；
+        两者都留空时才退回 :meth:`set_scope` 设定的兼容作用域。
         ``account`` 已废弃（题库共享），保留仅为兼容。
         """
         if not self.enabled:
             return 0
-        scope = self._scope
-        crs = course or scope["course"]
-        cid = course_id or (scope["course_id"] if crs == scope["course"] else "")
+        crs, cid = self._resolve(course, course_id)
         path = self.path_for(crs, cid)
         bank = self._bank(path)
         bank.set_meta(course=crs or UNKNOWN_COURSE, course_id=cid)
@@ -1339,7 +1480,12 @@ def get_bank() -> BankStore:
 
 def set_scope(account: "str | None" = None, course: "str | None" = None,
               course_id: "str | None" = None) -> None:
-    """设定当前作业归属（账号 / 课程），决定入库文件与查询优先级。"""
+    """**已废弃**：设定进程级「当前课程」。
+
+    单例上的可变状态，多线程刷课时会互相覆盖 —— 新代码请显式传
+    ``course`` / ``course_id`` 给 :func:`BankStore.lookup` / ``.learn``。
+    保留仅为兼容串行调用方（CLI、历史单测）。
+    """
     get_bank().set_scope(account=account, course=course, course_id=course_id)
 
 

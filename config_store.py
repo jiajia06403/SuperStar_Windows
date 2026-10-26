@@ -49,6 +49,11 @@ COMMON_FLOAT_KEYS = ("speed",)
 COMMON_RANGES = {"jobs": (1, 8), "speed": (1.0, 2.0)}
 # [ui] 段：主题只能是这三种（写错就回落默认的「跟随系统」）
 UI_THEME_VALUES = ("system", "light", "dark")
+# 窗口几何：宽x高+x+y（偏移量可带负号）
+UI_GEOMETRY_RE = re.compile(r"^\d{3,5}x\d{3,5}[+-]-?\d{1,5}[+-]-?\d{1,5}$")
+# 有取值范围的整数键：中部分栏位置（像素），超出范围视为非法
+UI_INT_RANGES = {"sash": (80, 4000)}
+UI_BOOL_KEYS = ("maximized",)
 
 _SECTION_RE = re.compile(r"^\s*\[(?P<name>[^\]]+)\]\s*$")
 _KV_RE = re.compile(r"^\s*(?P<key>[^#;=\s][^=]*?)\s*=(?P<rest>.*)$")
@@ -232,6 +237,15 @@ def _invalid(section: str, key: str, value: str) -> bool:
     if section == "ui":
         if key == "theme":
             return value.lower() not in UI_THEME_VALUES
+        if key == "geometry":
+            return not UI_GEOMETRY_RE.fullmatch(value)
+        if key in UI_INT_RANGES:
+            if not re.fullmatch(r"\d+", value):
+                return True
+            low, high = UI_INT_RANGES[key]
+            return not (low <= int(value) <= high)
+        if key in UI_BOOL_KEYS:
+            return value not in ("0", "1")
         return False
     if section != "tiku":
         return False

@@ -59,6 +59,9 @@ def test_cancel_flag_semantics():
 # 真实 study_video 循环：停止必须中断
 # --------------------------------------------------------------------------- #
 class _FakeResp:
+    status_code = 200      # 元数据请求会做状态码检查，缺了会被当成失败并重试
+    text = ""
+
     def json(self):
         # 视频信息接口：给一段 1 小时的视频，正常情况要跑满 1 小时
         return {"status": "success", "duration": 3600, "dtoken": "tok", "crc": "crc", "key": "k"}
@@ -136,7 +139,7 @@ class _FakeChaoxing:
     def __init__(self):
         self.calls = 0
 
-    def get_job_list(self, course, point):
+    def get_job_list(self, course, point, **kwargs):
         self.calls += 1
         return [{"type": "video", "jobid": "j1"}], {"notOpen": False}
 
@@ -186,7 +189,7 @@ def test_engine_stop_ends_thread_and_reports_idle():
     eng.on(eng.FINISHED, lambda stopped=False: finished.append(stopped))
 
     original_point = fake.get_job_list
-    fake.get_job_list = lambda course, point: (
+    fake.get_job_list = lambda course, point, **kwargs: (
         [{"type": "video", "jobid": "j1"}], {"notOpen": False})
     original_job = engine.process_job
 

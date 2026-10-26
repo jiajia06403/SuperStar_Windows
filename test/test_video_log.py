@@ -122,6 +122,29 @@ def test_study_video_emits_status_by_interval():
     assert max(percents) > 0, status
 
 
+def test_study_video_reports_progress_once():
+    """回归：开播不能连发两条进度上报 —— 第一条的结果会被第二条覆盖，白打一次请求。"""
+    ch = Chaoxing()
+    ch.video_log_interval = 0
+
+    seen = []
+
+    def fake_log(_self, session, course, job, job_info, dtoken, duration,
+                 play_time, _type, headers=None):
+        seen.append((duration, play_time))
+        return True, 200                  # 第一次上报就通过 -> 不应再有第二条
+
+    with mock.patch.object(base.SessionManager, "get_session",
+                           classmethod(lambda cls: _Session(duration=600))), \
+         mock.patch.object(Chaoxing, "video_progress_log", fake_log), \
+         mock.patch.object(base, "_progress_stream", lambda: io.StringIO()):
+        ch.study_video({"courseId": "c"},
+                       {"objectid": "o", "name": "v", "playTime": "123"}, {})
+
+    assert len(seen) == 1, f"开播应只上报一次，实际 {seen}"
+    assert seen[0] == (600, 600), seen[0]
+
+
 def test_resume_playtime_not_zeroed():
     """回归：续播进度 playTime 单位是秒，不能 //1000 归零（否则「当前观看」始终显示 0 秒）。"""
     ch = Chaoxing()
@@ -132,7 +155,7 @@ def test_resume_playtime_not_zeroed():
 
     def fake_log(_self, *args, **kwargs):
         calls["n"] += 1
-        return calls["n"] >= 3, 200
+        return calls["n"] >= 2, 200      # 开播一次上报即通过
 
     lines: "list[str]" = []
     sink = logger.add(lines.append, level="INFO", format="{message}")
@@ -263,6 +286,7 @@ if __name__ == "__main__":
         test_normalize_play_time_units,
         test_study_video_normalizes_millis_playtime,
         test_study_video_silent_when_disabled,
+        test_study_video_reports_progress_once,
         test_engine_pushes_interval_and_context,
         test_engine_reads_interval_from_config,
     ]

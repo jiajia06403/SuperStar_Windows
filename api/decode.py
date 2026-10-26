@@ -162,10 +162,11 @@ def decode_course_card(html_text: str) -> Tuple[List[Dict[str, Any]], Dict[str, 
         html_text: 任务点列表页面的HTML内容
         
     Returns:
-        任务点列表和任务信息的元组
+        任务点列表和任务信息的元组。读取失败（页面无 mArg / JSON 解析失败）时返回
+        ``([], {"unreadable": True})``，未开放时返回 ``([], {"notOpen": True})``。
     """
     logger.trace("开始解码任务点列表...")
-    
+
     # 检查章节是否未开放
     if "章节未开放" in html_text:
         return [], {"notOpen": True}
@@ -173,13 +174,20 @@ def decode_course_card(html_text: str) -> Tuple[List[Dict[str, Any]], Dict[str, 
     # 提取mArg参数
     temp = re.findall(r"mArg=\{(.*?)\};", html_text.replace(" ", ""))
     if not temp:
-        return [], {}
+        # 掉登录跳转页 / 验证码页 / 403 页等都不含 mArg：这是「读不到任务点」，
+        # 必须和「本章没有任务点」区分开，否则会被上层误判为章节已完成。
+        logger.warning("任务点页面未包含 mArg 数据，按读取失败处理")
+        return [], {"unreadable": True}
 
-    # 解析JSON数据
-    cards_data = json.loads("{" + temp[0] + "}")
+    # 解析JSON数据（页面可能是风控/错误页，mArg 残缺导致 JSON 非法）
+    try:
+        cards_data = json.loads("{" + temp[0] + "}")
+    except (ValueError, TypeError) as exc:
+        logger.warning(f"任务点页面 mArg 解析失败，按读取失败处理: {exc}")
+        return [], {"unreadable": True}
 
     if not cards_data:
-        return [], {}
+        return [], {"unreadable": True}
 
     # 提取任务信息
     job_info = _extract_job_info(cards_data)

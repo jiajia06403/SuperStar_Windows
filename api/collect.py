@@ -213,9 +213,9 @@ def collect_course(chaoxing: Any, course: Dict[str, Any],
         _emit(on_event, **event)
 
     course_title = stats["course"]
-
-    # 入库归属：这门课（题库按课程共享，不区分账号）
-    local_bank.set_scope(course=course_title, course_id=stats["course_id"])
+    # 入库归属：这门课（题库按课程共享，不区分账号）。
+    # 显式传给 known/learn（见 _collect_work），不用进程级 set_scope —— 采集可能
+    # 与刷课并发，全局作用域会被别的课程覆盖，答案会写进错误的课程文件。
 
     if session is None:
         from api.base import SessionManager
@@ -238,6 +238,13 @@ def collect_course(chaoxing: Any, course: Dict[str, Any],
             emit(kind="log",
                  message=f"【采集】读取章节任务点失败（{point.get('title', '')}）："
                          f"{type(exc).__name__}: {exc}")
+            continue
+
+        if isinstance(job_info, dict) and job_info.get("unreadable"):
+            # 读不到任务点（掉登录/风控/解析失败）：不是「本章没有作业」，计为错误
+            stats["errors"] += 1
+            emit(kind="log",
+                 message=f"【采集】读取章节任务点失败（{point.get('title', '')}）：页面不可读")
             continue
 
         works = [job for job in (jobs or []) if job.get("type") == "workid"]

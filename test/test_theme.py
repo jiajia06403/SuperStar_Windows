@@ -331,6 +331,46 @@ def test_toolbar_reflows_and_never_clipped():
         app.root.destroy()
 
 
+def test_combobox_focus_ring_clears_after_outside_click():
+    """点开账号下拉再点别处关掉：焦点要交出去，不能留在 combobox 上亮着描边。
+
+    ttk::combobox 展开时给 popdown 上了全局 grab，外部那下点击被吞掉，焦点随后
+    自动回到 combobox —— 这里验证交还逻辑：交给光标下的控件，点自己则保留。
+    """
+    app = _app()
+    try:
+        root = app.root
+        root.deiconify()                        # 没上屏时 winfo_containing 拿不到控件
+        root.update()
+        root.update_idletasks()
+        cb = app.acc_combo
+        script = root.tk.call("bind", "ComboboxPopdown", "<Button>")
+        assert script and len(str(script)) > 0, "应给 popdown 挂上关闭后的焦点处理"
+
+        # 命中测试里窗口未必真被 Windows 上屏（winfo_containing 会返回 None），
+        # 直接指定「光标下的控件」来测交还逻辑本身。
+        other = app.log_text
+        cb.focus_force()                        # 测试窗口未必是活动窗口，强制给焦点
+        root.update()
+        assert str(root.focus_get()) == str(cb), "前置条件：combobox 应拿到焦点"
+
+        with mock.patch.object(tk.Misc, "winfo_containing", return_value=other):
+            theme._hand_off_focus(root, str(cb), 0, 0)
+        root.update()
+        assert "focus" not in cb.state(), "点别处关掉下拉后 combobox 不应再有焦点"
+        assert str(root.focus_get()) == str(other), "焦点应交给光标下的控件"
+
+        # 点在 combobox 自己身上（再次点箭头收起）：焦点保留在它身上
+        cb.focus_force()                        # 测试窗口未必是活动窗口，强制给焦点
+        root.update()
+        with mock.patch.object(tk.Misc, "winfo_containing", return_value=cb):
+            theme._hand_off_focus(root, str(cb), 0, 0)
+        root.update()
+        assert "focus" in cb.state(), "点自己收起下拉时应保留焦点"
+    finally:
+        app.root.destroy()
+
+
 if __name__ == "__main__":
     cases = [
         test_mode_helpers,
@@ -343,6 +383,7 @@ if __name__ == "__main__":
         test_theme_combobox_preview_applies_immediately,
         test_theme_save_is_silent_no_popup,
         test_toolbar_reflows_and_never_clipped,
+        test_combobox_focus_ring_clears_after_outside_click,
     ]
     failed = []
     for case in cases:

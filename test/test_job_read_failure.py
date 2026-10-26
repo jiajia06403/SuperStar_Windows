@@ -1,0 +1,312 @@
+# -*- coding: utf-8 -*-
+# layer: core  # core=默认必跑 / gui=真窗口 / slow=仅 --all
+"""任务点「读不到」必须是失败态，不能被当成章节已完成。
+
+回归背景：非 200 / 掉登录跳转页 / 验证码页 / 403 页 / mArg 解析失败都会让
+get_job_list 返回 ([], {})，而 process_chapter 曾把空任务点判成 SUCCESS 并
+cache.mark_done() —— 一次网络抖动就整章被永久跳过。
+
+覆盖：
+  1. decode_course_card：无 mArg / JSON 非法 -> ([], {"unreadable": True})，不抛异常；
+  2. get_job_list：HTTP 非 200 -> unreadable；真正空章节 -> empty=True；
+  3. process_chapter：([], {}) -> ERROR；unreadable -> ERROR；empty -> SUCCESS；
+  4. _work_still_pending：读不到任务点 -> None，调用方按未通过处理（不得 SUCCESS）。
+"""
+import os
+import sys
+import tempfile
+import types
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from ci_annotate import annotate_exc  # noqa: E402
+
+import api.base as base  # noqa: E402
+import api.decode as decode  # noqa: E402
+import engine  # noqa: E402
+from engine import ChapterResult, StudyEngine  # noqa: E402
+from api.base import StudyResult  # noqa: E402
+
+_PROCESS_CHAPTER = engine.process_chapter
+
+COURSE = {"courseId": "C1", "clazzId": "cz", "cpi": "cp", "title": "课"}
+POINT = {"id": "p1", "title": "第1章", "has_finished": False}
+
+
+# --------------------------------------------------------------------------- #
+# 1. decode_course_card
+# --------------------------------------------------------------------------- #
+def test_decode_no_marg_is_unreadable():
+    """403 / 掉登录跳转页（无 mArg）：按读取失败返回，不抛异常。"""
+    for html in ("<html><body>403 Forbidden</body></html>",
+                 "<script>location.href='/passport/login'</script>",
+                 "<html>验证码</html>"):
+        jobs, info = decode.decode_course_card(html)
+        assert jobs == [] and info.get("unreadable") is True, (html, jobs, info)
+
+
+def test_decode_bad_json_is_unreadable():
+    """mArg 残缺导致 JSON 非法：兜底为读取失败，不得抛 JSONDecodeError。"""
+    html = '<script>mArg={"defaults":{"ktoken":"k",;</script>'
+    jobs, info = decode.decode_course_card(html)
+    assert jobs == [] and info.get("unreadable") is True, (jobs, info)
+
+
+def test_decode_not_open_unchanged():
+    jobs, info = decode.decode_course_card("<html>章节未开放</html>")
+    assert jobs == [] and info.get("notOpen") is True and "unreadable" not in info
+
+
+def test_decode_normal_card_readable():
+    html = '<script>mArg={"defaults":{"ktoken":"k"},"attachments":[]};</script>'
+    jobs, info = decode.decode_course_card(html)
+    assert jobs == [] and not info.get("unreadable"), info
+    assert info.get("ktoken") == "k"
+
+
+# --------------------------------------------------------------------------- #
+# 2. get_job_list
+# --------------------------------------------------------------------------- #
+def _chaoxing(pages):
+    """pages: 按卡片序号 num 依次返回的 (status_code, text)。"""
+    calls = {"emptypage": 0}
+
+    class _Resp:
+        def __init__(self, status, text):
+            self.status_code = status
+            self.text = text
+
+    class _Session:
+        def __init__(self):
+            self.nums = []
+
+        def get(self, url, params=None, **kw):
+            self.nums.append(params.get("num"))
+            idx = min(len(self.nums) - 1, len(pages) - 1)
+            status, text = pages[idx]
+            return _Resp(status, text)
+
+    sess = _Session()
+    old = base.SessionManager.get_session
+    base.SessionManager.get_session = staticmethod(lambda: sess)
+    c = base.Chaoxing(account=None, tiku=None)
+    c.rate_limiter = types.SimpleNamespace(limit_rate=lambda *a, **k: None)
+    c.study_emptypage = lambda course, point: calls.__setitem__(
+        "emptypage", calls["emptypage"] + 1)
+    return c, calls, sess, old
+
+
+def test_get_job_list_http_error_is_unreadable():
+    c, calls, _sess, old = _chaoxing([(403, "<html>403</html>")])
+    try:
+        jobs, info = c.get_job_list(COURSE, POINT)
+    finally:
+        base.SessionManager.get_session = old
+    assert jobs == [] and info.get("unreadable") is True, (jobs, info)
+    assert calls["emptypage"] == 0, "读取失败不能当空章节上报"
+
+
+def test_get_job_list_unparsable_page_is_unreadable():
+    c, calls, _sess, old = _chaoxing([(200, "<html>验证码</html>")])
+    try:
+        jobs, info = c.get_job_list(COURSE, POINT)
+    finally:
+        base.SessionManager.get_session = old
+    assert jobs == [] and info.get("unreadable") is True, (jobs, info)
+    assert calls["emptypage"] == 0
+
+
+def test_get_job_list_empty_chapter_marks_empty():
+    """卡片解析成功但没有任务点：是真空章节（走 study_emptypage），不是失败。"""
+    html = '<script>mArg={"defaults":{"ktoken":"k"},"attachments":[]};</script>'
+    c, calls, _sess, old = _chaoxing([(200, html)])
+    try:
+        jobs, info = c.get_job_list(COURSE, POINT)
+    finally:
+        base.SessionManager.get_session = old
+    assert jobs == [] and info.get("empty") is True, (jobs, info)
+    assert not info.get("unreadable")
+    assert calls["emptypage"] == 1
+
+
+def test_get_job_list_not_open_unchanged():
+    c, _calls, _sess, old = _chaoxing([(200, "<html>章节未开放</html>")])
+    try:
+        jobs, info = c.get_job_list(COURSE, POINT)
+    finally:
+        base.SessionManager.get_session = old
+    assert jobs == [] and info.get("notOpen") is True and not info.get("unreadable")
+
+
+# --------------------------------------------------------------------------- #
+# 2b. 请求量：别再把 7 张卡片无条件全打一遍
+# --------------------------------------------------------------------------- #
+_EMPTY_CARD = '<script>mArg={"defaults":{"ktoken":"k"},"attachments":[]};</script>'
+_VIDEO_CARD = (
+    '<script>mArg={"defaults":{"ktoken":"k"},"attachments":[{"type":"video",'
+    '"job":"1","jobid":"v1","mid":"m1","objectId":"o1","otherInfo":"x",'
+    '"property":{"name":"1.1"}}]};</script>'
+)
+
+
+def test_full_read_stops_after_consecutive_empty_cards():
+    """全卡片都为空时，最多只请求 CARD_MAX_EMPTY 张，而不是固定 7 次。"""
+    c, calls, sess, old = _chaoxing([(200, _EMPTY_CARD)])
+    try:
+        jobs, info = c.get_job_list(COURSE, POINT)
+    finally:
+        base.SessionManager.get_session = old
+    assert jobs == [] and info.get("empty") is True, (jobs, info)
+    assert calls["emptypage"] == 1
+    assert len(sess.nums) == base.Chaoxing.CARD_MAX_EMPTY, sess.nums
+
+
+def test_partial_read_never_declares_empty_chapter():
+    """只请求指定卡片时不得断言「本章无任务点」：不打空页、不写 empty。"""
+    c, calls, sess, old = _chaoxing([(200, _EMPTY_CARD)])
+    try:
+        jobs, info = c.get_job_list(COURSE, POINT, nums="0")
+    finally:
+        base.SessionManager.get_session = old
+    assert sess.nums == ["0"], sess.nums
+    assert jobs == [] and not info.get("empty") and not info.get("unreadable"), info
+    assert calls["emptypage"] == 0, "半份数据不能上报空章节"
+
+
+def test_stop_when_short_circuits_card_requests():
+    """命中 stop_when 立即收手，后续卡片不再请求。"""
+    c, _calls, sess, old = _chaoxing([(200, _VIDEO_CARD)])
+    try:
+        jobs, info = c.get_job_list(COURSE, POINT, stop_when=lambda j, i: True)
+    finally:
+        base.SessionManager.get_session = old
+    assert sess.nums == ["0"], sess.nums
+    assert [j["jobid"] for j in jobs] == ["v1"], jobs
+
+
+def test_track_cards_records_card_of_each_job():
+    """track_cards 给出 jobid -> 卡片序号，供复检时只回读相关卡片。"""
+    c, _calls, _sess, old = _chaoxing([(200, _VIDEO_CARD), (200, _EMPTY_CARD)])
+    try:
+        _jobs, info = c.get_job_list(COURSE, POINT, track_cards=True)
+    finally:
+        base.SessionManager.get_session = old
+    assert info.get("card_of_job") == {"v1": "0"}, info
+
+
+# --------------------------------------------------------------------------- #
+# 3. process_chapter
+# --------------------------------------------------------------------------- #
+class _Backend:
+    """最小后端：rate_limiter + tiku + 可编排的 get_job_list。"""
+
+    def __init__(self, script):
+        self.rate_limiter = types.SimpleNamespace(limit_rate=lambda *a, **k: None)
+        self.tiku = types.SimpleNamespace(DISABLE=False)
+        self.script = list(script)
+        self.calls = 0
+        self.study_calls = 0
+
+    def get_job_list(self, course, point, **kwargs):
+        self.calls += 1
+        if len(self.script) > 1:
+            return self.script.pop(0)
+        return self.script[0]
+
+    def study_work(self, *a, **k):
+        self.study_calls += 1
+        return StudyResult.SUCCESS
+
+
+def test_process_chapter_empty_job_list_is_error():
+    """([], {}) 必须判失败：绝不能当作「本章无任务点」而标记完成。"""
+    be = _Backend([([], {})])
+    r = _PROCESS_CHAPTER(be, COURSE, POINT, 1.0, work_retry=1)
+    assert r == ChapterResult.ERROR, r
+
+
+def test_process_chapter_unreadable_is_error():
+    be = _Backend([([], {"unreadable": True})])
+    r = _PROCESS_CHAPTER(be, COURSE, POINT, 1.0, work_retry=1)
+    assert r == ChapterResult.ERROR, r
+
+
+def test_process_chapter_empty_chapter_still_success():
+    """真正没有任务点的章节（empty=True）保持原行为。"""
+    be = _Backend([([], {"empty": True})])
+    r = _PROCESS_CHAPTER(be, COURSE, POINT, 1.0, work_retry=1)
+    assert r == ChapterResult.SUCCESS, r
+
+
+def test_process_chapter_not_open_unchanged():
+    be = _Backend([([], {"notOpen": True})])
+    r = _PROCESS_CHAPTER(be, COURSE, POINT, 1.0, work_retry=1)
+    assert r == ChapterResult.NOT_OPEN, r
+
+
+def test_work_still_pending_none_on_unreadable():
+    be = _Backend([([], {"unreadable": True})])
+    assert engine._work_still_pending(be, COURSE, POINT) is None
+
+
+def test_work_card_nums_and_narrow_reread():
+    """回读章节检测只请求 workid 所在卡片；没有归属信息时退回全量(None)。"""
+    jobs = [{"type": "video", "jobid": "v"}, {"type": "workid", "jobid": "w"}]
+    assert engine._work_card_nums(jobs, {"card_of_job": {"v": "0", "w": "2"}}) == "2"
+    # 老数据 / 未开启 track_cards：无从收敛，退回全量读取（None）
+    assert engine._work_card_nums(jobs, {"knowledgeid": "p1"}) is None
+
+    seen = []
+
+    class _CountingBackend:
+        def get_job_list(self, course, point, **kwargs):
+            seen.append(kwargs.get("nums"))
+            return [], {"knowledgeid": "p1"}
+
+    nums = engine._work_card_nums(jobs, {"card_of_job": {"v": "0", "w": "2"}})
+    assert engine._work_still_pending(_CountingBackend(), COURSE, POINT, nums=nums) is False
+    assert seen == ["2"], seen
+
+
+def test_process_chapter_unreadable_reread_is_not_success():
+    """回读不到任务点 -> 按未通过处理，重答次数用尽后是 UNVERIFIED，不是 SUCCESS。"""
+    be = _Backend([([{"type": "workid", "jobid": "w"}], {"knowledgeid": "p1"}),
+                   ([], {"unreadable": True})])
+    r = _PROCESS_CHAPTER(be, COURSE, POINT, 1.0, work_retry=0)
+    assert r == ChapterResult.UNVERIFIED, r
+    assert be.study_calls == 1
+
+
+def test_study_course_does_not_mark_done_on_read_failure():
+    """端到端：读不到任务点的章节不得写入完成缓存。"""
+    tmp = tempfile.mkdtemp()
+    eng = StudyEngine(cache_dir=tmp, poll_interval=0.01)
+    eng.current_uid = "u9"
+    eng.work_retry = 0
+    be = _Backend([([], {})])
+    be.get_uid = lambda: "u9"
+    be.get_course_point = lambda *a, **k: {"points": [dict(POINT)]}
+    eng.chaoxing = be
+    engine.process_chapter = _PROCESS_CHAPTER
+    try:
+        eng._study_course(COURSE)
+    finally:
+        pass
+    assert eng.cache.is_done("u9", "C1", "p1") is False, "读取失败不能记为已完成"
+
+
+# --------------------------------------------------------------------------- #
+if __name__ == "__main__":
+    funcs = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+    failed = 0
+    for fn in funcs:
+        try:
+            fn()
+            print(f"PASS  {fn.__name__}")
+        except Exception as e:  # noqa: BLE001
+            failed += 1
+            print(f"FAIL  {fn.__name__}: {e}")
+            annotate_exc(f"test_job_read_failure.py::{fn.__name__}")
+    print(f"\n{'ALL PASS' if failed == 0 else str(failed) + ' FAILED'}")
+    sys.exit(1 if failed else 0)

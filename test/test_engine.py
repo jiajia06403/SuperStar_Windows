@@ -28,7 +28,7 @@ from api.base import StudyResult  # noqa: E402
 _ORIG_PROCESS_CHAPTER = engine.process_chapter
 
 
-def _always_ok(ch, course, point, speed, work_retry=1):
+def _always_ok(ch, course, point, speed, work_retry=1, **kw):
     return ChapterResult.SUCCESS
 
 
@@ -47,7 +47,7 @@ class FakeChaoxing:
     def get_course_point(self, *a, **k):
         return {"points": self.points}
 
-    def get_job_list(self, course, point):
+    def get_job_list(self, course, point, **kwargs):
         if self.job_info_seq:
             return [], self.job_info_seq.pop(0)
         return [], {"notOpen": False}
@@ -165,7 +165,7 @@ def test_reanswer_unlimited_when_quiz_failed():
 
     rounds = {"n": 0}
 
-    def _fail_then_ok(ch, course, point, speed, work_retry=1):
+    def _fail_then_ok(ch, course, point, speed, work_retry=1, **kw):
         rounds["n"] += 1
         # 前 3 轮都判「不合格」，第 4 轮才通过（远超 work_retry=1 的次数）
         return ChapterResult.UNVERIFIED if rounds["n"] <= 3 else ChapterResult.SUCCESS
@@ -234,7 +234,7 @@ def test_study_course_flow():
     # 模拟 process_chapter：a,b 成功；c 在未开放时返回 NOT_OPEN，开放后成功
     calls = {"c": 0}
 
-    def fake_process(ch, c2, point, speed, work_retry=1):
+    def fake_process(ch, c2, point, speed, work_retry=1, **kw):
         if point["id"] == "c":
             calls["c"] += 1
             # 第一次进入 c 时，get_job_list 仍在返回 notOpen（轮询逻辑里）
@@ -266,7 +266,7 @@ def test_study_course_skip_server_finished():
     ]
     seen = []
 
-    def fake_process(ch, c2, point, speed, work_retry=1):
+    def fake_process(ch, c2, point, speed, work_retry=1, **kw):
         seen.append(point["id"])
         return ChapterResult.SUCCESS
 
@@ -292,7 +292,7 @@ def test_study_course_ignores_stale_cache():
     eng.cache.mark_done("224", "C", "a")   # 本地认为已完成
     seen = []
 
-    def fake_process(ch, c2, point, speed, work_retry=1):
+    def fake_process(ch, c2, point, speed, work_retry=1, **kw):
         seen.append(point["id"])
         return ChapterResult.SUCCESS
 
@@ -390,7 +390,7 @@ def test_process_chapter_unsubmitted_is_not_done():
             self.rate_limiter = _Limiter()
             self.tiku = _Tiku()
 
-        def get_job_list(self, course, point):
+        def get_job_list(self, course, point, **kwargs):
             return ([{"type": "workid", "jobid": "work-1"}],
                     {"knowledgeid": point["id"]})
 
@@ -418,7 +418,7 @@ def _work_backend(pending_rounds: int):
             self.rounds = 0
             self.study_calls = 0
 
-        def get_job_list(self, course, point):
+        def get_job_list(self, course, point, **kwargs):
             # 平台视角：前 pending_rounds 轮回读时作业仍未通过 -> 仍返回 workid 任务
             jobs = [] if self.rounds > pending_rounds else [{"type": "workid", "jobid": "w"}]
             return jobs, {"knowledgeid": "p1"}
@@ -463,7 +463,7 @@ def test_process_chapter_no_retry_when_tiku_disabled():
             self.rate_limiter = _Limiter()
             self.tiku = _Tiku()
 
-        def get_job_list(self, course, point):
+        def get_job_list(self, course, point, **kwargs):
             return [{"type": "workid", "jobid": "w"}], {"knowledgeid": "p1"}
 
         def study_work(self, *a, **k):
@@ -487,7 +487,7 @@ def test_study_course_unverified_not_marked_done():
         {"id": "b", "title": "正常章", "has_finished": False},
     ]
 
-    def fake_process(ch, c2, point, speed, work_retry=1):
+    def fake_process(ch, c2, point, speed, work_retry=1, **kw):
         return ChapterResult.UNVERIFIED if point["id"] == "a" else ChapterResult.SUCCESS
 
     engine.process_chapter = fake_process
@@ -519,7 +519,7 @@ def test_study_course_reanswer_until_platform_passes():
             return {"points": [{"id": "w1", "title": "章节检测章",
                                 "has_finished": self.attempts > self.reject}]}
 
-        def get_job_list(self, course, point):
+        def get_job_list(self, course, point, **kwargs):
             if self.attempts > self.reject:
                 return [], {"notOpen": False}
             return [{"type": "workid", "jobid": "w"}], {"knowledgeid": "w1"}
@@ -562,7 +562,7 @@ def test_study_course_rejected_keeps_pending_after_retry():
         def get_course_point(self, *a, **k):
             return {"points": [{"id": "w1", "title": "章节检测章", "has_finished": False}]}
 
-        def get_job_list(self, course, point):
+        def get_job_list(self, course, point, **kwargs):
             return [{"type": "workid", "jobid": "w"}], {"knowledgeid": "w1"}
 
         def study_work(self, *a, **k):
@@ -580,6 +580,131 @@ def test_study_course_rejected_keeps_pending_after_retry():
     eng._study_course(course)
     assert be.attempts == 2                    # 首次 + 1 次重答
     assert eng.cache.is_done("u2", "C", "w1") is False, "不合格章节不能记为已完成"
+
+
+# --------------------------------------------------------------------------- #
+# 并发数（界面「并发」设置）
+# --------------------------------------------------------------------------- #
+class _SpiedLimiter:
+    def limit_rate(self, *a, **k):
+        return None
+
+
+class _SpiedTiku:
+    DISABLE = False
+
+
+class _MultiJobChaoxing:
+    """一章多个任务点（非章节检测），用来观察并发行为。"""
+
+    def __init__(self, count):
+        self.rate_limiter = _SpiedLimiter()
+        self.tiku = _SpiedTiku()
+        self.jobs = [{"type": "video", "jobid": f"v{i}"} for i in range(count)]
+
+    def get_job_list(self, course, point, **kwargs):
+        return list(self.jobs), {"knowledgeid": point["id"]}
+
+
+class _RecordingExecutor:
+    """替身线程池：记录 max_workers，并在调用线程上顺序跑完（结果顺序不变）。"""
+
+    def __init__(self, max_workers=None, **kwargs):
+        _RecordingExecutor.seen.append(max_workers)
+        self._max_workers = max_workers
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def map(self, fn, iterable):
+        return [fn(item) for item in iterable]
+
+
+def test_jobs_is_forwarded_to_thread_pool():
+    """界面并发数必须真的生效：StudyEngine.jobs=3 -> 线程池 max_workers=3。"""
+    _RecordingExecutor.seen = []
+    old_executor, old_process_job = engine.ThreadPoolExecutor, engine.process_job
+    engine.process_chapter = _ORIG_PROCESS_CHAPTER
+    try:
+        engine.ThreadPoolExecutor = _RecordingExecutor
+        done = []
+
+        def _fake_job(ch, course, job, job_info, speed):
+            done.append(job["jobid"])
+            return StudyResult.SUCCESS
+
+        engine.process_job = _fake_job
+
+        eng = StudyEngine(cache_dir=tempfile.mkdtemp(), poll_interval=0.01)
+        eng.chaoxing = _MultiJobChaoxing(6)
+        eng.current_uid = "u9"
+        eng.jobs = 3                       # 相当于界面上选了「并发 3」
+
+        r = eng._process_chapter({"courseId": "C", "title": "课"},
+                                 {"id": "p1", "title": "章", "has_finished": False})
+        assert r == ChapterResult.SUCCESS, r
+        assert done == [f"v{i}" for i in range(6)], done
+        assert _RecordingExecutor.seen == [3], f"线程池上限应为 3，实际 {_RecordingExecutor.seen}"
+    finally:
+        engine.ThreadPoolExecutor = old_executor
+        engine.process_job = old_process_job
+
+
+def test_jobs_one_runs_serial():
+    """并发=1 时任务点必须严格串行（不建线程池、不出现重叠执行）。"""
+    state = {"active": 0, "max_active": 0, "threads": set(), "order": []}
+    lock = threading.Lock()
+
+    def _slow_job(ch, course, job, job_info, speed):
+        with lock:
+            state["active"] += 1
+            state["max_active"] = max(state["max_active"], state["active"])
+            state["threads"].add(threading.current_thread().name)
+            state["order"].append(job["jobid"])
+        time.sleep(0.01)
+        with lock:
+            state["active"] -= 1
+        return StudyResult.SUCCESS
+
+    class _NoExecutor:
+        def __init__(self, *a, **k):
+            raise AssertionError("并发=1 时不应创建线程池")
+
+    old_executor, old_process_job = engine.ThreadPoolExecutor, engine.process_job
+    engine.process_chapter = _ORIG_PROCESS_CHAPTER
+    try:
+        engine.ThreadPoolExecutor = _NoExecutor
+        engine.process_job = _slow_job
+
+        eng = StudyEngine(cache_dir=tempfile.mkdtemp(), poll_interval=0.01)
+        eng.chaoxing = _MultiJobChaoxing(5)
+        eng.current_uid = "u9"
+        eng.jobs = 1
+
+        r = eng._process_chapter({"courseId": "C", "title": "课"},
+                                 {"id": "p1", "title": "章", "has_finished": False})
+        assert r == ChapterResult.SUCCESS, r
+        assert state["max_active"] == 1, f"出现并发执行，最大同时执行数 {state['max_active']}"
+        assert state["order"] == [f"v{i}" for i in range(5)], state["order"]
+        assert state["threads"] == {threading.main_thread().name}, state["threads"]
+    finally:
+        engine.ThreadPoolExecutor = old_executor
+        engine.process_job = old_process_job
+
+
+def test_normalize_jobs_clamps():
+    """并发数收敛到 1~8：非法/越界都回到合法区间。"""
+    assert engine.normalize_jobs(3) == 3
+    assert engine.normalize_jobs("2") == 2
+    assert engine.normalize_jobs(0) == 1
+    assert engine.normalize_jobs(-5) == 1
+    assert engine.normalize_jobs(99) == engine.MAX_JOBS
+    assert engine.normalize_jobs("x") == engine.DEFAULT_JOBS
+    assert engine.normalize_jobs(None) == engine.DEFAULT_JOBS
+    assert StudyEngine(cache_dir=tempfile.mkdtemp()).jobs == engine.DEFAULT_JOBS
 
 
 # --------------------------------------------------------------------------- #

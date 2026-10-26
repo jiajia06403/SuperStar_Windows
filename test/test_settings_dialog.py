@@ -265,6 +265,30 @@ def test_layout_not_clipped():
                 root.destroy()
 
 
+def test_user_resize_survives_provider_switch():
+    """用户手动拉宽后切换提供方：_fit 只增不减，不再把拉开的宽度打回去。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        _prepare_dir(tmp)
+        with _FakeAppDir(tmp):
+            root = tk.Tk()
+            try:
+                dlg = _open(root)
+                dlg.geometry(f"{dlg.winfo_width() + 160}x{dlg.winfo_height()}")
+                dlg.update()
+                dlg.update()
+                wide = dlg.winfo_width()
+                assert dlg._user_sized, "手动改过尺寸后应被标记为 user-sized"
+                _select(dlg, "TikuAdapter")
+                dlg.update_idletasks()
+                assert dlg.winfo_width() >= wide - 2, \
+                    f"切提供方把用户拉开的宽度打回了: {wide} -> {dlg.winfo_width()}"
+                assert int(dlg.hint_lbl.cget("wraplength")) >= wide - 60, \
+                    "提示文字的换行宽度应按新宽度重算"
+                dlg.destroy()
+            finally:
+                root.destroy()
+
+
 def _wait_test_done(dlg, timeout=5.0) -> None:
     """泵 Tk 事件循环，直到连通性测试结束（后台线程 + 队列回主线程）。"""
     import time
@@ -350,6 +374,7 @@ if __name__ == "__main__":
         test_save_keeps_hidden_provider_defaults_empty,
         test_video_log_interval_saved_to_common,
         test_layout_not_clipped,
+        test_user_resize_survives_provider_switch,
         test_conn_test_button_shows_result,
         test_conn_test_row_hidden_when_disabled,
     ]

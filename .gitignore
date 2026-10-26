@@ -39,3 +39,7 @@ Thumbs.db
 
 # ---------- Agent workspace / local memory ----------
 .workbuddy/
+
+# ---------- Local scratch / ad-hoc verification (never commit) ----------
+.review_tmp/
+_tmp_collect.py

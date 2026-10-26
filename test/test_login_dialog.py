@@ -122,6 +122,30 @@ def test_long_error_text_is_truncated():
         root.destroy()
 
 
+def test_login_dialog_is_resizable_and_ordered():
+    """登录框可横向拉伸：输入框跟着变宽，按钮次序与行内提示位置不变。"""
+    root = tk.Tk()
+    try:
+        dlg = LoginDialog(root)
+        dlg.update()
+        width_before = dlg.winfo_width()
+        entry_before = dlg.user_entry.winfo_width()
+        dlg.geometry(f"{width_before + 200}x{dlg.winfo_height()}")
+        dlg.update()
+        dlg.update()
+        assert dlg.winfo_width() >= width_before + 180, \
+            f"登录框应可横向拉伸: {width_before} -> {dlg.winfo_width()}"
+        assert dlg.user_entry.winfo_width() > entry_before, "输入框应跟着窗口变宽"
+        # 拉宽后提示区可以变宽，但按钮次序与同行关系不变
+        dlg.show_error("账号或密码错误")
+        dlg.update()
+        _assert_inline_left_of_buttons(dlg, "账号或密码错误")
+        assert dlg.msg_holder.winfo_width() <= 420, "提示区宽度应有上限，不能反过来顶宽窗口"
+        dlg.destroy()
+    finally:
+        root.destroy()
+
+
 def test_auto_login_failed_reopens_dialog():
     """自动登录失败：重弹登录框，原因显示在「取消 / 登录」左侧。"""
     from gui.app import build
@@ -215,6 +239,7 @@ if __name__ == "__main__":
         test_missing_credentials_inline_error,
         test_login_failure_keeps_window_and_shows_error,
         test_long_error_text_is_truncated,
+        test_login_dialog_is_resizable_and_ordered,
         test_auto_login_failed_reopens_dialog,
         test_login_failure_then_retry_succeeds,
     ]

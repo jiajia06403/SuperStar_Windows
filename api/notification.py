@@ -4,12 +4,100 @@
 """
 
 import configparser
+import re
 from abc import ABC, abstractmethod
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
+from urllib.parse import urlsplit
 
 import requests
 
 from api.logger import logger
+
+
+# --------------------------------------------------------------------------- #
+# URL 脱敏
+#
+# 通知 URL 常常「本身就是凭据」：Server酱 的 sendkey 在路径里，Telegram 的 bot token
+# 也在路径里。日志既落盘到程序目录的 chaoxing.log，又回显到 GUI 日志面板，用户截图
+# 分享即泄露，所以写日志前必须先脱敏 —— 只保留 scheme+host 与凭据末 4 位。
+# --------------------------------------------------------------------------- #
+_MASK = "***"
+_KEEP = 4
+# 凭据样的连续串；长度门槛取 12 是为了放过 sendMessage 这类普通端点名
+_CREDENTIAL_RE = re.compile(r"[A-Za-z0-9_:\-]{12,}")
+
+
+def _mask_text(text: str, keep: int = _KEEP) -> str:
+    """短串整体打码，长串只留末 keep 位。"""
+    text = text or ""
+    if len(text) <= keep:
+        return "*" * len(text)
+    return _MASK + text[-keep:]
+
+
+def _split_url(url: str) -> Tuple[str, str]:
+    """拆成 (scheme://host, host 之后的剩余部分)；非标准 URL 时 base 为空串。"""
+    raw = (url or "").strip()
+    if not raw:
+        return "", ""
+    parts = urlsplit(raw)
+    if not (parts.scheme and parts.netloc):
+        return "", raw
+    prefix = f"{parts.scheme}://{parts.netloc}"
+    netloc = parts.netloc
+    if "@" in netloc:  # user:pass@host 形式的凭据同样要挡掉
+        netloc = f"{_MASK}@{netloc.rpartition('@')[2]}"
+    return f"{parts.scheme}://{netloc}", raw[len(prefix):]
+
+
+def mask_url(url: str, keep: int = _KEEP) -> str:
+    """把可能含凭据的通知 URL 脱敏，只留 scheme+host 与凭据末几位。
+
+    https://sctapi.ftqq.com/SCT1234567890abcdef.send
+        -> https://sctapi.ftqq.com/***cdef.send
+    https://api.telegram.org/bot123456789:AAH-random-token-xyz/sendMessage
+        -> https://api.telegram.org/***-xyz/sendMessage
+    """
+    base, tail = _split_url(url)
+    if not tail:
+        return base
+
+    hits = list(_CREDENTIAL_RE.finditer(tail))
+    if not hits:  # 没有长串可认，整段按文本打码
+        return base + _mask_text(tail, keep)
+
+    chunks, cursor = [], 0
+    for hit in hits:
+        chunks.append(tail[cursor:hit.start()])
+        chunks.append(_MASK + hit.group()[-keep:])
+        cursor = hit.end()
+    chunks.append(tail[cursor:])
+    return base + "".join(chunks)
+
+
+def mask_text(text, *urls: str) -> str:
+    """把文本（典型是 requests 异常串，里面会回显完整 URL）里的凭据换成脱敏形式。
+
+    Args:
+        text: 待清洗的文本，一般是异常对象或错误消息
+        urls: 可能夹带进文本的完整 URL（通常是 self.url）
+    """
+    out = "" if text is None else str(text)
+    for url in urls:
+        raw = (url or "").strip()
+        if not raw:
+            continue
+        _base, tail = _split_url(raw)
+        for needle in (raw, tail):
+            if len(needle) <= _KEEP:
+                continue
+            if needle in out:
+                out = out.replace(needle, mask_url(raw) if needle == raw else _mask_text(needle))
+        for hit in _CREDENTIAL_RE.finditer(tail):
+            secret = hit.group()
+            if secret in out:
+                out = out.replace(secret, _MASK + secret[-_KEEP:])
+    return out
 
 
 class NotificationService(ABC):
@@ -179,7 +267,7 @@ class ServerChan(NotificationService):
             return
 
         self.url = self._conf['url']
-        logger.info(f"已初始化Server酱通知服务，URL: {self.url}")
+        logger.info(f"已初始化Server酱通知服务，URL: {mask_url(self.url)}")
 
     def _send(self, message: str) -> None:
         """
@@ -201,8 +289,8 @@ class ServerChan(NotificationService):
             response.raise_for_status()
             result = response.json()
             logger.info(f"Server酱通知发送成功: {result}")
-        except requests.RequestException as e:
-            logger.error(f"Server酱通知发送失败: {e}")
+        except requests.RequestException as e:  # 异常串里会回显完整 URL，先脱敏
+            logger.error(f"Server酱通知发送失败: {mask_text(e, self.url)}")
         except ValueError as e:
             logger.error(f"Server酱返回数据解析失败: {e}")
 
@@ -220,7 +308,7 @@ class Qmsg(NotificationService):
             return
 
         self.url = self._conf['url']
-        logger.info(f"已初始化Qmsg酱通知服务，URL: {self.url}")
+        logger.info(f"已初始化Qmsg酱通知服务，URL: {mask_url(self.url)}")
 
     def _send(self, message: str) -> None:
         """
@@ -237,8 +325,8 @@ class Qmsg(NotificationService):
             response.raise_for_status()
             result = response.json()
             logger.info(f"Qmsg酱通知发送成功: {result}")
-        except requests.RequestException as e:
-            logger.error(f"Qmsg酱通知发送失败: {e}")
+        except requests.RequestException as e:  # 同上：URL 即密钥，不得直出
+            logger.error(f"Qmsg酱通知发送失败: {mask_text(e, self.url)}")
         except ValueError as e:
             logger.error(f"Qmsg酱返回数据解析失败: {e}")
 
@@ -256,7 +344,7 @@ class Bark(NotificationService):
             return
 
         self.url = self._conf['url']
-        logger.info(f"已初始化Bark通知服务，URL: {self.url}")
+        logger.info(f"已初始化Bark通知服务，URL: {mask_url(self.url)}")
 
     def _send(self, message: str) -> None:
         """
@@ -273,7 +361,7 @@ class Bark(NotificationService):
             result = response.json()
             logger.info(f"Bark通知发送成功: {result}")
         except requests.RequestException as e:
-            logger.error(f"Bark通知发送失败: {e}")
+            logger.error(f"Bark通知发送失败: {mask_text(e, self.url)}")
         except ValueError as e:
             logger.error(f"Bark返回数据解析失败: {e}")
 
@@ -290,7 +378,8 @@ class Telegram(NotificationService):
             return
         self.tg_chat_id = self._conf['tg_chat_id']
         self.url = self._conf['url']
-        logger.info(f"已初始化Telegram通知服务，Chat_id: {self.tg_chat_id} URL: {self.url}")
+        logger.info(f"已初始化Telegram通知服务，Chat_id: {self.tg_chat_id} "
+                    f"URL: {mask_url(self.url)}")
 
     def _send(self, message: str) -> None:
         """
@@ -314,7 +403,7 @@ class Telegram(NotificationService):
             else:
                 logger.error(f"Telegram通知发送失败: {result}")
         except requests.RequestException as e:
-            logger.error(f"Telegram通知发送失败: {e}")
+            logger.error(f"Telegram通知发送失败: {mask_text(e, self.url)}")
         except ValueError as e:
             logger.error(f"Telegram返回数据解析失败: {e}")
 

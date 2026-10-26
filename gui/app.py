@@ -13,6 +13,7 @@ import ctypes
 import json
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -23,7 +24,7 @@ from tkinter import filedialog, messagebox, ttk
 from api.logger import logger
 from config_store import USER_NAME, load_section, save_section, sync_with_default, user_path
 from engine import StudyEngine
-from gui import theme
+from gui import layout, theme
 
 APP_TITLE = "SuperStar · 学习通刷课"
 MAX_LOG_LINES = 1500          # 日志面板最大行数，超出裁剪，避免长跑占内存
@@ -162,28 +163,10 @@ DEFAULT_SPEED, DEFAULT_JOBS = 2.0, 4
 # 登录框「取消 / 登录」按钮左侧的行内提示区宽度（像素）。
 # 必须给足：最小可用文案「账号或密码错误」约 84px，最长的一条
 # 「cookies 已失效，请更新 cookies」约 182px，窄了会被截成「账号或密码…」等于没提示。
-MSG_AREA_WIDTH = 210
-
-
-def _ellipsize_text(text: str, avail_px: int) -> str:
-    """按像素宽度截断文本并补省略号（行内提示用，避免把窗口撑宽）。"""
-    text = str(text or "")
-    if not text:
-        return ""
-    try:
-        font = tkfont.nametofont("TkDefaultFont")
-    except tk.TclError:
-        return text
-    if avail_px <= 0 or font.measure(text) <= avail_px:
-        return text
-    lo, hi = 0, len(text)
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        if font.measure(text[:mid] + "…") <= avail_px:
-            lo = mid
-        else:
-            hi = mid - 1
-    return text[:lo].rstrip() + "…"
+MSG_AREA_MIN = 210
+# 上限：窗口拉宽时提示区可以跟着变宽，但不能反过来把窗口顶宽
+# （test_login_dialog.py 断言「超长错误不撑宽窗口」）。
+MSG_AREA_MAX = 420
 
 
 def _ensure_msg_styles(win: tk.Misc) -> None:
@@ -211,7 +194,7 @@ def _login_error_text(exc: Exception) -> str:
     for needle, brief in mapping:
         if needle in text:
             return brief
-    # 未识别的原文：按长度粗裁一次，最终还会由 _ellipsize_text 按像素截断
+    # 未识别的原文：按长度粗裁一次，最终还会由 layout.ellipsize 按像素截断
     return text if len(text) <= 40 else text[:39] + "…"
 
 
@@ -266,6 +249,39 @@ def saved_theme_mode() -> str:
 
 
 # --------------------------------------------------------------------------- #
+# 主窗口几何：界面取值与持久化
+# --------------------------------------------------------------------------- #
+# 宽x高+x+y（偏移量可带负号）；与 config_store.UI_GEOMETRY_RE 同一格式
+_GEOMETRY_RE = re.compile(r"^\d{3,5}x\d{3,5}[+-]-?\d{1,5}[+-]-?\d{1,5}$")
+DEFAULT_GEOMETRY = "980x660"
+
+
+def _saved_ui(key: str) -> str:
+    """用户配置里的界面状态取值（缺失或读不出一律返回空串 = 留空即停用）。"""
+    try:
+        return str(load_ui_config().get(key, "") or "").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def saved_geometry() -> str:
+    """上次退出时的主窗口几何；非法/缺失时返回空串（调用方回落默认尺寸）。"""
+    value = _saved_ui("geometry")
+    return value if _GEOMETRY_RE.fullmatch(value) else ""
+
+
+def saved_sash() -> "int | None":
+    """上次退出时中部分栏的位置（像素）；非法/缺失返回 None。"""
+    value = _saved_ui("sash")
+    return int(value) if value.isdigit() else None
+
+
+def saved_maximized() -> bool:
+    """上次退出时窗口是否最大化。"""
+    return _saved_ui("maximized") == "1"
+
+
+# --------------------------------------------------------------------------- #
 # 登录对话框
 # --------------------------------------------------------------------------- #
 class LoginDialog(tk.Toplevel):
@@ -282,7 +298,7 @@ class LoginDialog(tk.Toplevel):
                  remember: bool = True, error: str = "", on_submit=None):
         super().__init__(master)
         self.title("登录超星学习通")
-        self.resizable(False, False)
+        self.resizable(True, True)
         self.result = None
         self.on_closed = None            # 窗口关闭回调（App 用它作废在途登录结果）
         self._on_submit = on_submit
@@ -291,6 +307,8 @@ class LoginDialog(tk.Toplevel):
 
         body = ttk.Frame(self, padding=16)
         body.pack(fill="both", expand=True)
+        # 列可伸缩：窗口拉宽时输入框跟着变宽（只写 sticky="ew" 而不给 weight 是死代码）
+        body.columnconfigure(0, weight=1)
 
         ttk.Label(body, text="手机号").grid(row=0, column=0, sticky="w", pady=(0, 4))
         self.user_var = tk.StringVar(value=username)
@@ -316,9 +334,9 @@ class LoginDialog(tk.Toplevel):
 
         btns = ttk.Frame(body)
         btns.grid(row=6, column=0, sticky="e", pady=(14, 0))
-        # 行内提示区：固定宽度、夹在「取消 / 登录」两个按钮左侧。
-        # 宽度按输入框实际像素算，保证出现提示时窗口不会被撑宽。
-        self.msg_holder = ttk.Frame(btns, width=160, height=24)
+        # 行内提示区：夹在「取消 / 登录」两个按钮左侧，宽度由 _fit_msg_area 定。
+        # 高度按字体行高算：写死 24px 在 150% 缩放下会比按钮矮，纵向中心就对不齐。
+        self.msg_holder = ttk.Frame(btns, width=160, height=max(24, layout.line_height() + 6))
         self.msg_holder.pack_propagate(False)
         self.msg_holder.pack(side="left", padx=(0, 12))
         self.msg_label = ttk.Label(self.msg_holder, text="", style="Info.TLabel", anchor="w")
@@ -337,26 +355,61 @@ class LoginDialog(tk.Toplevel):
 
         self.update_idletasks()
         self._fit_msg_area(body)
+        # 记下自然尺寸（提示区已按 MSG_AREA_MIN 定宽后再量）：它是窗口下限，
+        # _fit_msg_area 也用它区分「用户拉宽的部分」。
+        self.update_idletasks()
+        self._natural_w = self.winfo_width()
+        self._natural_h = self.winfo_reqheight()
+        self.minsize(self._natural_w, self._natural_h)
+        self._msg_job = None
+        self.bind("<Configure>", self._schedule_fit_msg)
         if error:
             self.show_error(error)
 
     # ---------------- 行内提示 ----------------
-    def _fit_msg_area(self, body: tk.Misc) -> None:
-        """固定提示区宽度：出错误时窗口宽度不变，短文案完整显示、长文案加省略号。
+    def _schedule_fit_msg(self, _event=None) -> None:
+        """窗口拉宽后重算提示区宽度（合并连续 Configure，60ms 内只算一次）。"""
+        if self._msg_job is not None:
+            return
+        self._msg_job = self.after(60, self._run_fit_msg)
+
+    def _run_fit_msg(self) -> None:
+        self._msg_job = None
+        self._fit_msg_area()
+    def _fit_msg_area(self, _body: "tk.Misc | None" = None) -> None:
+        """提示区宽度：有下限（短文案不截断）也有上限（不把窗口顶宽）。
 
         不能按「输入框剩余宽度」反推 —— 按钮本身就要占掉 ~180px，反推出来的
         宽度连「账号或密码错误」（~84px）都放不下，文案会被截成「账号或密码…」。
+
+        宽度 = 下限 + 「用户手动拉宽的那部分」。窗口处于自然宽度时提示区恒为
+        ``MSG_AREA_MIN``，拉宽时跟着变宽但不超过 ``MSG_AREA_MAX``；因为多出来的
+        宽度本来就来自用户拉伸，按钮行总宽始终不超过当前窗口可用宽度 ——
+        不构成「提示区变宽 → 窗口变宽」的正反馈。
         """
         try:
-            width = max(int(MSG_AREA_WIDTH),
-                        int(self.user_entry.winfo_reqwidth()) // 3)
-            self.msg_holder.configure(width=width)
-            self._msg_budget = max(40, width - 6)
+            base = getattr(self, "_natural_w", 0) or self.winfo_width()
+            extra = max(0, self.winfo_width() - int(base))
+            want = int(min(MSG_AREA_MIN + extra, MSG_AREA_MAX))
+            cur = int(self.msg_holder.cget("width"))
+            if abs(want - cur) < 2:
+                return                      # <2px 不动：防 Configure 抖动
+            self.msg_holder.configure(width=want)
+            self._msg_budget = max(40, want - 6)
+            self._repaint_msg()
         except Exception:  # noqa: BLE001
-            self._msg_budget = MSG_AREA_WIDTH - 6
+            self._msg_budget = MSG_AREA_MIN - 6
+
+    def _repaint_msg(self) -> None:
+        """宽度变了要重画：原文存在 ``_msg_text`` 里，按新预算重新截断。"""
+        text = getattr(self, "_msg_text", "")
+        if text:
+            self.msg_label.configure(text=layout.ellipsize(text, self._msg_budget))
 
     def _set_msg(self, text: str, style: str) -> None:
-        self.msg_label.configure(text=_ellipsize_text(text, self._msg_budget), style=style)
+        self._msg_text = str(text or "")     # 记住原文：提示区变宽后可重新截断
+        budget = getattr(self, "_msg_budget", MSG_AREA_MIN - 6)
+        self.msg_label.configure(text=layout.ellipsize(self._msg_text, budget), style=style)
 
     def show_error(self, message: str) -> None:
         """行内显示错误（红色），不弹模态框；窗口保留，用户可直接改密码重试。"""
@@ -396,6 +449,14 @@ class LoginDialog(tk.Toplevel):
 
     def destroy(self) -> None:
         """关闭时通知宿主（App），避免残留的登录框/在途结果影响后续状态。"""
+        # 先撤掉待执行的提示区重算：否则 after 回调会打到已销毁的窗口上（Tcl 噪音）
+        job = getattr(self, "_msg_job", None)
+        self._msg_job = None
+        if job is not None:
+            try:
+                self.after_cancel(job)
+            except Exception:  # noqa: BLE001
+                pass
         try:
             super().destroy()
         finally:
@@ -567,6 +628,8 @@ class SettingsDialog(tk.Toplevel):
     def __init__(self, master: tk.Misc):
         super().__init__(master)
         self.title("设置")
+        # 只锁宽度下限：高度由内容决定（_fit 按当前显示的项收放）
+        self.minsize(560, 0)
         self.result = None
         self.common_result = None
         self.ui_result = None
@@ -575,6 +638,12 @@ class SettingsDialog(tk.Toplevel):
         self._positioned = False
         self._testing = False
         self._test_gen = 0
+        # 可缩放与「按内容收放」共存：_own_geo 记我们自己设的尺寸，用于区分
+        # 之后的变化是用户手动拉的（见 _on_self_configure / _fit）。
+        self._user_sized = False
+        self._own_geo = ""
+        self._settle = 0
+        self._geo_echoed = False
 
         cfg = load_tiku_config()
         common_cfg = load_common_config()
@@ -677,6 +746,7 @@ class SettingsDialog(tk.Toplevel):
         except tk.TclError:      # 窗口尚未上屏时抓焦点会报错，不影响使用
             pass
         self.bind("<Escape>", lambda _e: self.destroy())
+        self.bind("<Configure>", self._on_self_configure)
         self._on_provider_change()
         self._center(master)
         theme.register_window(self)
@@ -838,18 +908,57 @@ class SettingsDialog(tk.Toplevel):
             return
         self._set_test_result(("测试通过 · " if ok else "测试失败 · ") + str(msg), bool(ok))
     # ---------------- 窗口尺寸 / 位置 ----------------
+    def _apply_geometry(self, width: int, height: int) -> None:
+        """改尺寸的唯一出口：记下「我们自己设的值」，供 _on_self_configure 比对。"""
+        self._own_geo = f"{int(width)}x{int(height)}"
+        self._settle = 0
+        if self._positioned:
+            self.geometry(f"{self._own_geo}+{self.winfo_x()}+{self.winfo_y()}")
+        else:
+            self.geometry(self._own_geo)
+
+    def _on_self_configure(self, event) -> None:
+        """区分「我们自己设的尺寸」与「用户手动拉伸」：
+
+        先等一次与我们设的值一致的 Configure（``_geo_echoed``）作为基准，
+        之后再出现不同的尺寸就认定是用户拉的。这样不依赖帧计数，
+        也不怕 WM 偶尔多送一帧。
+        """
+        if event.widget is not self or not self._positioned or not self._own_geo:
+            return
+        width, height = self.winfo_width(), self.winfo_height()
+        if width <= 1 or height <= 1:              # 尚未上屏，量到的尺寸没意义
+            return
+        try:
+            own_w, own_h = (int(part) for part in self._own_geo.split("x"))
+        except ValueError:
+            return
+        # 2px 容差：WM 的边框/缩放取整不该被误判成用户拉伸
+        if abs(width - own_w) <= 2 and abs(height - own_h) <= 2:
+            self._settle = 0
+            self._geo_echoed = True
+            return
+        if self._geo_echoed:
+            self._user_sized = True
+
     def _fit(self) -> None:
-        """按当前显示的项重设窗口大小，避免切到项少的提供方时留下大片空白。"""
-        width = max(self._width, 560)
+        """按当前显示的项重设窗口大小，避免切到项少的提供方时留下大片空白。
+
+        与「可缩放」共存的规则：用户手动拉过之后**只增不减** —— 宽度保留，
+        只在内容放不下时增高。这样既不会裁切内容，也不会把用户拉开的尺寸打回去。
+        """
+        fit_w = max(self._width, 560)
+        width = self.winfo_width() if (self._positioned and self._user_sized) else fit_w
         # 提示文字按窗口宽度换行：先定换行宽度，能量出准确高度
         self.hint_lbl.configure(wraplength=max(width - 48, 320))
         self.test_lbl.configure(wraplength=max(width - 150, 260))
         self.update_idletasks()
-        height = self.winfo_reqheight()
-        if self._positioned:
-            self.geometry(f"{width}x{height}+{self.winfo_x()}+{self.winfo_y()}")
-        else:
-            self.geometry(f"{width}x{height}")
+        need_h = self.winfo_reqheight()
+        if self._positioned and self._user_sized:
+            if need_h > self.winfo_height():           # 放不下才增高，其余一律不动
+                self._apply_geometry(max(width, fit_w), need_h)
+            return
+        self._apply_geometry(fit_w, need_h)
 
     def _center(self, master: tk.Misc) -> None:
         self.update_idletasks()
@@ -960,10 +1069,14 @@ class LocalBankDialog(tk.Toplevel):
         self._add_row(stat, 3, "占用空间", readonly=True)
         self._add_row(stat, 4, "最近更新", readonly=True)
 
-        ttk.Label(body,
-                  text=("题库按课程存放：<课程ID>.json，只存平台确认过的正确答案，所有账号共用。"
-                        "导入会把对方题库合并进来（同题取确认次数更高的答案），不会覆盖其余内容。"),
-                  style="Status.TLabel", wraplength=560, justify="left").pack(fill="x", pady=(8, 0))
+        self._note = ttk.Label(
+            body,
+            text=("题库按课程存放：<课程ID>.json，只存平台确认过的正确答案，所有账号共用。"
+                  "导入会把对方题库合并进来（同题取确认次数更高的答案），不会覆盖其余内容。"),
+            style="Status.TLabel", wraplength=560, justify="left")
+        self._note.pack(fill="x", pady=(8, 0))
+        # 说明文字按窗口实际宽度换行：写死 560 在拉宽后右侧留白、拉窄后被切
+        self._note.bind("<Configure>", self._reflow_note)
 
         btns = ttk.Frame(body)
         btns.pack(fill="x", pady=(12, 0))
@@ -976,8 +1089,25 @@ class LocalBankDialog(tk.Toplevel):
 
         self.bind("<Escape>", lambda _e: self.destroy())
         self._refresh()
-        self.geometry("640x380")
+        # 首次尺寸按内容实测（不再写死 640x380），之后可自由拉伸
+        self.update_idletasks()
+        self.geometry(f"{max(self.winfo_reqwidth(), 560)}x{max(self.winfo_reqheight(), 320)}")
+        self.minsize(560, 320)
         theme.register_window(self)
+
+    # ---------------- 说明文字换行 ----------------
+    def _reflow_note(self, event=None) -> None:
+        """说明文字按实际宽度换行（窗口拉宽时展开、拉窄时收拢）。"""
+        width = event.width if event is not None else self._note.winfo_width()
+        want = max(int(width) - 4, 200)
+        try:
+            cur = int(self._note.cget("wraplength"))
+        except tk.TclError:
+            return
+        # 8px 死区：wraplength 变化会改 reqheight，进而触发新的 Configure
+        if abs(want - cur) < 8:
+            return
+        self._note.configure(wraplength=want)
 
     # ---------------- 构建 ----------------
     def _make_bank(self):
@@ -1147,6 +1277,8 @@ class App:
         # 但先上色可以避免首帧闪一下白底。
         self.theme = theme.ThemeManager(self.root)
         self.theme.apply(saved_theme_mode())
+        # 点别处关掉账号下拉后不要残留聚焦描边（对全部 combobox 生效）
+        theme.install_combobox_focus_fix(self.root)
 
         self._build_ui()
         self.theme.add_listener(self._on_theme_changed)
@@ -1247,21 +1379,25 @@ class App:
     def _build_ui(self) -> None:
         style = ttk.Style(self.root)
         # 行高/列宽都按当前字体实测，避免高 DPI（125%/150% 缩放）下
-        # 固定 22px 行高与 56px 状态列把汉字裁掉。
+        # 固定 22px 行高与 56px 状态列把汉字裁掉。尺寸的取法统一在 gui/layout.py。
         self._ui_font = tkfont.nametofont("TkDefaultFont")
-        self._line_h = self._ui_font.metrics("linespace")
+        self._line_h = layout.line_height()
         style.configure("Treeview", rowheight=max(22, self._line_h + 6))
 
         outer = ttk.Frame(self.root, padding=(10, 8))
         outer.pack(fill="both", expand=True)
         outer.columnconfigure(0, weight=1)
+        # row0（工具栏）与 row2（状态栏）刻意不给 weight：它们是单行文本高度，
+        # 给 weight 只会在窗口变高时被纵向拉出空白，并抢走 row1/row3 的 3:2 空间。
+        # 横向撑满靠 sticky="ew"，纵向自适应交给 row1/row3 的 weight。
         outer.rowconfigure(1, weight=3, minsize=180)
         outer.rowconfigure(3, weight=2, minsize=150)
 
         self._build_toolbar(outer).grid(row=0, column=0, sticky="ew", pady=(0, 8))
 
         # 中部：课程 / 章节
-        body = ttk.Panedwindow(outer, orient="horizontal")
+        # 存成实例属性：退出时要读 sash 位置落盘，启动时还原
+        self._body = body = ttk.Panedwindow(outer, orient="horizontal")
         body.grid(row=1, column=0, sticky="nsew")
         body.add(self._build_course_pane(body), weight=1)
         body.add(self._build_chapter_pane(body), weight=2)
@@ -1352,6 +1488,8 @@ class App:
         box.columnconfigure(0, weight=1)
 
         self.course_tree = ttk.Treeview(box, show="tree", selectmode="browse")
+        # 分栏被拖到极窄时列宽不会归零（show="tree" 只有 #0 一列）
+        self.course_tree.column("#0", width=280, minwidth=layout.COURSE_MIN_W, stretch=True)
         self.course_tree.grid(row=0, column=0, sticky="nsew")
         bar = ttk.Scrollbar(box, orient="vertical", command=self.course_tree.yview)
         bar.grid(row=0, column=1, sticky="ns")
@@ -1383,15 +1521,19 @@ class App:
         self.chapter_tree.heading("title", text="章节")
         # 状态列宽按最长状态文本（未开放）实测，另留单元格内边距；
         # 固定 56px 在 125% 缩放下会把「未开放」裁掉半个字。
-        state_w = max(self._ui_font.measure(t) for t, _c in CHAPTER_STYLE.values()) + 20
-        self.chapter_tree.column("state", width=state_w, minwidth=state_w, stretch=False)
-        self.chapter_tree.column("title", width=360, minwidth=220, anchor="w")
+        self._sync_state_column()
+        self.chapter_tree.column("title", width=360, minwidth=layout.TITLE_MIN_W, anchor="w")
         for key, (_text, color) in CHAPTER_STYLE.items():
             self.chapter_tree.tag_configure(key, foreground=color)
         self.chapter_tree.grid(row=0, column=0, sticky="nsew")
         bar = ttk.Scrollbar(box, orient="vertical", command=self.chapter_tree.yview)
         bar.grid(row=0, column=1, sticky="ns")
+        self._chapter_vsb = bar
         self.chapter_tree.configure(yscrollcommand=bar.set)
+        # 列宽随 resize 重算：after 合并连续 Configure，避免在事件里同步改列宽触发递归
+        self._fit_cols_job = None
+        self.chapter_tree.bind("<Configure>", self._schedule_fit_columns)
+        self.chapter_tree.bind("<Destroy>", self._on_tree_destroy)
 
         tools = ttk.Frame(box)
         tools.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
@@ -1412,6 +1554,55 @@ class App:
         self.chapter_hint.bind("<Configure>", lambda _e: self._paint_hint())
         return box
 
+    # ---------------- Treeview 列宽自适应 ----------------
+    def _schedule_fit_columns(self, _event=None) -> None:
+        """合并 resize 期间的连续 Configure：60ms 内只重算一次。"""
+        if self._fit_cols_job is not None:
+            return
+        self._fit_cols_job = self.root.after(60, self._run_fit_columns)
+
+    def _on_tree_destroy(self, _event=None) -> None:
+        """窗口/树销毁时撤掉待执行的重算，避免 after 回调打到已销毁的解释器上。"""
+        job = getattr(self, "_fit_cols_job", None)
+        self._fit_cols_job = None
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _sync_state_column(self) -> None:
+        """状态列宽 = 最长状态文本实测 + 内边距（字体/DPI 变化后可重算）。
+
+        必须同步执行：若推迟到 ``after`` 里，测试在 ``update_idletasks()`` 后读到的
+        还是构建期的旧值，``test_gui_smoke`` 的「状态列放得下最长状态文本」会误判。
+        """
+        state_w = max(layout.measure(t) for t, _c in CHAPTER_STYLE.values()) + layout.STATE_COL_PAD
+        self._state_w = state_w
+        self.chapter_tree.column("state", width=state_w, minwidth=state_w, stretch=False)
+
+    def _run_fit_columns(self) -> None:
+        self._fit_cols_job = None
+        tree = self.chapter_tree
+        try:
+            if not tree.winfo_exists() or tree.winfo_width() <= 1:
+                return
+        except tk.TclError:
+            return
+        self._sync_state_column()
+        # 章节列吃满剩余宽度，但不小于 TITLE_MIN_W：分栏被拖窄时列会收缩到最小宽度，
+        # 而不是停在初始的 360px 让横向滚动条常驻。
+        sb_w = self._chapter_vsb.winfo_width()
+        rest = tree.winfo_width() - (sb_w if sb_w > 1 else 0) - 4
+        want = max(layout.TITLE_MIN_W, rest - self._state_w)
+        try:
+            cur = int(tree.column("title", "width"))
+        except tk.TclError:
+            return
+        if abs(want - cur) < 2:
+            return                     # <2px 不动：小抖动会让 Configure 自激
+        tree.column("title", width=want, minwidth=layout.TITLE_MIN_W, anchor="w")
+
     def _build_log_pane(self, parent: tk.Misc) -> ttk.Widget:
         box = ttk.Labelframe(parent, text="运行日志", padding=6)
         box.rowconfigure(0, weight=1)
@@ -1426,6 +1617,8 @@ class App:
         # 否则右侧内容直接被窗口边界切掉、无法查看。
         xbar = ttk.Scrollbar(box, orient="horizontal", command=self.log_text.xview)
         xbar.grid(row=1, column=0, sticky="ew")
+        # 右下角缩放把手：与横向滚动条同格，不额外占高度
+        ttk.Sizegrip(box).grid(row=1, column=1, sticky="se")
         self.log_text.configure(yscrollcommand=bar.set, xscrollcommand=xbar.set)
         self.log_text.tag_configure("warn", foreground="#ef6c00")
         self.log_text.tag_configure("error", foreground="#c62828")
@@ -1477,20 +1670,6 @@ class App:
         self._status_full = full
         self._paint_status()
 
-    def _ellipsize(self, text: str, avail_px: int) -> str:
-        """把文本裁剪到不超过 avail_px 像素，末尾补省略号。"""
-        font = getattr(self, "_ui_font", None) or tkfont.nametofont("TkDefaultFont")
-        if avail_px <= 0 or font.measure(text) <= avail_px:
-            return text
-        lo, hi = 0, len(text)
-        while lo < hi:
-            mid = (lo + hi + 1) // 2
-            if font.measure(text[:mid] + "…") <= avail_px:
-                lo = mid
-            else:
-                hi = mid - 1
-        return text[:lo].rstrip() + "…"
-
     def _paint_status(self) -> None:
         label = getattr(self, "status_label", None)
         if label is None:
@@ -1499,7 +1678,7 @@ class App:
         shown = full
         width = label.winfo_width()
         if width > 1:
-            shown = self._ellipsize(full, width - 4)
+            shown = layout.ellipsize(full, width - 4)
         if label.cget("text") != shown:
             label.configure(text=shown)
 
@@ -1902,7 +2081,7 @@ class App:
         width = self.chapter_hint.winfo_width()
         shown = full
         if width > 1:
-            shown = self._ellipsize(full, max(40, width - 4))
+            shown = layout.ellipsize(full, max(40, width - 4))
         if self.chapter_hint.cget("text") != shown:
             self.chapter_hint.configure(text=shown)
 
@@ -2104,6 +2283,46 @@ class App:
         except Exception as exc:  # noqa: BLE001
             logger.debug(f"保存倍速/并发失败: {exc}")
 
+    def _save_window_geometry(self) -> None:
+        """退出时记录主窗口几何与中部分栏位置（下次启动恢复）。
+
+        与 ``_save_run_params`` 同一守卫：自检/测试用临时 cache_dir 时不写盘，
+        避免在源码目录生成 config_user.ini。
+        """
+        if not self._can_save_config:
+            return
+        try:
+            if not self.root.winfo_viewable():
+                return                       # 从未真正上屏，量到的几何没有意义
+            zoomed = str(self.root.state()) == "zoomed"
+            sash = ""
+            pane = getattr(self, "_body", None)
+            if pane is not None and pane.winfo_width() > 1:
+                try:
+                    sash = str(int(pane.sashpos(0)))
+                except tk.TclError:
+                    sash = ""
+            save_section("ui", {
+                "geometry": "" if zoomed else self.root.geometry(),
+                "sash": sash,
+                "maximized": "1" if zoomed else "0",
+            })
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"保存窗口几何失败: {exc}")
+
+    def _restore_sash(self) -> None:
+        """还原中部分栏位置（上屏后才有意义；越界值按当前可用宽度夹住）。"""
+        raw = saved_sash()
+        pane = getattr(self, "_body", None)
+        if raw is None or pane is None:
+            return
+        try:
+            if pane.winfo_width() <= 1:
+                return
+            pane.sashpos(0, max(120, min(raw, pane.winfo_width() - 160)))
+        except tk.TclError:
+            pass
+
     def on_start(self) -> None:
         if self.engine.chaoxing is None:
             return self._tips("请先登录（或点击「演示」）")
@@ -2224,6 +2443,7 @@ class App:
                 return
             self.engine.stop()
         self._save_run_params()      # 只改倍速/并发没点开始也要记住
+        self._save_window_geometry() # 窗口尺寸/位置/分栏位置，下次启动恢复
         try:
             self.theme.stop_watch()
         except Exception:  # noqa: BLE001
@@ -2251,12 +2471,22 @@ def build(demo: bool = False, cache_dir: str | None = None) -> App:
     _enable_dpi_awareness()
     root = tk.Tk()
     root.title(APP_TITLE)
-    root.geometry("980x660")
+    # 恢复上次的窗口尺寸/位置（没记过就用默认尺寸居中）；minsize 不得上调 —
+    # test_theme 用 840x560 触发工具栏折行断言，窗口被撑大就不会折行了。
+    geometry = saved_geometry()
+    root.geometry(geometry or DEFAULT_GEOMETRY)
     root.minsize(840, 560)
     _apply_cjk_font(root)
     app = App(root, cache_dir=cache_dir, sync_config=cache_dir is None)
     if demo:
         app.load_demo()
+    if saved_maximized():
+        try:
+            root.state("zoomed")
+        except tk.TclError:
+            pass
+    # 分栏位置要等窗口上屏后再设，否则 sashpos 无效
+    root.after_idle(app._restore_sash)
     return app
 
 

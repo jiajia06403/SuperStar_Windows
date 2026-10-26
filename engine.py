@@ -15,6 +15,13 @@ SuperStar Windows 引擎
          每 reanswer_interval 秒再来一轮，直到平台判通过或用户停止；
        - 上一章已完成（或本就首章）则每 15 秒检查当前章节状态，直到开放或软件关闭。
 
+  4. **异常隔离**：任务点 / 章节 / 课程三层各自兜底，单点网络或解析异常只会让
+     该任务点（最多该章节、该课程）失败，绝不会穿透到主循环把整轮刷课结束掉：
+       - ``process_job``：每种任务类型单独 try/except -> StudyResult.ERROR；
+       - ``process_chapter``：except Exception -> ChapterResult.ERROR（Cancelled 优先、单独处理）；
+       - ``StudyEngine._process_chapter`` / ``_run``：章节级、课程级再兜一层。
+     只有用户停止（``cancel.Cancelled``）才会中断整轮。
+
 本模块与 GUI 解耦：通过 on(event, cb) 注册回调，GUI 只负责把这些回调映射到界面。
 """
 import json
@@ -44,6 +51,19 @@ DEFAULT_VIDEO_LOG_INTERVAL = 10
 
 # 章节检测「不合格重答」默认次数（[tiku] work_retry 缺省时使用）
 DEFAULT_WORK_RETRY = 3
+
+# 单章内任务点并发数默认/上限（界面 1~8，config_store.COMMON_RANGES 与之对齐）
+DEFAULT_JOBS = 4
+MAX_JOBS = 8
+
+
+def normalize_jobs(jobs) -> int:
+    """把任意来源的并发数收敛到 1~MAX_JOBS（非法/缺失回落 DEFAULT_JOBS）。"""
+    try:
+        value = int(float(str(jobs).strip()))
+    except (TypeError, ValueError):
+        return DEFAULT_JOBS
+    return min(MAX_JOBS, max(1, value))
 
 
 def video_log_interval_from_config(default: float = DEFAULT_VIDEO_LOG_INTERVAL) -> float:
@@ -80,13 +100,42 @@ class ChapterResult(Enum):
 # --------------------------------------------------------------------------- #
 # 单任务点处理（来自原 main.py，保持核心逻辑不变）
 # --------------------------------------------------------------------------- #
+def _guard_job(job: dict, course: dict, label: str, call: Callable[[], StudyResult]) -> StudyResult:
+    """执行单个任务点调用，把异常收敛成 StudyResult.ERROR。
+
+    这是「异常隔离」的第一道闸：一个任务点的网络/解析异常只能废掉它自己，
+    同章其它任务点照跑（否则异常会经 ThreadPoolExecutor.map 冒到 _run，
+    把整轮刷课直接结束掉）。
+
+    停止信号（Cancelled）**不在这里收敛** —— 必须继续上抛，交给
+    ``process_chapter`` 转成 ChapterResult.STOPPED，保持原有的停止语义。
+    """
+    try:
+        return call()
+    except Cancelled:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            f"{label}异常，已跳过（同章其它任务点继续）: 课程: {course.get('title')} "
+            f"任务ID: {job.get('jobid')} -> {type(exc).__name__}: {exc}"
+        )
+        logger.debug(traceback.format_exc())
+        return StudyResult.ERROR
+
+
 def process_job(chaoxing: Chaoxing, course: dict, job: dict, job_info: dict, speed: float) -> StudyResult:
     if job["type"] == "video":
         logger.trace(f"识别到视频任务, 任务章节: {course['title']} 任务ID: {job['jobid']}")
-        video_result = chaoxing.study_video(course, job, job_info, _speed=speed, _type="Video")
+        video_result = _guard_job(
+            job, course, "视频任务",
+            lambda: chaoxing.study_video(course, job, job_info, _speed=speed, _type="Video"),
+        )
         if video_result.is_failure():
             logger.warning("当前任务非视频任务, 正在尝试音频任务解码")
-            video_result = chaoxing.study_video(course, job, job_info, _speed=speed, _type="Audio")
+            video_result = _guard_job(
+                job, course, "音频任务",
+                lambda: chaoxing.study_video(course, job, job_info, _speed=speed, _type="Audio"),
+            )
         if video_result.is_failure():
             logger.warning(
                 f"出现异常任务 -> 任务章节: {course['title']} 任务ID: {job['jobid']}, 已跳过"
@@ -94,13 +143,15 @@ def process_job(chaoxing: Chaoxing, course: dict, job: dict, job_info: dict, spe
         return video_result
     elif job["type"] == "document":
         logger.trace(f"识别到文档任务, 任务章节: {course['title']} 任务ID: {job['jobid']}")
-        return chaoxing.study_document(course, job)
+        return _guard_job(job, course, "文档任务", lambda: chaoxing.study_document(course, job))
     elif job["type"] == "workid":
         logger.trace(f"识别到章节检测任务, 任务章节: {course['title']}")
-        return chaoxing.study_work(course, job, job_info)
+        return _guard_job(job, course, "章节检测任务",
+                          lambda: chaoxing.study_work(course, job, job_info))
     elif job["type"] == "read":
         logger.trace(f"识别到阅读任务, 任务章节: {course['title']}")
-        return chaoxing.study_read(course, job, job_info)
+        return _guard_job(job, course, "阅读任务",
+                          lambda: chaoxing.study_read(course, job, job_info))
     elif job["type"] == "live":
         logger.trace(f"识别到直播任务, 任务章节: {course['title']} 任务ID: {job['jobid']}")
         try:
@@ -118,6 +169,9 @@ def process_job(chaoxing: Chaoxing, course: dict, job: dict, job_info: dict, spe
                 cancel.check()
             thread.join()
             return StudyResult.SUCCESS
+        except Cancelled:
+            # 停止信号必须原样上抛，不能被当成任务失败
+            raise
         except Exception as e:  # noqa: BLE001
             logger.error(f"处理直播任务时出错: {str(e)}")
             return StudyResult.ERROR
@@ -132,20 +186,53 @@ def _tiku_disabled(chaoxing: Chaoxing) -> bool:
     return tiku is None or bool(getattr(tiku, "DISABLE", False))
 
 
-def _work_still_pending(chaoxing: Chaoxing, course: dict, point: dict) -> Optional[bool]:
+def _job_unreadable(job_info) -> bool:
+    """任务点读取失败标记（非 200 / 掉登录 / 风控页 / 解析失败）。"""
+    return isinstance(job_info, dict) and bool(job_info.get("unreadable", False))
+
+
+def _work_card_nums(jobs, job_info) -> Optional[str]:
+    """章节检测(workid)落在哪几张卡片上（``get_job_list(track_cards=True)`` 才有归属信息）。
+
+    目的是复检时只回读这几张卡片：was-not-workid 的卡片不会因为重答而长出新的
+    workid（哪张卡有无测验由老师排版决定），全量回扫一遍纯属浪费请求。
+    拿不到归属信息时返回 ``None``，调用方退回全量读取。
+    """
+    card_of = job_info.get("card_of_job") if isinstance(job_info, dict) else None
+    if not isinstance(card_of, dict) or not card_of:
+        return None
+    nums: list[str] = []
+    for job in jobs or []:
+        if not isinstance(job, dict) or job.get("type") != "workid":
+            continue
+        key = str(job.get("jobid") or job.get("id") or "")
+        num = card_of.get(key)
+        if num is not None and num not in nums:
+            nums.append(str(num))
+    return "".join(nums) if nums else None
+
+
+def _work_still_pending(chaoxing: Chaoxing, course: dict, point: dict,
+                        nums: Optional[str] = None) -> Optional[bool]:
     """提交答题后回读章节任务点，判断章节检测是否仍未通过。
+
+    ``nums``：只回读这些卡片（通常是上次读到 workid 的那一张），缺省才会全扫。
 
     超星的任务点卡片只有在 ``isPassed`` 为真时才被解析器跳过，因此回读到的 job 列表里
     若仍存在 ``workid`` 任务，说明平台仍要求「重新作答」（判分不合格 / 未提交）。
 
-    返回 True=仍需重做，False=已通过，None=无法判断（网络/解析异常，不阻断流程）。
+    返回 True=仍需重做，False=已通过，None=无法判断（网络/解析异常 / 读不到任务点）。
+    调用方**不得**把 None 当作已通过。
     """
     try:
-        jobs, job_info = chaoxing.get_job_list(course, point)
+        jobs, job_info = chaoxing.get_job_list(course, point, nums=nums)
     except Exception as e:  # noqa: BLE001
         logger.warning(f"回读章节任务点失败，跳过完成校验: {e}")
         return None
     if not isinstance(jobs, list):
+        return None
+    if _job_unreadable(job_info):
+        # 压根没读到任务点：无法判断通过与否，不能当成「已通过」
         return None
     if isinstance(job_info, dict) and job_info.get("notOpen", False):
         # 章节突然变回未开放，属于异常情况，不参与完成校验
@@ -153,12 +240,45 @@ def _work_still_pending(chaoxing: Chaoxing, course: dict, point: dict) -> Option
     return any(j.get("type") == "workid" for j in jobs)
 
 
+def _run_job_batch(chaoxing: Chaoxing, course: dict, jobs: list[dict], job_info: dict,
+                   speed: float, max_workers: int) -> list[StudyResult]:
+    """按并发上限跑完本章任务点（保持任务点原有顺序）。
+
+    ``max_workers <= 1`` 时**纯串行、不建线程**：便于排查顺序问题，也把并发风控降到最低。
+    并发 >1 时才用线程池；``executor.map`` 保证结果顺序与输入一致（乱序会让上层
+    "任一失败即整章失败" 的判断难以复现）。
+    """
+    if max_workers <= 1:
+        return [process_job(chaoxing, course, j, job_info, speed) for j in jobs]
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        return list(executor.map(
+            lambda j: process_job(chaoxing, course, j, job_info, speed), jobs))
+
+
 def process_chapter(chaoxing: Chaoxing, course: dict, point: dict, speed: float,
-                    work_retry: int = DEFAULT_WORK_RETRY) -> ChapterResult:
+                    work_retry: int = DEFAULT_WORK_RETRY,
+                    jobs: int = DEFAULT_JOBS) -> ChapterResult:
     """处理单个章节，返回 ChapterResult。
 
     ``work_retry``：章节检测提交后回读发现「仍未通过」时允许的重新作答次数。
     平台判分不合格（需要重新作答）时不会再被当作已完成。
+
+    ``jobs``：本章内任务点的并发上限（1 = 串行）。透传自 ``StudyEngine.start_study``，
+    不再硬编码；取值范围收敛见 :func:`normalize_jobs`。
+
+    并发安全性（8 并发评估，2026-10）：
+      - ~~``api.local_bank.set_scope()`` 进程级全局作用域~~ **已移除**：课程归属改成
+        ``course`` / ``course_id`` 显式传参（``Tiku.query`` -> ``BankStore.lookup``，
+        ``learn_work_answers`` -> ``BankStore.learn``），并发作业各写各的课程文件。
+        ``set_scope`` 仅作为串行调用方（CLI / 历史单测）的兼容入口保留，刷课与采集都不再用。
+      - ``Tiku.query()`` 每次新建 ``CacheDAO()``，但锁已提升为**按缓存文件共享的模块级
+        RLock**（``api.answer._cache_lock_for``）：指向同一份 cache.json 的实例共用一把锁，
+        ``add_cache`` 的 read-modify-write 整段互斥，不再丢更新（回归见
+        ``test/test_cache_concurrency.py``：8 线程各写 1 题，8 条都在）。
+      - ``Tiku._failure_count`` / ``_unavailable_reason`` 无锁自增，最坏是误判一次
+        "连续失败 -> 停用"，随后会被成功查询重置。
+      - ``local_bank`` 自身读写走模块级 ``_LOCK``，并发安全。
+      - 结论：1~8 并发均可安全使用，未发现会破坏刷课正确性的共享状态竞争。
     """
     logger.info(f'当前章节: {point["title"]}')
     if point.get("has_finished"):
@@ -169,23 +289,33 @@ def process_chapter(chaoxing: Chaoxing, course: dict, point: dict, speed: float,
         work_retry = max(0, int(work_retry))
     except (TypeError, ValueError):
         work_retry = DEFAULT_WORK_RETRY
+    # 注意：下面的局部变量 jobs 是任务点列表，并发上限必须先另存（否则被覆盖）
+    max_workers = normalize_jobs(jobs)
 
     reanswer = 0
+    first_read = True     # 首次读取任务点：空列表按「读取失败」处理
     try:
         while True:
             cancel.check()
             chaoxing.rate_limiter.limit_rate(random_time=True, random_min=0, random_max=0.2)
 
-            jobs, job_info = chaoxing.get_job_list(course, point)
+            # 记下任务点来自哪张卡片：回读章节检测状态时可以只回读那几张，不必全扫
+            jobs, job_info = chaoxing.get_job_list(course, point, track_cards=True)
 
             # 发现未开放章节
             if job_info.get("notOpen", False):
                 return ChapterResult.NOT_OPEN
 
-            job_results: list[StudyResult] = []
-            with ThreadPoolExecutor(max_workers=5) as executor:
-                for result in executor.map(lambda j: process_job(chaoxing, course, j, job_info, speed), jobs):
-                    job_results.append(result)
+            # 取不到任务点（非 200 / 掉登录 / 风控页 / 解析失败）必须是失败态。
+            # 空列表只在「确实没有任务点」时才算完成（get_job_list 会带 empty=True）；
+            # 否则一次网络抖动就会把整章静默记为已完成并永久跳过。
+            if _job_unreadable(job_info) or not isinstance(jobs, list) or (
+                    first_read and not jobs and not job_info.get("empty", False)):
+                logger.error(f"章节任务点读取失败，保留为未完成: {point['title']}")
+                return ChapterResult.ERROR
+            first_read = False
+
+            job_results = _run_job_batch(chaoxing, course, jobs, job_info, speed, max_workers)
 
             for result in job_results:
                 if result.is_failure():
@@ -202,10 +332,12 @@ def process_chapter(chaoxing: Chaoxing, course: dict, point: dict, speed: float,
 
             # 有章节检测：提交后回读服务端，确认平台真的接受了这次作答。
             # 平台判「不合格/需重新作答」时任务点仍为未通过，必须重新作答而不是草率算完成。
-            pending = _work_still_pending(chaoxing, course, point)
+            # 只回读「本次真的存在 workid」的那几张卡片（拿不到归属信息才全扫）
+            pending = _work_still_pending(chaoxing, course, point, nums=_work_card_nums(jobs, job_info))
             if pending is None:
-                logger.warning(f"未能回读章节检测状态，暂按已完成处理: {point['title']}")
-                return ChapterResult.SUCCESS
+                # 回读不到任务点 -> 无法确认通过，按「未通过」处理（绝不记为已完成）
+                logger.warning(f"未能回读章节检测状态，按未通过处理: {point['title']}")
+                pending = True
             if not pending:
                 logger.info(f"回读确认章节检测已通过: {point['title']}")
                 return ChapterResult.SUCCESS
@@ -224,8 +356,18 @@ def process_chapter(chaoxing: Chaoxing, course: dict, point: dict, speed: float,
             if cancel.wait(min(3.0, 1.0 * reanswer)):
                 raise Cancelled()
     except Cancelled:
+        # 停止信号优先：单独处理，保持「中断整轮」的语义（上层收尾，不重试）
         logger.info(f"收到停止信号，中断章节处理: {point['title']}")
         return ChapterResult.STOPPED
+    except Exception as exc:  # noqa: BLE001
+        # 第二道闸：章节级兜底。单章异常一律记为 ERROR 交给上层重试/跳过，
+        # 绝不能冒到 _run 把整轮刷课结束掉。
+        logger.error(
+            f"章节处理异常（已隔离，不影响其它章节）: {point['title']} "
+            f"-> {type(exc).__name__}: {exc}"
+        )
+        logger.error(traceback.format_exc())
+        return ChapterResult.ERROR
 
 
 # --------------------------------------------------------------------------- #
@@ -382,7 +524,7 @@ class StudyEngine:
         self._not_open: dict[str, set[str]] = {}
         # 运行状态
         self.speed = 2.0
-        self.jobs = 4
+        self.jobs = DEFAULT_JOBS
         self.query_delay = 0
         self.work_retry = DEFAULT_WORK_RETRY   # 单次刷课内章节检测不合格的重新作答次数
         # 视频状态日志间隔（秒，0=关闭）：观看视频时每 N 秒输出章节号/进度百分比等
@@ -661,10 +803,11 @@ class StudyEngine:
         return "pending"
 
     # ---- 启动 / 停止 ----
-    def start_study(self, course_list: list[dict], speed: float = 2.0, jobs: int = 4) -> None:
+    def start_study(self, course_list: list[dict], speed: float = 2.0,
+                    jobs: int = DEFAULT_JOBS) -> None:
         assert self.chaoxing is not None, "请先登录"
         self.speed = min(2.0, max(1.0, speed))
-        self.jobs = max(1, jobs)
+        self.jobs = normalize_jobs(jobs)
         self._stop = False
         self.last_stopped = False
         cancel.clear()          # 清掉上一轮的停止标记，否则新一轮刚开始就中断
@@ -695,12 +838,41 @@ class StudyEngine:
         return bool(self._thread and self._thread.is_alive())
 
     # ---- 主循环 ----
+    def _process_chapter(self, course: dict, point: dict) -> ChapterResult:
+        """单章处理入口（课程级隔离）。
+
+        ``process_chapter`` 自己已兜底，这里再包一层是为了让「某章异常」在任何情况下
+        都只会变成 ERROR/STOPPED —— 异常一旦冒到课程循环，后面的章节就全都不跑了。
+        """
+        try:
+            return process_chapter(self.chaoxing, course, point, self.speed,
+                                   work_retry=self.work_retry, jobs=self.jobs)
+        except Cancelled:
+            return ChapterResult.STOPPED
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                f"章节处理异常（已隔离，继续下一章）: {point.get('title')} "
+                f"-> {type(exc).__name__}: {exc}"
+            )
+            logger.error(traceback.format_exc())
+            return ChapterResult.ERROR
+
     def _run(self, course_list: list[dict]) -> None:
         try:
             for course in course_list:
                 if self._stop:
                     break
-                self._study_course(course)
+                try:
+                    self._study_course(course)
+                except Cancelled:
+                    raise          # 停止信号交给外层统一收尾（FINISHED(stopped=True)）
+                except Exception as exc:  # noqa: BLE001
+                    # 课程级隔离：一门课读章节失败不该让后面选中的课全部不跑
+                    logger.error(
+                        f"课程处理异常（已跳过该课程，其余课程继续）: "
+                        f"{course.get('title')} -> {type(exc).__name__}: {exc}"
+                    )
+                    logger.error(traceback.format_exc())
             if self.current_uid:
                 self.cache.flush(self.current_uid)
             self.last_stopped = bool(self._stop)
@@ -764,8 +936,7 @@ class StudyEngine:
                 self.cache.flush(uid)
                 self._emit(self.PROGRESS, cid, pid, "pending")
 
-            result = process_chapter(self.chaoxing, course, point, self.speed,
-                                     work_retry=self.work_retry)
+            result = self._process_chapter(course, point)
 
             if result == ChapterResult.STOPPED:
                 # 停止信号已打断正在跑的任务点（视频/直播/答题），整轮收尾
@@ -813,8 +984,7 @@ class StudyEngine:
                 if cancel.wait(2):
                     logger.info("收到停止信号，结束当前课程")
                     return
-                r = process_chapter(self.chaoxing, course, point, self.speed,
-                                    work_retry=self.work_retry)
+                r = self._process_chapter(course, point)
                 if r == ChapterResult.STOPPED:
                     return
                 if r == ChapterResult.SUCCESS:
@@ -875,8 +1045,7 @@ class StudyEngine:
                 logger.warning(f"上一章节仍未通过平台校验，继续重答(第 {attempt} 轮): {title}")
             self._set_video_context(prev, i, len(points))
 
-            r = process_chapter(self.chaoxing, course, prev, self.speed,
-                                work_retry=self.work_retry)
+            r = self._process_chapter(course, prev)
 
             if r == ChapterResult.STOPPED:
                 return False
@@ -887,10 +1056,17 @@ class StudyEngine:
                 self._emit(self.PROGRESS, cid, str(prev["id"]), "done")
                 logger.info(f"上一章节重新完成: {title}，检查当前章节是否解锁")
                 # 重新检查当前章节是否已开放，再决定是否继续处理当前章节
+                # 开放与否看第一张卡片就够了（未开放时第 0 张就返回「章节未开放」），
+                # 没必要为一次状态确认把 7 张卡片全打一遍。
                 try:
-                    _, job_info = self.chaoxing.get_job_list(course, points[i])
+                    _, job_info = self.chaoxing.get_job_list(
+                        course, points[i], nums=Chaoxing.CARD_NUMS_FIRST)
                 except Exception:  # noqa: BLE001
                     logger.warning("检查章节开放状态失败，转为轮询当前章节")
+                    job_info = {"notOpen": True}
+                if _job_unreadable(job_info):
+                    # 读不到任务点，无法确认已解锁：按仍未开放处理，继续轮询
+                    logger.warning("检查章节开放状态失败（读不到任务点），转为轮询当前章节")
                     job_info = {"notOpen": True}
                 if not job_info.get("notOpen", False):
                     logger.info(f"当前章节已解锁: {cur_title}")
@@ -933,9 +1109,15 @@ class StudyEngine:
             if cancel.wait(self.poll_interval):   # 可被停止按钮立刻唤醒
                 return False
             try:
-                _, job_info = self.chaoxing.get_job_list(course, points[i])
+                # 轮询只看第一张卡片：原来每 15 秒用 7 个请求确认一个开关状态
+                _, job_info = self.chaoxing.get_job_list(
+                    course, points[i], nums=Chaoxing.CARD_NUMS_FIRST)
             except Exception:  # noqa: BLE001
                 logger.warning("检查章节开放状态失败，稍后重试")
+                continue
+            if _job_unreadable(job_info):
+                # 读不到任务点不等于已开放，继续等
+                logger.warning("检查章节开放状态失败（读不到任务点），稍后重试")
                 continue
             if not job_info.get("notOpen", False):
                 logger.info(f"章节已开放: {title}")

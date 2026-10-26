@@ -19,6 +19,8 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -727,7 +729,7 @@ def test_verify_work_swallows_errors():
 # --------------------------------------------------------------------------- #
 # 9. 端到端：study_work 提交成功后按判分入库
 # --------------------------------------------------------------------------- #
-def _run_study_work(verdict_html: str, bank: lb.LocalBank):
+def _run_study_work(verdict_html: str, bank: lb.LocalBank, tiku=None):
     """跑一遍 study_work：第一次 GET 抓题、第二次 GET 核验判分。"""
     import api.base as base
 
@@ -788,7 +790,7 @@ def _run_study_work(verdict_html: str, bank: lb.LocalBank):
     base.SessionManager.get_session = staticmethod(lambda: session)
     base.decode_questions_info = lambda text: make_questions()
     try:
-        c = base.Chaoxing(account=None, tiku=_Tiku())
+        c = base.Chaoxing(account=None, tiku=tiku or _Tiku())
         result = c.study_work(
             {"courseId": "C", "clazzId": "cz", "title": "高等数学"},
             {"type": "workid", "jobid": "work-1", "enc": "e"},
@@ -917,6 +919,102 @@ def test_study_work_overwrites_wrong_bank_answer():
             "用题库答案答错后应被正确答案覆写"
     finally:
         lb._BANK = old
+
+
+# --------------------------------------------------------------------------- #
+# 10. 并发：课程归属逐次显式传参（不再依赖进程级 set_scope）
+# --------------------------------------------------------------------------- #
+def test_learn_uses_explicit_course_without_scope():
+    """不设作用域也能写对文件：course / course_id 由调用方给出。"""
+    store = _store()
+    assert store.learn([_item()], {"1": True},
+                       course="高等数学", course_id="1001") == 1
+    assert store.learn([_item(qid="2", title="2. 题目二")], {"2": True},
+                       course="大学英语", course_id="1002") == 1
+    rel = sorted(os.path.relpath(c["path"], store.root).replace("\\", "/")
+                 for c in store.stats()["courses"])
+    assert rel == ["1001.json", "1002.json"], rel
+
+
+def test_lookup_priority_uses_explicit_course():
+    """同一道题在两门课里答案不同：按显式传入的课程取对应那份。"""
+    store = _store()
+    store.learn([_item(answer="B")], {"1": True},
+                course="高等数学", course_id="1001")
+    store.learn([_item(answer="A")], {"1": {"ok": False, "answer": "A"}},
+                course="大学英语", course_id="1002")
+    assert store.lookup("题目一", "single", OPTS,
+                        course="高等数学", course_id="1001") == "B"
+    assert store.lookup("题目一", "single", OPTS,
+                        course="大学英语", course_id="1002") == "A"
+
+
+def test_concurrent_learn_writes_each_course_separately():
+    """两门课并发入库：各写各的文件，互不串台（无进程级作用域参与）。"""
+    store = _store()
+    gate = threading.Barrier(2)
+    errors: list = []
+
+    def worker(course: str, course_id: str, tag: str) -> None:
+        try:
+            gate.wait(10)
+            for i in range(8):
+                qid = f"{tag}{i}"
+                store.learn([_item(qid=qid, title=f"{i}. {tag}题目{i}")],
+                            {qid: True}, course=course, course_id=course_id)
+                time.sleep(0.001)          # 拉长重叠窗口，放大竞争概率
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{tag}: {type(exc).__name__}: {exc}")
+
+    threads = [threading.Thread(target=worker, args=args)
+               for args in (("高等数学", "1001", "A"), ("大学英语", "1002", "B"))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+
+    assert not errors, errors
+    assert not any(t.is_alive() for t in threads), "线程未结束"
+    rel = sorted(os.path.relpath(c["path"], store.root).replace("\\", "/")
+                 for c in store.stats()["courses"])
+    assert rel == ["1001.json", "1002.json"], rel
+    for cid, tag, other in (("1001", "A", "B"), ("1002", "B", "A")):
+        with open(os.path.join(store.root, f"{cid}.json"), encoding="utf8") as fh:
+            titles = [str(e.get("q") or "") for e in json.load(fh)["entries"].values()]
+        assert len(titles) == 8, (cid, titles)
+        assert all(tag in t for t in titles), (cid, titles)
+        assert not any(other in t for t in titles), f"{cid} 里混进了别的课程的题：{titles}"
+
+
+def test_study_work_passes_course_to_tiku():
+    """study_work 把课程显式传给题库，且不写进程级作用域。"""
+    bank = _bank()
+    seen: list = []
+
+    class _Recorder:
+        DISABLE = False
+        COVER_RATE = 0.0
+
+        def query(self, q, course="", course_id=""):
+            seen.append((course, course_id))
+            return "B"
+
+        def get_submit_params(self):
+            return ""
+
+        def ensure_available(self):
+            return True
+
+    old = lb._BANK
+    lb._BANK = bank
+    try:
+        _run_study_work('<div class="singleQuesId" data="405717701">'
+                        '<i class="dui"></i></div>', bank, tiku=_Recorder())
+    finally:
+        lb._BANK = old
+
+    assert seen == [("高等数学", "C")], seen
+    assert bank.scope == {"course": "", "course_id": ""}, "不应再写全局作用域"
 
 
 def _main() -> int:

@@ -102,6 +102,38 @@ def _default_cache_file() -> str:
     except Exception:  # noqa: BLE001  api/ 单独使用时退化为当前目录
         return CacheDAO.DEFAULT_CACHE_FILE
 
+
+# --------------------------------------------------------------------------- #
+# 缓存文件锁：同一进程内按「缓存文件真实路径」共享一把 RLock
+#
+# 之前 CacheDAO.__init__ 里是 self._lock = threading.RLock()，实例级：
+# Tiku.query 每次查询 new 一个 CacheDAO()，任务点线程池（最多 5 线程）各拿各的锁，
+# 互斥根本不成立；add_cache 是 read-modify-write，原子 replace 只保证文件不损坏，
+# 挡不住「两个线程读到同一份旧内容、后写的覆盖先写的」→ 丢更新。
+# 改成模块级锁表后，指向同一个 cache.json 的所有实例共用一把锁；
+# 不同路径（单测里的临时文件）仍各用各的锁，互不阻塞。
+# 用 RLock：add_cache/remove_cache 已持锁再进 _read_cache/_write_cache 需要可重入。
+# --------------------------------------------------------------------------- #
+_CACHE_LOCKS: "dict[str, threading.RLock]" = {}
+_CACHE_LOCKS_GUARD = threading.Lock()
+
+
+def _cache_lock_for(file) -> "threading.RLock":
+    """取缓存文件对应的共享锁（同文件同锁；路径按 abspath+normcase 归一化）。"""
+    try:
+        key = os.path.normcase(os.path.abspath(str(file)))
+    except Exception:  # noqa: BLE001 - 路径异常时退化为字符串，不至于崩在拿锁上
+        key = str(file)
+    lock = _CACHE_LOCKS.get(key)
+    if lock is None:
+        with _CACHE_LOCKS_GUARD:
+            lock = _CACHE_LOCKS.get(key)
+            if lock is None:
+                lock = threading.RLock()
+                _CACHE_LOCKS[key] = lock
+    return lock
+
+
 class CacheDAO:
     """
     @Author: SocialSisterYi
@@ -111,7 +143,9 @@ class CacheDAO:
 
     def __init__(self, file: Optional[str] = None):
         self.cache_file = Path(file or _default_cache_file())
-        self._lock = threading.RLock()
+        # 不是实例级锁：同一缓存文件的所有实例共享 _cache_lock_for() 返回的锁，
+        # 否则多线程并发 add_cache 的 read-modify-write 会丢更新。
+        self._lock = _cache_lock_for(self.cache_file)
         if not self.cache_file.is_file():
             self._write_cache({})
 
@@ -205,11 +239,23 @@ class CacheDAO:
         return data.get(question)
 
     def add_cache(self, question: str, answer: str) -> None:
-        # 为缓存写入加锁，防止并发写入损坏文件
+        # 为「读取-修改-回写」整段加锁（锁按缓存文件共享）：
+        # 原子 replace 只保证文件不损坏，不保证不丢更新——
+        # 两个线程同时读到旧内容时，后写的一份会整块覆盖掉先写的那题。
         with self._lock:
             data = self._read_cache()
             data[question] = answer
             self._write_cache(data)
+
+    def remove_cache(self, question: str) -> bool:
+        """删掉某题的缓存答案（平台判错后作废，避免重答时复用同一个错答案）。"""
+        with self._lock:
+            data = self._read_cache()
+            if question not in data:
+                return False
+            data.pop(question, None)
+            self._write_cache(data)
+            return True
 
 
 # TODO: 重构此部分代码，将此类改为抽象类，加载题库方法改为静态方法，禁止直接初始化此类
@@ -313,7 +359,7 @@ class Tiku:
             self.DISABLE = True
             return None
         
-    def query(self,q_info:dict) -> Optional[str]:
+    def query(self, q_info: dict, course: str = "", course_id: str = "") -> Optional[str]:
         # 预处理, 去除【单选题】这样与标题无关的字段
         # （本地题库的指纹用同一套处理后标题，所以必须放在最前面）
         logger.debug(f"原始标题：{q_info['title']}")
@@ -327,7 +373,8 @@ class Tiku:
             return None
 
         # 本地题库优先：只存平台判过对的答案，命中即用，不消耗任何远程额度
-        local_answer = self._query_local_bank(q_info)
+        # course / course_id 由调用方显式传入（并发安全，不读进程级作用域）
+        local_answer = self._query_local_bank(q_info, course, course_id)
         if local_answer:
             return local_answer
 
@@ -366,14 +413,20 @@ class Tiku:
         self._record_failure()
         return None
 
-    def _query_local_bank(self, q_info: dict) -> Optional[str]:
-        """查本地题库（平台判过对的答案）。关闭 / 未命中 / 异常都返回 None。"""
+    def _query_local_bank(self, q_info: dict, course: str = "",
+                          course_id: str = "") -> Optional[str]:
+        """查本地题库（平台判过对的答案）。关闭 / 未命中 / 异常都返回 None。
+
+        ``course`` / ``course_id`` 决定「先查哪个课程文件」，由调用方显式给出；
+        留空时题库退回兼容作用域（见 :meth:`BankStore.set_scope`）。
+        """
         try:
             bank = local_bank.get_bank()
             if not bank.usable:
                 return None
             return bank.lookup(q_info.get('title', ''), q_info.get('type', ''),
-                               q_info.get('options', ''))
+                               q_info.get('options', ''),
+                               course=course, course_id=course_id)
         except Exception as exc:  # noqa: BLE001 - 本地题库异常不能影响正常搜题
             logger.error(f"本地题库查询异常：{type(exc).__name__}: {exc}")
             return None
