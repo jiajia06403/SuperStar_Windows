@@ -556,7 +556,7 @@ class SettingsDialog(tk.Toplevel):
     # [common] 段：视频学习 + 并发相关的键（观看进度要求 / 状态日志间隔 / 章内任务点并发）
     RUN_FIELDS = (
         ("point_jobs", "任务点并发（同一章节内同时刷几个任务点，1~8；1 = 章内串行最稳）", "text"),
-        ("video_finish_percent", "观看进度要求(%)，达到即判定完成（90~100，100 = 必须看完）", "text"),
+        ("video_finish_percent", "观看进度要求(%)，到达后每 5 秒复查（90~100，100 = 看完才查）", "text"),
         ("video_log_interval", "视频状态日志间隔(秒，0 = 不输出)", "text"),
     )
     RUN_DEFAULTS = {"point_jobs": "1", "video_finish_percent": "90", "video_log_interval": "10"}
@@ -688,7 +688,8 @@ class SettingsDialog(tk.Toplevel):
         ttk.Label(
             self.run_frame,
             text="任务点并发 = 单个章节内同时刷几个任务点（界面「并发章节」管的是同时刷几章，两者相乘是总并发）；\n"
-                 "观看进度要求 = 播到该百分比即判定任务点完成，不必看完；填 100 恢复「必须全部看完」；\n"
+                 "观看进度要求 = 播到该百分比后每 5 秒复查一次；平台仍未认可就继续看，不会中断，"
+                 "直到通过或看完（100 = 从结尾开始复查）；\n"
                  "状态日志按间隔在日志输出：章节号 / 视频名 / 进度百分比 / 预计剩余。",
             style="Status.TLabel", justify="left",
         ).grid(row=len(self.RUN_FIELDS), column=0, columnspan=2, sticky="w", pady=(2, 0))
@@ -1927,8 +1928,8 @@ class App:
             interval = self.engine.video_log_interval
             log_mode = ("视频状态日志已关闭" if interval <= 0
                         else f"视频状态日志：每 {interval:g} 秒一条")
-            require = ("观看进度要求 100%（必须看完）" if percent >= 100
-                       else f"观看进度要求 {percent:g}%（达标即判定完成）")
+            require = ("观看进度要求 100%（看完后每 5 秒复查）" if percent >= 100
+                       else f"观看进度要求 {percent:g}%（到达后每 5 秒复查，未通过继续看）")
             self.log(f"【设置】{require}；{log_mode}；"
                      f"任务点并发 {self.engine.point_jobs}（章节内）")
         except Exception as exc:  # noqa: BLE001

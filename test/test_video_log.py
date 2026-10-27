@@ -5,8 +5,9 @@
 覆盖：
   - 状态行内容：章节号 / 章节名 / 进度百分比 / 已播时长 / 倍速 / 预计剩余；
   - study_video 按间隔输出（真实时间计时，倍速下仍按秒数间隔）；
-  - 引擎把 [common] 的间隔与当前章节上下文推给后端；
-  - [common] video_log_interval 的取值校验。
+  - 观看进度要求（video_finish_percent）：达标即判定完成、100% 保留旧的「必须看完」；
+  - 引擎把 [common] 的间隔/进度要求与当前章节上下文推给后端；
+  - [common] video_log_interval / video_finish_percent 的取值校验。
 """
 import io
 import os
@@ -102,6 +103,7 @@ def test_study_video_emits_status_by_interval():
     try:
         with mock.patch.object(base.SessionManager, "get_session",
                                classmethod(lambda cls: _Session(duration=2))), \
+             mock.patch.object(base, "VIDEO_FINISH_RECHECK_SECONDS", 0.2), \
              mock.patch.object(Chaoxing, "video_progress_log", fake_log), \
              mock.patch.object(base, "_progress_stream", lambda: io.StringIO()):
             result = ch.study_video(
@@ -193,6 +195,7 @@ def test_study_video_silent_when_disabled():
     try:
         with mock.patch.object(base.SessionManager, "get_session",
                                classmethod(lambda cls: _Session(duration=1))), \
+             mock.patch.object(base, "VIDEO_FINISH_RECHECK_SECONDS", 0.2), \
              mock.patch.object(Chaoxing, "video_progress_log", fake_log), \
              mock.patch.object(base, "_progress_stream", lambda: io.StringIO()):
             ch.study_video({"courseId": "c"}, {"objectid": "o", "name": "v", "playTime": "0"}, {})
@@ -254,6 +257,109 @@ def test_study_video_normalizes_millis_playtime():
 
 
 # --------------------------------------------------------------------------- #
+# 观看进度要求（video_finish_percent）
+# --------------------------------------------------------------------------- #
+def test_finish_percent_normalize_and_target():
+    """百分比收敛到 90~100 + 达标秒数换算：越界收敛到边界，脏数据回默认。"""
+    assert base.normalize_finish_percent("90") == 90
+    assert base.normalize_finish_percent(90) == 90
+    assert base.normalize_finish_percent("95") == 95
+    assert base.normalize_finish_percent(100) == 100
+    assert base.normalize_finish_percent("") == base.DEFAULT_VIDEO_FINISH_PERCENT
+    assert base.normalize_finish_percent(None) == base.DEFAULT_VIDEO_FINISH_PERCENT
+    assert base.normalize_finish_percent("abc") == base.DEFAULT_VIDEO_FINISH_PERCENT
+    assert base.normalize_finish_percent("0") == 90             # 下界收敛（不允许「不看也过」）
+    assert base.normalize_finish_percent("-10") == 90
+    assert base.normalize_finish_percent("180") == 100          # 上界收敛（= 必须看完）
+
+    assert base._video_finish_target(600, 90) == 540
+    assert base._video_finish_target(600, 100) == 600           # 100% = 旧行为
+    assert base._video_finish_target(600, 95) == 570
+    assert base._video_finish_target(600, 0) == 540             # 越界按 90%
+    assert base._video_finish_target(3, 90) == 3                # 短时长四舍五入
+    assert base._video_finish_target(0, 90) == 0                # 时长未知
+    assert base._video_finish_target(600, 300) == 600           # 越界按 100%
+
+
+def test_study_video_keeps_watching_when_platform_not_convinced():
+    """达标（90%）后平台仍判未通过时**不得中断观看**：继续看，5 秒复查一次，直到看完或通过。"""
+    ch = Chaoxing()
+    ch.video_log_interval = 0
+    ch.video_finish_percent = 90
+
+    seen = []
+    calls = {"n": 0}
+
+    def fake_log(_self, session, course, job, job_info, dtoken, duration,
+                 play_time, _type, headers=None):
+        calls["n"] += 1
+        seen.append(play_time)
+        # 开播那条「满时长」上报不算数；要看到结尾后再报一次才判通过
+        return calls["n"] >= 3 and play_time >= duration, 200
+
+    lines: "list[str]" = []
+    sink = logger.add(lines.append, level="INFO", format="{message}")
+    try:
+        with mock.patch.object(base.SessionManager, "get_session",
+                               classmethod(lambda cls: _Session(duration=1000))), \
+             mock.patch.object(base, "VIDEO_FINISH_RECHECK_SECONDS", 0.2), \
+             mock.patch.object(Chaoxing, "video_progress_log", fake_log), \
+             mock.patch.object(base, "_progress_stream", lambda: io.StringIO()):
+            result = ch.study_video({"courseId": "c"},
+                                    {"objectid": "o", "name": "v", "playTime": "0"},
+                                    {}, _speed=910.0)
+    finally:
+        logger.remove(sink)
+
+    assert result == StudyResult.SUCCESS, result
+    assert any("观看进度要求: 90%" in line for line in lines), lines
+    # 达标点（≥900s）上报过一次，但**没有**就此收工
+    assert any(900 <= play_time < 1000 for play_time in seen), seen
+    assert seen[-1] >= 1000, f"达标后应继续看到结尾，实际上报位置 {seen}"
+    assert len(seen) >= 3, f"达标后应继续复查，实际只上报了 {seen}"
+    assert any("观看比例已达 90%" in line and "继续观看" in line for line in lines), lines
+
+
+def test_recheck_interval_is_five_seconds():
+    """复查间隔就是需求里的「再多看 5 秒」（真实秒），改这个常量即改变节奏。"""
+    assert base.VIDEO_FINISH_RECHECK_SECONDS == 5.0
+
+
+def test_study_video_percent_100_keeps_old_behavior():
+    """percent=100 时保持旧行为：播到结尾后要继续上报，直到平台返回已通过。"""
+    ch = Chaoxing()
+    ch.video_log_interval = 0
+    ch.video_finish_percent = 100
+
+    seen = []
+
+    def fake_log(_self, session, course, job, job_info, dtoken, duration,
+                 play_time, _type, headers=None):
+        seen.append(play_time)
+        return len(seen) >= 3, 200        # 结尾要报 3 次才通过
+
+    with mock.patch.object(base.SessionManager, "get_session",
+                           classmethod(lambda cls: _Session(duration=10))), \
+         mock.patch.object(base, "VIDEO_FINISH_RECHECK_SECONDS", 0.2), \
+         mock.patch.object(Chaoxing, "video_progress_log", fake_log), \
+         mock.patch.object(base, "_progress_stream", lambda: io.StringIO()):
+        result = ch.study_video({"courseId": "c"},
+                                {"objectid": "o", "name": "v", "playTime": "0"},
+                                {}, _speed=50.0)
+
+    assert result == StudyResult.SUCCESS, result
+    assert len(seen) == 3, f"100% 时应在结尾重复上报，实际 {seen}"
+    assert all(play_time == 10 for play_time in seen), seen
+
+
+def test_default_percent_matches_packaged_config():
+    """代码里的默认百分比必须与随包 config_win.ini 一致（防止两处漂移）。"""
+    packaged = config_store.load_default().get("common", "video_finish_percent", fallback="")
+    assert packaged.strip() == str(int(base.DEFAULT_VIDEO_FINISH_PERCENT)), packaged
+    assert int(packaged) == 90, "产品默认值应为 90%"
+
+
+# --------------------------------------------------------------------------- #
 # 引擎：配置推送 + 章节上下文
 # --------------------------------------------------------------------------- #
 def test_engine_pushes_interval_and_context():
@@ -261,8 +367,15 @@ def test_engine_pushes_interval_and_context():
     eng.chaoxing = _FakeBackend()
 
     eng.video_log_interval = 12
-    eng._push_video_log()
+    eng.video_finish_percent = 95
+    eng._push_video_config()
     assert eng.chaoxing.video_log_interval == 12
+    assert eng.chaoxing.video_finish_percent == 95
+
+    # 越界值推给后端前先收敛到 90~100
+    eng.video_finish_percent = 50
+    eng._push_video_config()
+    assert eng.chaoxing.video_finish_percent == 90
 
     eng._set_video_context({"id": "p3", "title": "第三章 中值定理"}, 3, 9)
     assert eng.chaoxing.video_context == {
@@ -277,6 +390,21 @@ def test_engine_reads_interval_from_config():
     assert config_store._invalid("common", "video_log_interval", "60") is False
     assert config_store._invalid("common", "video_log_interval", "") is False
 
+    # 观看进度百分比：90~100 的整数合法，越界/非整数/非数字非法（迁移时回落默认 90）
+    assert config_store._invalid("common", "video_finish_percent", "90") is False
+    assert config_store._invalid("common", "video_finish_percent", "95") is False
+    assert config_store._invalid("common", "video_finish_percent", "100") is False
+    assert config_store._invalid("common", "video_finish_percent", "") is False
+    assert config_store._invalid("common", "video_finish_percent", "89") is True
+    assert config_store._invalid("common", "video_finish_percent", "101") is True
+    assert config_store._invalid("common", "video_finish_percent", "-1") is True
+    assert config_store._invalid("common", "video_finish_percent", "abc") is True
+    assert config_store._invalid("common", "video_finish_percent", "99.5") is True
+
+    # 引擎读配置：结果恒在 90~100 之间（脏配置也不会低于下限）
+    from engine import video_finish_percent_from_config
+    assert 90 <= video_finish_percent_from_config() <= 100
+
 
 if __name__ == "__main__":
     cases = [
@@ -287,6 +415,11 @@ if __name__ == "__main__":
         test_study_video_normalizes_millis_playtime,
         test_study_video_silent_when_disabled,
         test_study_video_reports_progress_once,
+        test_finish_percent_normalize_and_target,
+        test_study_video_keeps_watching_when_platform_not_convinced,
+        test_recheck_interval_is_five_seconds,
+        test_study_video_percent_100_keeps_old_behavior,
+        test_default_percent_matches_packaged_config,
         test_engine_pushes_interval_and_context,
         test_engine_reads_interval_from_config,
     ]

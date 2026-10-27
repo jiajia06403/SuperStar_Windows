@@ -168,13 +168,20 @@ def _normalize_play_time(raw, duration) -> int:
     return 0
 
 
-# 视频任务点「观看进度要求」：达到该比例即判定任务点完成，不必看完。
+# 视频任务点「观看进度要求」：播到该比例后开始「复查」——
+# 平台此时若仍未判通过，就继续再看 VIDEO_FINISH_RECHECK_SECONDS 秒再上报，
+# 如此循环直到平台判通过（isPassed）或整段看完，绝不因为「比例到了」而中断观看。
 # 取值范围限定 90~100（低于 90 没有意义且容易被手改成「不看也过」）；
-# 100 = 旧行为（必须播到结尾，并且要等平台返回 isPassed）。
+# 100 = 旧行为（从结尾开始复查）。
 # 由引擎按 [common] video_finish_percent 写入 self.video_finish_percent。
 DEFAULT_VIDEO_FINISH_PERCENT = 90
 MIN_VIDEO_FINISH_PERCENT = 90
 MAX_VIDEO_FINISH_PERCENT = 100
+
+# 到达观看比例后平台仍未判通过时的复查间隔（**真实秒**）。
+# 含义：不中断观看，继续再看 5 秒再上报一次，如此循环，直到平台判通过或整段看完。
+# 用真实时间而不是播放位置：倍速下「看 5 秒」才符合用户直觉。
+VIDEO_FINISH_RECHECK_SECONDS = 5.0
 
 
 def _clamp_finish_percent(value: float) -> float:
@@ -463,8 +470,8 @@ class Chaoxing:
         # 视频状态日志：每 N 秒在日志输出一条「章节号 + 进度百分比 + 预计剩余」，0 = 关闭。
         # 由引擎按配置（config_win.ini [common] video_log_interval）写入。
         self.video_log_interval: float = 0
-        # 视频任务点的「观看进度要求」（90~100，默认 90）：播到该比例即判定任务点完成，
-        # 不必看完；100 = 旧行为（必须看完且等平台返回已通过）。
+        # 视频任务点的「观看进度要求」（90~100，默认 90）：播到该比例后开始每 5 秒
+        # 复查一次；平台未判通过就继续看，直到通过或看完。100 = 旧行为（从结尾开始复查）。
         # 由引擎按配置（config_win.ini [common] video_finish_percent）写入。
         self.video_finish_percent: float = float(DEFAULT_VIDEO_FINISH_PERCENT)
         # 当前章节上下文（引擎在进入章节前写入）：章节序号/总数/名称，供视频日志显示。
@@ -996,9 +1003,10 @@ class Chaoxing:
 
         logger.info(f"开始任务: {_job['name']}, 总时长: {duration}s, 已进行: {play_time}s")
 
-        # 观看进度要求：达到 target_time 即判定任务点完成（默认 90%）。
-        # target_time >= duration 说明用户要的是「全部看完」，走原有逻辑：
-        # 播到结尾后继续上报，直到平台返回 isPassed（结尾那几次上报常常要多发几遍）。
+        # 观看进度要求：播到 finish_percent（默认 90%）后进入「复查」阶段 ——
+        # 平台若此时仍未判通过，**绝不中断观看**：继续再看 VIDEO_FINISH_RECHECK_SECONDS 秒
+        # 再上报一次，如此循环，直到平台返回 isPassed（任务完成）或整段看完。
+        # 100% 时目标点就是结尾，效果等同旧行为（结尾反复上报直到通过）。
         finish_percent = normalize_finish_percent(
             getattr(self, "video_finish_percent", DEFAULT_VIDEO_FINISH_PERCENT))
         target_time = _video_finish_target(duration, finish_percent)
@@ -1007,8 +1015,9 @@ class Chaoxing:
             logger.debug("观看进度要求：{}%（需完整看完）", f"{finish_percent:g}")
         else:
             logger.info(
-                "观看进度要求: {:g}%，即看到 {}s（总时长 {}s）即判定该任务点完成",
-                finish_percent, target_time, duration,
+                "观看进度要求: {:g}%，即看到 {}s（总时长 {}s）后开始复查；"
+                "平台未判通过就继续观看并每 {:g} 秒复查一次",
+                finish_percent, target_time, duration, VIDEO_FINISH_RECHECK_SECONDS,
             )
 
         pbar = tqdm(total=duration, initial=play_time, desc=_job["name"],
@@ -1042,14 +1051,23 @@ class Chaoxing:
             if status_interval > 0:      # 开播先报一条，立刻能看到章节归属与续播进度
                 self._log_video_status(_job, play_time, duration, _speed)
 
+            # 达标复查状态：达标点只提示一次；达标后每 5 秒复查一次，直到通过或看完
+            target_reported = False
+            end_reported = False
+            next_recheck = 0.0
+
             while not passed:
                 # 停止按钮必须能中断视频循环：一个视频动辄几十分钟，
                 # 只在章节边界检查会让界面长时间卡在「停止中」。
                 cancel.check()
+                # 上报时机三选一：常规周期（wait_time）｜达标点必报一次｜达标后每 5 秒复查。
                 # Sometimes the last request needs to be sent several times to complete the task
-                # play_time >= target_time：到点（含「播到结尾」）必须上报一次，
-                # 让平台记下最终位置，再按比例规则判定。
-                if play_time - last_log_time >= wait_time or play_time >= target_time:
+                due = play_time - last_log_time >= wait_time
+                if not due and not target_reported and play_time >= target_time:
+                    due = True
+                if not due and next_recheck and time.time() >= next_recheck:
+                    due = True
+                if due:
 
                     passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration,
                                                             int(play_time), _type, headers=headers)
@@ -1079,19 +1097,29 @@ class Chaoxing:
                     elif not passed and state != 200:
                         return StudyResult.ERROR
 
-                    # 观看比例已达标（且不是「必须看完」）：按本地规则判定任务点完成。
-                    # 服务端 isPassed 要等它自己的规则满足，这里不再无限等下去 ——
-                    # 这正是「达到百分比即可完成，无需全部看完」的落点。
-                    # finish_full 时走原逻辑：继续上报直到平台返回已通过。
-                    if not passed and not finish_full and play_time >= target_time:
-                        logger.info(
-                            "观看比例已达 {:g}%（{}/{}s ≥ {}s），按设定判定任务点完成: {}",
-                            finish_percent, int(play_time), duration, target_time, _job["name"],
+                    # 已看完仍不通过：提示一次，之后继续按复查间隔上报
+                    # （平台偶尔要在结尾多收几次进度才认，不能在这里中断观看）
+                    if not passed and play_time >= duration and not end_reported:
+                        end_reported = True
+                        logger.warning(
+                            "已完整看完仍未判定通过，继续每 {:g} 秒复查一次: {}",
+                            VIDEO_FINISH_RECHECK_SECONDS, _job["name"],
                         )
-                        return StudyResult.SUCCESS
 
-
-
+                    # 到达设定比例（默认 90%）：不中断观看，改成 5 秒一次的复查节奏。
+                    # 平台若接受（isPassed=true）循环自然结束；不接受就继续看，直到看完。
+                    if play_time >= target_time:
+                        first_hit = not target_reported
+                        target_reported = True
+                        if not passed:
+                            next_recheck = time.time() + max(0.0, VIDEO_FINISH_RECHECK_SECONDS)
+                            if first_hit and play_time < duration:
+                                logger.info(
+                                    "观看比例已达 {:g}%（{}/{}s），平台尚未判定完成，"
+                                    "继续观看并每 {:g} 秒复查一次: {}",
+                                    finish_percent, int(play_time), duration,
+                                    VIDEO_FINISH_RECHECK_SECONDS, _job["name"],
+                                )
 
                     wait_time = int(random.uniform(30, 90))
                     last_log_time = play_time

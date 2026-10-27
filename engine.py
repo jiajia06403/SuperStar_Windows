@@ -146,8 +146,8 @@ def video_finish_percent_from_config(
         default: float = DEFAULT_VIDEO_FINISH_PERCENT) -> float:
     """读取 [common] video_finish_percent（90~100，默认 90）；缺省/非法回落 default。
 
-    语义：观看进度达到该百分比即判定视频任务点完成，不必看完；
-    100 = 恢复旧的「必须全部看完」（且要等平台返回已通过）。
+    语义：播到该百分比后开始「复查」（每 5 秒一次）；平台未判通过就继续观看，
+    直到通过或整段看完。100 = 恢复旧的「从结尾开始复查」。
     """
     try:
         from config_store import load_section
@@ -683,7 +683,8 @@ class StudyEngine:
         self.reanswer_rounds = DEFAULT_REANSWER_ROUNDS
         # 视频状态日志间隔（秒，0=关闭）：观看视频时每 N 秒输出章节号/进度百分比等
         self.video_log_interval = video_log_interval_from_config()
-        # 观看进度要求（90~100）：达到该比例即判定视频任务点完成（100 = 必须全部看完）
+        # 观看进度要求（90~100）：播到该比例后每 5 秒复查一次，未通过就继续看
+        # （100 = 旧行为，从结尾开始复查）
         self.video_finish_percent = video_finish_percent_from_config()
 
     # ---- 事件订阅 ----
