@@ -33,7 +33,7 @@ SuperStar Windows 引擎
 
   5. **并发**：课程之间仍然串行；并发发生在「单门课程内部」：
        - ``jobs``（界面「并发章节」）= 同时进行几个章节，默认 1；
-       - ``point_jobs``（设置里的「任务点并发」）= 单章内同时刷几个任务点，默认 1；
+       - ``point_jobs``（设置里的「任务点并发」）= 单章内同时刷几个任务点，默认 5（对齐安卓版 jobs=5）；
        - **遇到「章节未开放」立即把本章之后的处理降为串行（jobs=1）**：
          未开放意味着解锁顺序被打断，再并发推进只会乱序抢进度，因此收束回
          逐章串行、沿用回退重做上一章 / 轮询解锁的既有语义。
@@ -98,9 +98,10 @@ MAX_JOBS = 8
 DEFAULT_CHAPTER_JOBS = 1
 MAX_CHAPTER_JOBS = MAX_JOBS
 
-# 单章内任务点并发（设置里「任务点并发」）：默认 1 = 章内串行。
-# 与章节并发是乘法关系，默认都为 1，避免一次开几十路请求撞风控。
-DEFAULT_POINT_JOBS = 1
+# 单章内任务点并发（设置里「任务点并发」）：默认 5，对齐 SuperStar 安卓版（jobs=5）。
+# 安卓版用 5 路章内并发已验证稳定；配合每线程独立限速（api.base.RateLimiter 已改为
+# threading.local），5 路任务点真正并行、互不阻塞。章节并发仍默认 1（最稳）。
+DEFAULT_POINT_JOBS = 5
 MAX_POINT_JOBS = 8
 
 
@@ -381,16 +382,16 @@ def _run_job_batch(chaoxing: Chaoxing, course: dict, jobs: list[dict], job_info:
 
 def process_chapter(chaoxing: Chaoxing, course: dict, point: dict, speed: float,
                     work_retry: int = DEFAULT_WORK_RETRY,
-                    jobs: int = DEFAULT_JOBS) -> ChapterResult:
+                    jobs: int = DEFAULT_POINT_JOBS) -> ChapterResult:
     """处理单个章节，返回 ChapterResult。
 
     ``work_retry``：章节检测提交后回读发现「仍未通过」时允许的重新作答次数。
     平台判分不合格（需要重新作答）时不会再被当作已完成。
 
     ``jobs``：本章内任务点的并发上限（1 = 串行）。由 ``StudyEngine.point_jobs``
-    透传（「设置 → 视频学习 → 任务点并发」，默认 1）；取值范围收敛见
-    :func:`normalize_point_jobs`。章节级的并发在 :meth:`StudyEngine._study_course`
-    里做，不在本函数。
+    透传（「设置 → 视频学习 → 任务点并发」，默认 5，对齐 SuperStar 安卓版 jobs=5）；
+    取值范围收敛见 :func:`normalize_point_jobs`。章节级的并发在
+    :meth:`StudyEngine._study_course` 里做，不在本函数。
 
     并发安全性（8 并发评估，2026-10）：
       - ~~``api.local_bank.set_scope()`` 进程级全局作用域~~ **已移除**：课程归属改成
@@ -406,9 +407,13 @@ def process_chapter(chaoxing: Chaoxing, course: dict, point: dict, speed: float,
       - ``local_bank`` 自身读写走模块级 ``_LOCK``，并发安全。
       - 结论：1~8 并发均可安全使用，未发现会破坏刷课正确性的共享状态竞争。
     """
-    logger.info(f'当前章节: {point["title"]}')
+    # 章节标题已在界面的章节树里标「进行中」，这里不再用 INFO 刷一遍（冗长且重复）；
+    # 只在文件日志里保留 DEBUG，方便排查。
+    logger.debug(f'当前章节: {point["title"]}')
     if point.get("has_finished"):
-        logger.info(f'章节：{point["title"]} 已完成所有任务点')
+        # 该分支正常运行时由串行/并发调度方先行判定（已记「章节已完成」），这里只兜底；
+        # 同样降为 DEBUG，避免和调度方的「章节已完成」重复刷屏。
+        logger.debug(f'章节：{point["title"]} 已完成所有任务点')
         return ChapterResult.SUCCESS
 
     try:
@@ -449,7 +454,23 @@ def process_chapter(chaoxing: Chaoxing, course: dict, point: dict, speed: float,
                 return ChapterResult.ERROR
             first_read = False
 
+            # 本章 workid 任务点的 jobid：并发跑时按 jobid 隔离统计，先清掉上轮残留
+            # （不同章节 workid 不同，互不影响；章节并发也不串台）。
+            workids = [j.get("jobid") for j in jobs
+                       if isinstance(j, dict) and j.get("type") == "workid"]
+            # getattr 守卫：真实 Chaoxing 有按 jobid 隔离的统计方法；测试桩没有时跳过
+            # （桩自行直接设置 last_answer_stats 等实例字段，无需合并）。
+            _clear = getattr(chaoxing, "clear_work_stats", None)
+            if _clear:
+                _clear(workids)
+
             job_results = _run_job_batch(chaoxing, course, jobs, job_info, speed, max_workers)
+
+            # 批次结束（worker 线程已 join）：把各 workid 的统计合并回实例字段，
+            # 供下面的 REFUSED / found==0 / 判分进展判断读取（无并发竞争）。
+            _merge = getattr(chaoxing, "merge_work_stats", None)
+            if _merge:
+                _merge(workids)
 
             # 平台拒绝重答（重做次数用尽）是终局：先于普通失败判断，否则会被
             # 当成可重试的 ERROR，进而回退重答 / 等下一章解锁 —— 那是死循环。

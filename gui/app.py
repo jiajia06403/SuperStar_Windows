@@ -84,6 +84,19 @@ def _panel_filter(record) -> bool:
     return not any(key in message for key in LOG_PANEL_HIDE)
 
 
+# 章节并发 worker 线程命名约定（engine._study_course_parallel）：
+# 并发序号 = 线程名 ``chapter-{k+1}`` 里的数字。界面据此给该线程产生的日志打上
+# 「并发#N」标记，便于在并发 >1 时区分不同章节的日志流；串行 / 主线程（无名或
+# 非 chapter-*）不产生该前缀。
+_CHAPTER_THREAD = re.compile(r"^chapter-(\d+)$")
+
+
+def _slot_of_thread(thread_name: str) -> "int | None":
+    """从线程名解析并发序号；非并发 worker 返回 None。"""
+    m = _CHAPTER_THREAD.match(thread_name or "")
+    return int(m.group(1)) if m else None
+
+
 # --------------------------------------------------------------------------- #
 # 环境准备
 # --------------------------------------------------------------------------- #
@@ -681,11 +694,11 @@ class SettingsDialog(tk.Toplevel):
     )
     # [common] 段：视频学习 + 并发相关的键（观看进度要求 / 状态日志间隔 / 章内任务点并发）
     RUN_FIELDS = (
-        ("point_jobs", "任务点并发（同一章节内同时刷几个任务点，1~8；1 = 章内串行最稳）", "text"),
+        ("point_jobs", "任务点并发（同一章节内同时刷几个任务点，1~8；默认 5，对齐安卓版 jobs=5）", "text"),
         ("video_finish_percent", "观看进度要求(%)，到达后每 5 秒复查（90~100）", "text"),
         ("video_log_interval", "视频状态日志间隔(秒，0 = 不输出)", "text"),
     )
-    RUN_DEFAULTS = {"point_jobs": "1", "video_finish_percent": "90", "video_log_interval": "10"}
+    RUN_DEFAULTS = {"point_jobs": "5", "video_finish_percent": "90", "video_log_interval": "10"}
     PROVIDER_FIELDS = {
         "TikuYanxi": (
             ("tokens", "言溪 TOKEN（多个用英文逗号分隔）", "secret"),
@@ -1512,9 +1525,19 @@ class App:
 
     def _install_log_sink(self) -> None:
         self._log_sink_id = logger.add(
-            lambda m: self.events.put(("log", m.strip())),
-            level="INFO", format="{message}", enqueue=True, filter=_panel_filter,
+            self._log_sink, level="INFO", format="{message}", enqueue=True, filter=_panel_filter,
         )
+
+    def _log_sink(self, m) -> None:
+        """GUI 日志面板 sink：把每条日志连同「并发序号」送进事件队列。
+
+        ``m`` 是 loguru 的 Message 对象，``m.record`` 仍携带线程名等信息。
+        并发序号来自线程名（``chapter-N``）；非并发 worker 线程（主线程 / 串行刷课）
+        slot 为 ``None``，界面不加标记。
+        """
+        record = m.record
+        slot = _slot_of_thread(record["thread"].name)
+        self.events.put(("log", record["message"], slot))
 
     def _pump(self) -> None:
         """主线程消费引擎事件队列。"""
@@ -1913,6 +1936,8 @@ class App:
         self.log_text.configure(yscrollcommand=bar.set, xscrollcommand=xbar.set)
         self.log_text.tag_configure("warn", foreground="#ef6c00")
         self.log_text.tag_configure("error", foreground="#c62828")
+        # 「并发#N」前缀默认色（浅色主题强调色），深色调由 _on_theme_changed 覆盖
+        self.log_text.tag_configure("slot", foreground="#0f6cbd")
         return box
 
     # ---------------- 主题 ----------------
@@ -1936,12 +1961,17 @@ class App:
             selectbackground=p["select"], selectforeground=p["select_text"])
         for tag in ("warn", "error"):
             self.log_text.tag_configure(tag, foreground=p[tag])
+        # 「并发#N」前缀：用主题强调色，和正文（text）区分开
+        self.log_text.tag_configure("slot", foreground=p["accent"])
 
     # ---------------- 通用 UI 动作 ----------------
-    def log(self, message: str) -> None:
+    def log(self, message: str, slot: "int | None" = None) -> None:
         tag = "error" if ("ERROR" in message or "失败" in message) else (
             "warn" if ("WARNING" in message or "警告" in message) else "")
         self.log_text.configure(state="normal")
+        if slot is not None:
+            # 「并发#N」用主题强调色单独着色，一眼区分不同并发章节的日志流
+            self.log_text.insert("end", f"【并发#{slot}】", "slot")
         self.log_text.insert("end", message + "\n", tag)
         lines = int(self.log_text.index("end-1c").split(".")[0])
         if lines > MAX_LOG_LINES:
@@ -2703,6 +2733,14 @@ class App:
             message = str(event.get("message") or "")
             if message:
                 self.events.put(("log", message))
+            if event.get("kind") == "progress":
+                done, total = int(event.get("done") or 0), int(event.get("total") or 0)
+                if not total:
+                    return
+                # 章节级进度 message 是章节名；作业级进度 message 为空
+                text = (f"采集题库 · 章节 {done}/{total} {message}" if message
+                        else f"采集题库 · 作业 {done}/{total}")
+                self.events.put(("status", "reading", text.strip()))
 
         try:
             for index, course in enumerate(courses, 1):
@@ -2764,7 +2802,17 @@ class App:
             text += "，已中断"
         self.set_status("idle", "采集题库完成 · " + text)
         if not self.silent:
-            messagebox.showinfo("采集完成", text, parent=self.root)
+            hint = ""
+            if not summary.get("read"):
+                if summary.get("unsubmitted"):
+                    hint = ("\n\n这些作业一份都没提交过 —— 平台只有在作业**提交之后**"
+                            "才记录答案和判分，所以现在没有任何答案可采。\n"
+                            "请先在浏览器或网页端把作业做完并提交，再点「采集题库」。")
+                elif summary.get("closed"):
+                    hint = "\n\n作业都已被老师关闭/过期，平台不再提供答案。"
+                else:
+                    hint = "\n\n本课程暂时没有可读的已完成作业。"
+            messagebox.showinfo("采集完成", text + hint, parent=self.root)
 
     # ---------------- 开始 / 停止 ----------------
     def _save_run_params(self) -> None:
@@ -2868,8 +2916,8 @@ class App:
         self.engine.stop()
 
     # ---------------- 引擎事件处理（主线程） ----------------
-    def _ev_log(self, message: str) -> None:
-        self.log(message)
+    def _ev_log(self, message: str, slot: "int | None" = None) -> None:
+        self.log(message, slot=slot)
 
     def _ev_login_result(self, gen: int, ok: bool, message: str) -> None:
         """登录结果（主线程）：成功关窗，失败在「取消 / 登录」左侧行内报错。"""

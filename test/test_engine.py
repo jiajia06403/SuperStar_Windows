@@ -1298,6 +1298,85 @@ def test_manual_wait_waits_for_popup_ack_before_counting():
 
 
 # --------------------------------------------------------------------------- #
+# 任务点并发 > 1 的鲁棒性回归（对齐 SuperStar 安卓版 jobs=5）
+# --------------------------------------------------------------------------- #
+def test_rate_limiter_is_per_thread():
+    """RateLimiter 必须按线程隔离：5 个 worker 各自限速、互不阻塞。
+
+    旧实现用「全局锁 + 单个 last_call」把整个引擎串行化，导致 task 并发 > 1 时
+    等价于串行（并发失效）。这里验证 5 个线程并发调用，整体耗时远小于串行累计。
+    """
+    from api.base import RateLimiter
+    lim = RateLimiter(0.2)  # 每条请求间隔 0.2s
+    n_calls = 3
+    n_threads = 5
+
+    barrier = threading.Barrier(n_threads)
+    errors = []
+
+    def worker():
+        try:
+            barrier.wait()
+            for _ in range(n_calls):
+                lim.limit_rate()
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+    t0 = time.time()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    elapsed = time.time() - t0
+
+    assert not errors, errors
+    # 串行累计 = 5 线程 × 3 次 × 0.2s = 3.0s；并发应在 1 个线程的量级（≈ n_calls×0.2 + 余量）
+    assert elapsed < 2.0, f"限速器疑似被全局串行化：{elapsed:.2f}s"
+
+
+def test_work_stats_isolated_by_jobid_and_merged():
+    """章节检测统计按 jobid 隔离写入，merge 正确汇总，clear 只清指定 jobid。"""
+    from api.base import Chaoxing
+    ch = Chaoxing()  # 无需网络：只用到内存统计方法
+
+    ch.set_work_stat("w1", answer={"total": 4, "found": 2}, verdict={"right": 3, "wrong": 1, "fixed": 0})
+    ch.set_work_stat("w2", answer={"total": 2, "found": 0}, verdict={"right": 1, "wrong": 0, "fixed": 1})
+    ch.set_work_stat("w2", refused="请输入验证码")  # 同一 jobid 覆盖 refused
+
+    ch.merge_work_stats(["w1", "w2"])
+    assert ch.last_answer_stats == {"total": 6, "found": 2}, ch.last_answer_stats
+    assert ch.last_verdict_stats == {"right": 4, "wrong": 1, "fixed": 1}, ch.last_verdict_stats
+    assert "验证码" in ch.work_refused_reason, ch.work_refused_reason
+
+    # 只清 w1，w2 的统计应保留
+    ch.clear_work_stats(["w1"])
+    ch.merge_work_stats(["w1", "w2"])
+    assert ch.last_answer_stats == {"total": 2, "found": 0}, ch.last_answer_stats
+    assert "验证码" in ch.work_refused_reason
+
+
+def test_work_stats_concurrent_no_loss():
+    """并发写不同 jobid 不丢更新（锁保护 + 按 jobid 隔离）。"""
+    from api.base import Chaoxing
+    ch = Chaoxing()
+    n = 8
+
+    def worker(i):
+        ch.set_work_stat(f"w{i}", answer={"total": i + 1, "found": i})
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    ch.merge_work_stats([f"w{i}" for i in range(n)])
+    assert ch.last_answer_stats["total"] == sum(i + 1 for i in range(n))
+    assert ch.last_answer_stats["found"] == sum(i for i in range(n))
+
+
+# --------------------------------------------------------------------------- #
 if __name__ == "__main__":
     funcs = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0
