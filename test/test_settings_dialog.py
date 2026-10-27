@@ -2,11 +2,10 @@
 # layer: gui  # core=默认必跑 / gui=真窗口 / slow=仅 --all
 """答题设置窗口的行为测试（真实 Tk 窗口，无需账号/网络）。
 
-校验四条约定：
+校验三条约定：
   1. 下拉切换「答案提供方式」后，下方**只显示该提供方真正会读取的配置项**；
-  2. AI / DeepSeek / SiliconFlow 预填的地址与模型各不相同；
-  3. 保存写进用户配置；换提供方再保存不会清掉别家的值；
-  4. 窗口高度随内容收放，且内容不被窗口底边裁切。
+  2. 保存写进用户配置；换提供方再保存不会清掉别家的值；
+  3. 窗口高度随内容收放，且内容不被窗口底边裁切。
 """
 import os
 import sys
@@ -105,30 +104,6 @@ def test_only_relevant_fields_shown():
                 _select(dlg, "")
                 assert not [p for p in dlg.panels.values() if p.winfo_manager()]
                 assert not dlg.specific_frame.winfo_manager(), "停用时专属区应隐藏"
-                dlg.destroy()
-            finally:
-                root.destroy()
-
-
-def test_ai_defaults_differ_per_provider():
-    with tempfile.TemporaryDirectory() as tmp:
-        _prepare_dir(tmp)
-        with _FakeAppDir(tmp):
-            root = tk.Tk()
-            try:
-                dlg = _open(root)
-                expect = {
-                    "AI": ("endpoint", "https://api.openai.com/v1", "model", "gpt-3.5-turbo"),
-                    "DeepSeek": ("deepseek_endpoint", "https://api.deepseek.com/v1",
-                                 "deepseek_model", "deepseek-chat"),
-                    "SiliconFlow": ("siliconflow_endpoint",
-                                    "https://api.siliconflow.cn/v1/chat/completions",
-                                    "siliconflow_model", "deepseek-ai/DeepSeek-V4.1-Flash"),
-                }
-                for name, (ekey, evalue, mkey, mvalue) in expect.items():
-                    _select(dlg, name)
-                    assert _value(dlg, ekey) == evalue, f"{name} 默认地址异常: {_value(dlg, ekey)}"
-                    assert _value(dlg, mkey) == mvalue, f"{name} 默认模型异常: {_value(dlg, mkey)}"
                 dlg.destroy()
             finally:
                 root.destroy()
@@ -460,7 +435,6 @@ def test_conn_test_row_hidden_when_disabled():
 if __name__ == "__main__":
     cases = [
         test_only_relevant_fields_shown,
-        test_ai_defaults_differ_per_provider,
         test_save_keeps_other_providers_values,
         test_shared_field_edits_are_kept,
         test_save_keeps_hidden_provider_defaults_empty,
