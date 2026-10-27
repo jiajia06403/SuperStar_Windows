@@ -319,6 +319,52 @@ def test_log_panel_hides_noise():
         app.root.destroy()
 
 
+def test_concurrent_log_slot_prefix():
+    """并发章节 worker 线程（chapter-N）的日志带「并发#N」标记；主线程/串行不带。"""
+    import threading
+
+    from loguru import logger as _logger
+
+    from gui.app import build
+
+    app = build(demo=True, cache_dir=tempfile.mkdtemp(prefix="ss_slot_"))
+    app.silent = True
+    try:
+        app.root.update()
+        app.log_text.configure(state="normal")
+        app.log_text.delete("1.0", "end")
+        app.log_text.configure(state="disabled")
+
+        # 并发 worker 线程（命名 chapter-N）发出的日志
+        def emit_from(name, msg):
+            t = threading.Thread(target=lambda: _logger.info(msg), name=name, daemon=True)
+            t.start()
+            t.join()
+
+        emit_from("chapter-2", "章节完成: 并发测试章节")
+        # 主线程（非 chapter-*）发出的日志：不应带并发前缀
+        _logger.info("章节完成: 串行测试章节")
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            app.root.update()
+            panel = app.log_text.get("1.0", "end")
+            if "【并发#2】章节完成: 并发测试章节" in panel and \
+                    "章节完成: 串行测试章节" in panel:
+                break
+            time.sleep(0.03)
+
+        panel = app.log_text.get("1.0", "end")
+        assert "【并发#2】章节完成: 并发测试章节" in panel, f"并发日志未加序号: {panel!r}"
+        serial_lines = [ln for ln in panel.splitlines()
+                        if ln.rstrip().endswith("串行测试章节")]
+        assert serial_lines, f"串行日志未出现在面板: {panel!r}"
+        assert not serial_lines[0].lstrip().startswith("【并发#"), \
+            f"串行日志误加并发前缀: {serial_lines[0]!r}"
+    finally:
+        app.root.destroy()
+
+
 if __name__ == "__main__":
     try:
         test_gui_demo_flow()
