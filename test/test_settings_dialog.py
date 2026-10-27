@@ -245,6 +245,98 @@ def test_video_log_interval_saved_to_common():
                 root.destroy()
 
 
+def test_video_finish_percent_saved_to_common():
+    """[common] video_finish_percent：默认 90、可改、越界或非数字不落盘。"""
+    from unittest import mock
+
+    import gui.app as app_mod
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _prepare_dir(tmp)
+        with _FakeAppDir(tmp):
+            root = tk.Tk()
+            try:
+                dlg = _open(root)
+                expected = config_store.load_default().get(
+                    "common", "video_finish_percent", fallback="")
+                assert _value(dlg, "video_finish_percent") == expected, \
+                    f"观看进度要求默认值应来自默认配置 {expected!r}，" \
+                    f"实际 {_value(dlg, 'video_finish_percent')!r}"
+                assert expected == "90", expected
+
+                dlg.vars["video_finish_percent"][1].set("95")
+                dlg._on_save()
+                assert dlg.common_result["video_finish_percent"] == "95"
+                cfg = config_store.load_section("common")
+                assert cfg["video_finish_percent"] == "95", cfg
+
+                # 越界（89/101）与非整数都不落盘
+                for bad in ("89", "101", "-1", "abc"):
+                    dlg2 = _open(root)
+                    dlg2.vars["video_finish_percent"][1].set(bad)
+                    with mock.patch.object(app_mod.messagebox, "showerror"):
+                        dlg2._on_save()
+                    assert dlg2.result is None, f"{bad} 不应保存"
+                    assert config_store.load_section("common")["video_finish_percent"] == "95"
+                    dlg2.destroy()
+            finally:
+                root.destroy()
+
+
+def test_submit_forced_and_verify_follows_local_bank():
+    """提交答题恒为 true、核验判分跟随本地题库开关；三者都不再有独立界面入口。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        _prepare_dir(tmp)
+        with _FakeAppDir(tmp):
+            root = tk.Tk()
+            try:
+                dlg = _open(root)
+                _select(dlg, "AI")
+                for key in ("submit", "true_list", "false_list", "local_bank_verify"):
+                    assert key not in dlg.vars, f"配置项 {key} 不应再出现在界面上"
+
+                # 关掉本地题库 -> 既不核验也不写
+                dlg.vars["local_bank"][1].set(False)
+                dlg._on_save()
+                cfg = config_store.load_section("tiku")
+                assert cfg["submit"] == "true", "答题应始终提交"
+                assert cfg["local_bank"] == "false" and cfg["local_bank_verify"] == "false", cfg
+
+                # 打开本地题库 -> 提交后自动核验
+                dlg2 = _open(root)
+                _select(dlg2, "AI")
+                dlg2.vars["local_bank"][1].set(True)
+                dlg2._on_save()
+                cfg = config_store.load_section("tiku")
+                assert cfg["local_bank"] == "true" and cfg["local_bank_verify"] == "true", cfg
+                # 判断题词表虽无输入框，仍原样保留在配置里（答题逻辑要用）
+                assert cfg.get("true_list") and cfg.get("false_list"), cfg
+                dlg2.destroy()
+            finally:
+                root.destroy()
+
+
+def test_provider_selector_sits_above_specific_panel():
+    """答案提供方式下拉紧贴在「专属设置」上方，而不是单独放在窗口顶部。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        _prepare_dir(tmp)
+        with _FakeAppDir(tmp):
+            root = tk.Tk()
+            try:
+                dlg = _open(root)
+                for name in SettingsDialog.PROVIDERS:
+                    _select(dlg, name)
+                    dlg.update_idletasks()
+                    box = dlg.provider_box
+                    assert box.winfo_y() < dlg.specific_frame.winfo_y(), \
+                        f"{name}：提供方式下拉应在专属设置区上方"
+                    assert dlg.specific_frame.winfo_y() - (box.winfo_y() + box.winfo_height()) <= 16, \
+                        f"{name}：下拉与专属设置之间不应再夹别的区块"
+                dlg.destroy()
+            finally:
+                root.destroy()
+
+
 def test_layout_not_clipped():
     with tempfile.TemporaryDirectory() as tmp:
         _prepare_dir(tmp)
@@ -373,6 +465,9 @@ if __name__ == "__main__":
         test_shared_field_edits_are_kept,
         test_save_keeps_hidden_provider_defaults_empty,
         test_video_log_interval_saved_to_common,
+        test_video_finish_percent_saved_to_common,
+        test_submit_forced_and_verify_follows_local_bank,
+        test_provider_selector_sits_above_specific_panel,
         test_layout_not_clipped,
         test_user_resize_survives_provider_switch,
         test_conn_test_button_shows_result,
