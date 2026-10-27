@@ -1449,7 +1449,7 @@ class App:
         self.status_label = ttk.Label(outer, text=self._status_full, style="Status.TLabel",
                                       anchor="w")
         self.status_label.grid(row=2, column=0, sticky="ew", pady=(6, 4))
-        self.status_label.bind("<Configure>", lambda _e: self._paint_status())
+        # 状态栏宽度重绘统一由 _run_fit_columns（after 合并）触发，避免 resize 风暴期每帧同步 paint
 
         self._build_log_pane(outer).grid(row=3, column=0, sticky="nsew")
 
@@ -1564,7 +1564,9 @@ class App:
         # 状态列宽按最长状态文本（进行中）实测，另留单元格内边距；
         # 固定 56px 在 125% 缩放下会把「进行中」裁掉半个字。
         self._sync_state_column()
-        self.chapter_tree.column("title", width=360, minwidth=layout.TITLE_MIN_W, anchor="w")
+        # 章节列 stretch=True：列宽由 Tk 在 C 层随容器自动伸缩，无需 Python 端
+        # 每帧 tree.column(width=...) 重设（那会触发 Treeview 额外重绘 —— 拖拽卡顿主因）。
+        self.chapter_tree.column("title", width=360, minwidth=layout.TITLE_MIN_W, anchor="w", stretch=True)
         for key, (_text, color) in CHAPTER_STYLE.items():
             self.chapter_tree.tag_configure(key, foreground=color)
         self.chapter_tree.grid(row=0, column=0, sticky="nsew")
@@ -1593,7 +1595,7 @@ class App:
         self.refresh_chapters_btn = ttk.Button(tools, text="刷新章节", width=10,
                                                command=self.on_refresh_chapters)
         self.refresh_chapters_btn.grid(row=0, column=1, sticky="e", padx=(8, 0))
-        self.chapter_hint.bind("<Configure>", lambda _e: self._paint_hint())
+        # 提示宽度重绘统一由 _run_fit_columns（after 合并）触发，避免 resize 风暴期每帧同步 paint
         return box
 
     # ---------------- Treeview 列宽自适应 ----------------
@@ -1614,16 +1616,27 @@ class App:
                 pass
 
     def _sync_state_column(self) -> None:
-        """状态列宽 = 最长状态文本实测 + 内边距（字体/DPI 变化后可重算）。
+        """状态列宽 = 最长状态文本实测 + 内边距（字体/DPI 变化后才需重算）。
 
         必须同步执行：若推迟到 ``after`` 里，测试在 ``update_idletasks()`` 后读到的
         还是构建期的旧值，``test_gui_smoke`` 的「状态列放得下最长状态文本」会误判。
+
+        字体不变时宽度恒定，直接跳过 ``tree.column(...)`` —— 否则每次 resize 都会
+        触发 Treeview 重绘（拖拽卡顿的元凶之一）。
         """
         state_w = max(layout.measure(t) for t, _c in CHAPTER_STYLE.values()) + layout.STATE_COL_PAD
+        if getattr(self, "_state_w", None) == state_w:
+            return
         self._state_w = state_w
         self.chapter_tree.column("state", width=state_w, minwidth=state_w, stretch=False)
 
     def _run_fit_columns(self) -> None:
+        """resize 合并回调（60ms 一次）：只做与窗口宽度相关的轻量重绘。
+
+        章节列已改 stretch=True，列宽伸缩由 Tk 在 C 层自动完成，这里**不再**
+        手动 tree.column("title", width=...) —— 原计划每帧改列宽会触发 Treeview
+        额外重绘，正是拖拽窗口边缘时明显卡顿的根因。
+        """
         self._fit_cols_job = None
         tree = self.chapter_tree
         try:
@@ -1631,19 +1644,11 @@ class App:
                 return
         except tk.TclError:
             return
+        # 状态列宽只依赖字体：每帧（已合并）重算可兜底 DPI/缩放变化后的重测。
         self._sync_state_column()
-        # 章节列吃满剩余宽度，但不小于 TITLE_MIN_W：分栏被拖窄时列会收缩到最小宽度，
-        # 而不是停在初始的 360px 让横向滚动条常驻。
-        sb_w = self._chapter_vsb.winfo_width()
-        rest = tree.winfo_width() - (sb_w if sb_w > 1 else 0) - 4
-        want = max(layout.TITLE_MIN_W, rest - self._state_w)
-        try:
-            cur = int(tree.column("title", "width"))
-        except tk.TclError:
-            return
-        if abs(want - cur) < 2:
-            return                     # <2px 不动：小抖动会让 Configure 自激
-        tree.column("title", width=want, minwidth=layout.TITLE_MIN_W, anchor="w")
+        # 状态栏 / 章节提示超宽时截断加省略号（早返回，文本不变则不重绘）。
+        self._paint_status()
+        self._paint_hint()
 
     def _build_log_pane(self, parent: tk.Misc) -> ttk.Widget:
         box = ttk.Labelframe(parent, text="运行日志", padding=6)
