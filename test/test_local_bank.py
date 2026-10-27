@@ -861,6 +861,63 @@ def test_study_work_stores_correct_answer_when_wrong():
         lb._BANK = old
 
 
+def test_study_work_redoes_wrong_question_with_a_different_answer():
+    """重做错题：上一轮被判错的答案绝不再原样提交（换成别的选项）。
+
+    完整链路：第一轮交 "B" 被平台判错 -> 记进错题本；第二轮题库又把 "B" 给回来
+    （搜题接口对同一道题几乎总是给同一个答案）-> 提交前最后一道闸必须换掉它。
+    不换就是「重答却交同一批答案」，平台必然再判一次不合格。
+    """
+    import api.wrong_answers as wa
+
+    bank = _bank()
+    old_bank = lb._BANK
+    old_book = wa._BOOK
+    lb._BANK = bank
+    wa._BOOK = wa.WrongBook(os.path.join(tempfile.mkdtemp(prefix="wa_"), "book.json"))
+    try:
+        wrong_html = '<div class="singleQuesId" data="405717701"><i class="cuo"></i></div>'
+        _result, first = _run_study_work(wrong_html, bank)
+        assert first.posts[-1].get("answer405717701") == "B", "第一轮应原样提交题库给的答案"
+        assert wa.known_keys("题目一", "single", "A. 甲选项\nB. 乙选项") == {"乙选项"}, \
+            "判错的答案要记进错题本"
+
+        _result, second = _run_study_work(wrong_html, bank)
+        assert second.posts[-1].get("answer405717701") == "A", \
+            f"被判错的答案不能原样提交，实际 {second.posts[-1].get('answer405717701')!r}"
+    finally:
+        lb._BANK = old_bank
+        wa._BOOK = old_book
+
+
+def test_study_work_random_answer_avoids_rejected_option():
+    """题库没答案 -> 随机作答时也要避开被判错的选项。
+
+    重做时 AI/题库可能直接给不出答案（额度用完、连通失败），随机作答就成了唯一
+    来源；它要是又抽中同一个错答案，这一轮等于白交。
+    """
+    import api.base as base
+    import api.wrong_answers as wa
+
+    bank = _bank()
+    old_bank = lb._BANK
+    old_book = wa._BOOK
+    old_query = base._tiku_query
+    lb._BANK = bank
+    wa._BOOK = wa.WrongBook(os.path.join(tempfile.mkdtemp(prefix="wa_"), "book.json"))
+    base._tiku_query = lambda *a, **k: None      # 模拟题库/AI 给不出答案
+    try:
+        wa.record_wrong("题目一", "single", "A. 甲选项\nB. 乙选项", "B")
+        _result, session = _run_study_work(
+            '<div class="singleQuesId" data="405717701"><i class="dui"></i></div>', bank)
+        assert session.posts[-1].get("answer405717701") == "A", \
+            f"随机作答不能选到被判错的选项，实际 {session.posts[-1].get('answer405717701')!r}"
+    finally:
+        lb._BANK = old_bank
+        wa._BOOK = old_book
+        base._tiku_query = old_query
+
+
 def test_study_work_writes_into_course_file():
     """入库文件落在 <课程ID>.json（不再按账号建目录）。"""
     bank = _bank()

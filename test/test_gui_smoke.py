@@ -25,42 +25,59 @@ def test_gui_demo_flow():
     assert stats["log_lines"] > 0, "日志面板为空"
 
 
-def test_gui_chapter_not_open_display():
-    """刷课时发现的未开放章节显示为「未开放」（done/pending 不受影响）。"""
+def test_gui_chapter_shows_in_progress_while_studying():
+    """正在处理的章节显示「进行中」，处理完/刷新列表后回到完成/待学。"""
     from gui.app import CHAPTER_STYLE, build
 
-    app = build(demo=True, cache_dir=tempfile.mkdtemp(prefix="ss_notopen_"))
+    app = build(demo=True, cache_dir=tempfile.mkdtemp(prefix="ss_chstudying_"))
     app.silent = True
     try:
         app.engine.login_demo()
         course = next(c for c in app.engine.list_courses() if c["courseId"] == "C1001")
-        # 模拟「读取进度」/ 勾选课程得到的章节列表（pt4 由服务端判定为未开放）
         points = [
             {"id": "pt1", "title": "第一章", "has_finished": True},
             {"id": "pt2", "title": "第二章", "has_finished": False},
-            {"id": "pt4", "title": "第四章", "has_finished": False, "not_open": True},
+            {"id": "pt3", "title": "第三章", "has_finished": False},
         ]
         app.current_course = course
         app._ev_points(course, points)
         app.root.update_idletasks()
 
         tree = app.chapter_tree
-        not_open_text, pending_text = CHAPTER_STYLE["not_open"][0], CHAPTER_STYLE["pending"][0]
-        assert tree.set("pt4", "state") == not_open_text, "未开放章节应显示「未开放」"
-        assert tree.set("pt2", "state") == pending_text, "已开放未完成章节应保持「待学」"
-        assert tree.set("pt1", "state") == CHAPTER_STYLE["done"][0]
-        assert "未开放 1 章" in app.chapter_hint.cget("text"), app.chapter_hint.cget("text")
+        studying_text = CHAPTER_STYLE["studying"][0]
+        pending_text = CHAPTER_STYLE["pending"][0]
+        assert studying_text == "进行中"
+        assert tree.set("pt2", "state") == pending_text, "未开始的章节应显示「待学」"
 
-        # 刷课途中发现未开放时，该行要即时切到「未开放」
-        app._ev_progress("C1001", "pt2", "not_open")
-        assert tree.set("pt2", "state") == not_open_text
-        assert "未开放 2 章" in app.chapter_hint.cget("text"), app.chapter_hint.cget("text")
+        # 引擎开始处理第二章：该行切「进行中」，其余行不动
+        app._ev_chapter("C1001", 1, 3, "第二章")
+        assert tree.set("pt2", "state") == studying_text
+        assert tree.set("pt3", "state") == pending_text
+
+        # 处理完成：该行切「完成」，「进行中」标记撤销
+        app._ev_progress("C1001", "pt2", "done")
+        assert tree.set("pt2", "state") == CHAPTER_STYLE["done"][0]
+        assert app._studying_pid is None
+
+        # 下一章开始：上一行的「进行中」不残留
+        app._ev_chapter("C1001", 2, 3, "第三章")
+        assert tree.set("pt3", "state") == studying_text
+        assert tree.set("pt2", "state") == CHAPTER_STYLE["done"][0], "上一章不应保持「进行中」"
+
+        # 刷课结束：所有「进行中」复位
+        app._ev_finished()
+        assert tree.set("pt3", "state") == pending_text
+        assert app._studying_pid is None
+
+        # 提示文本不再统计「未开放」
+        assert "未开放" not in app.chapter_hint.cget("text"), app.chapter_hint.cget("text")
+        assert "已完成 2/3 章" in app.chapter_hint.cget("text"), app.chapter_hint.cget("text")
     finally:
         app.root.destroy()
 
 
 def test_gui_course_shows_in_progress_while_studying():
-    """刷课时左侧课程列表把当前课程标为「进行中」，切课自动复位，结束清除。"""
+    """左侧课程列表把正在处理的课程标「进行中」：可并行多门，结束/切课后清除。"""
     from gui.app import build
 
     app = build(demo=True, cache_dir=tempfile.mkdtemp(prefix="ss_studying_"))
@@ -74,21 +91,120 @@ def test_gui_course_shows_in_progress_while_studying():
         cid1 = str(courses[0]["courseId"])
         cid2 = str(courses[1]["courseId"])
 
+        app._ev_course(cid1, "start")
         app._ev_chapter(cid1, 0, 5, "第一章")
         assert "进行中" in app.course_tree.item(cid1, "text")
-        assert "studying" in app.course_tree.item(cid1, "tags")
+        # cid1 同时也是「选中课程」：单选下整行蓝底优先，故 tag 是 selected
+        assert "selected" in app.course_tree.item(cid1, "tags")
 
-        # 切到下一门课：上一门复位、当前门标「进行中」
+        # 另一门课也开始处理：两门同时为「进行中」，未选中的那门用橙色文字标出
+        app._ev_course(cid2, "start")
         app._ev_chapter(cid2, 0, 3, "Unit 1")
-        assert "进行中" not in app.course_tree.item(cid1, "text")
+        assert "进行中" in app.course_tree.item(cid1, "text")
         assert "进行中" in app.course_tree.item(cid2, "text")
         assert "studying" in app.course_tree.item(cid2, "tags")
 
-        # 刷课结束：标记清除
+        # 第一门课处理完：只有它复位
+        app._ev_course(cid1, "end")
+        assert "进行中" not in app.course_tree.item(cid1, "text")
+        assert "studying" not in app.course_tree.item(cid1, "tags")
+        assert "进行中" in app.course_tree.item(cid2, "text")
+
+        # 刷课结束：标记全部清除
         app._ev_finished()
         assert "进行中" not in app.course_tree.item(cid2, "text")
-        assert "studying" not in app.course_tree.item(cid2, "tags")
+        assert app.course_tree.item(cid2, "tags") in ((), "")
     finally:
+        app.root.destroy()
+
+
+def test_gui_course_switch_blocked_while_running():
+    """单选 + 刷课中拒绝切课：点其他课程无反应，只在标题右侧短暂提示。"""
+    import types
+
+    from gui.app import COURSE_PANE_TITLE, COURSE_SWITCH_BLOCKED, build
+
+    app = build(demo=True, cache_dir=tempfile.mkdtemp(prefix="ss_switch_"))
+    app.silent = True
+    try:
+        app.engine.login_demo()
+        courses = app.engine.list_courses()
+        app._ev_courses(courses)
+        app.root.update_idletasks()
+        cid1 = str(courses[0]["courseId"])
+        cid2 = str(courses[1]["courseId"])
+        assert app.selected_cid == cid1, f"默认应选中第一门，实际 {app.selected_cid}"
+        assert app.current_course and str(app.current_course["courseId"]) == cid1
+
+        # 让界面认为「正在刷课」（只改 is_running 的判据，不真跑引擎）
+        class _Alive:
+            def is_alive(self):
+                return True
+
+        app.engine._thread = _Alive()
+        # 命中测试由 Tk 做（窗口未上屏时 bbox 为空），这里直接指定「点在第二行」
+        orig_identify = app.course_tree.identify_row
+        app.course_tree.identify_row = lambda _y: cid2
+        try:
+            app._on_course_click(types.SimpleNamespace(y=10))
+
+            assert app.selected_cid == cid1, "刷课中点了别的课，选中态不能改变"
+            assert str(app.current_course["courseId"]) == cid1, "章节面板不能切走"
+            assert COURSE_SWITCH_BLOCKED in app._course_box.cget("text"), \
+                f"标题右侧应出现提示，实际 {app._course_box.cget('text')!r}"
+
+            # 键盘上下键同理：选中被拨回原课程
+            app.course_tree.selection_set(cid2)
+            app._on_course_select()
+            assert app.selected_cid == cid1
+            assert cid1 in app.course_tree.selection()
+
+            # 刷课结束后即可正常切换
+            app.engine._thread = None
+            app._on_course_click(types.SimpleNamespace(y=10))
+            assert app.selected_cid == cid2
+        finally:
+            app.course_tree.identify_row = orig_identify
+        app._flash_course_hint("x", ms=1)
+        app.root.update()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and app._course_box.cget("text") != COURSE_PANE_TITLE:
+            app.root.update()
+            time.sleep(0.02)
+        assert app._course_box.cget("text") == COURSE_PANE_TITLE, "提示应在超时后自动消失"
+    finally:
+        app.root.destroy()
+
+
+def test_gui_manual_prompt_acks_engine():
+    """「需手动」弹窗：界面收到 PROMPT 后弹框，关闭即 ack，引擎才开始计时。
+
+    静默模式（自检/截图）不弹框但必须照常 ack，否则引擎线程会永远卡在等确认。
+    """
+    import threading
+
+    from gui.app import build
+
+    app = build(demo=True, cache_dir=tempfile.mkdtemp(prefix="ss_prompt_"))
+    app.silent = True
+    ack = threading.Event()
+    app.engine._manual_acks.append(ack)      # 模拟引擎线程正阻塞等这个确认
+    try:
+        # 走真实链路：引擎事件 -> 队列 -> 主线程弹窗 -> 关闭后 ack
+        app.engine._emit(app.engine.PROMPT, "上一章", "当前章", 300)
+        assert _pump_until(app, lambda: ack.is_set(), timeout=5), \
+            "弹窗关闭后必须 ack，否则刷课线程卡死"
+        assert app._manual_prompt_open is False and not app._manual_prompts
+
+        # 排队：同时有两条请求时逐个处理，每条都要放行
+        ack2, ack3 = threading.Event(), threading.Event()
+        app.engine._manual_acks.extend([ack2, ack3])
+        app.engine._emit(app.engine.PROMPT, "甲章", "课后章", 300)
+        app.engine._emit(app.engine.PROMPT, "乙章", "课后章", 300)
+        assert _pump_until(app, lambda: ack2.is_set() and ack3.is_set(), timeout=5), \
+            f"排队的两条请求都应被放行: {ack2.is_set()}/{ack3.is_set()}"
+    finally:
+        app.engine._manual_acks.clear()
         app.root.destroy()
 
 
@@ -117,13 +233,13 @@ def test_gui_text_not_clipped():
         app.root.update()
         font = tkfont.nametofont("TkDefaultFont")
 
-        # 1) 状态列必须放得下最长的状态文本（未开放）
+        # 1) 状态列必须放得下最长的状态文本（进行中）
         need = max(font.measure(t) for t, _c in CHAPTER_STYLE.values())
         col_w = app.chapter_tree.column("state", "width")
         assert col_w >= need + 12, f"状态列 {col_w}px 放不下 {need}px 的文本"
 
         # 2) 章节提示超宽时要加省略号，且不超出控件
-        app._set_hint("上海市大学生安全教育（2026级） · 已完成 2/244 章 · 未开放 90 章" * 3)
+        app._set_hint("上海市大学生安全教育（2026级） · 已完成 2/244 章 · 进行中 1 章" * 3)
         app.root.update_idletasks()
         shown = app.chapter_hint.cget("text")
         assert shown.endswith("…"), f"超长提示未截断: {shown!r}"
@@ -207,10 +323,14 @@ if __name__ == "__main__":
     try:
         test_gui_demo_flow()
         print("PASS  test_gui_demo_flow")
-        test_gui_chapter_not_open_display()
-        print("PASS  test_gui_chapter_not_open_display")
+        test_gui_chapter_shows_in_progress_while_studying()
+        print("PASS  test_gui_chapter_shows_in_progress_while_studying")
         test_gui_course_shows_in_progress_while_studying()
         print("PASS  test_gui_course_shows_in_progress_while_studying")
+        test_gui_course_switch_blocked_while_running()
+        print("PASS  test_gui_course_switch_blocked_while_running")
+        test_gui_manual_prompt_acks_engine()
+        print("PASS  test_gui_manual_prompt_acks_engine")
         test_gui_text_not_clipped()
         print("PASS  test_gui_text_not_clipped")
         test_log_panel_hides_noise()
@@ -218,7 +338,7 @@ if __name__ == "__main__":
         sys.exit(0)
     except AssertionError as exc:
         print(f"FAIL  test_gui_smoke: {exc}")
-        annotate_exc("test_gui_smoke.py::test_gui_chapter_not_open_display")
+        annotate_exc("test_gui_smoke.py::test_gui_chapter_shows_in_progress_while_studying")
         sys.exit(1)
     except Exception:  # noqa: BLE001
         annotate_exc("test_gui_smoke.py::unexpected")

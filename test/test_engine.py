@@ -1324,6 +1324,53 @@ def test_manual_wait_after_captcha_block():
     assert not points[0].get("work_refused")
 
 
+def test_manual_wait_waits_for_popup_ack_before_counting():
+    """弹窗未关闭（未 ack_manual）前不计时、不回读进度；关闭后才开始计时窗口。
+
+    这就是「需手动」弹窗的契约：引擎发 PROMPT 后阻塞，界面关掉弹窗再 ack，
+    引擎才真的开始 5 分钟倒计时与轮询进度。
+    """
+    from api import cancel
+
+    cancel.clear()
+    tmp_path = tempfile.mkdtemp()
+    eng = StudyEngine(cache_dir=str(tmp_path), poll_interval=0.01, reanswer_interval=0.01)
+    eng.current_uid = "78d"
+    eng.work_retry = 1
+    eng.reanswer_rounds = 1
+    eng.manual_wait = 5
+    fake = _ManualFake("78d", finish_after=1)
+    fake.points = [{"id": "p0", "title": "上一章", "has_finished": False},
+                   {"id": "p1", "title": "当前章", "has_finished": False}]
+    fake.job_info_seq = [{"notOpen": False}]
+    eng.chaoxing = fake
+    points = [{"id": "p0", "title": "上一章"}, {"id": "p1", "title": "当前章"}]
+    prompts = []
+    eng.on(eng.PROMPT, lambda t, ct, sec: prompts.append((t, ct, sec)))
+
+    box = {}
+    engine.process_chapter = lambda ch, c, p, s, work_retry=1, **kw: ChapterResult.UNVERIFIED
+    try:
+        th = threading.Thread(target=lambda: box.setdefault(
+            "ret", eng._handle_not_open({"courseId": "C", "clazzId": "cz", "cpi": "cp",
+                                        "title": "课"}, points, i=1, cid="C", uid="78d")))
+        th.start()
+        th.join(0.5)
+        assert prompts, "应发出「需手动」提示事件"
+        assert prompts[0][0] == "上一章" and prompts[0][2] == 5, prompts
+        assert th.is_alive(), "用户没关弹窗前引擎必须一直等，不能自己开始计时"
+        assert fake.reads == 0, f"用户没关弹窗前不该回读进度，实际回读 {fake.reads} 次"
+
+        eng.ack_manual()          # 模拟用户关掉弹窗
+        th.join(5)
+        assert not th.is_alive(), "确认之后应继续执行（计时窗口内做完则返回 True）"
+        assert box.get("ret") is True, box
+        assert fake.reads >= 1, "关掉弹窗后才开始轮询进度"
+    finally:
+        engine.process_chapter = _ORIG_PROCESS_CHAPTER
+        cancel.clear()
+
+
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":
     funcs = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

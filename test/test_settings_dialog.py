@@ -123,7 +123,7 @@ def test_ai_defaults_differ_per_provider():
                                  "deepseek_model", "deepseek-chat"),
                     "SiliconFlow": ("siliconflow_endpoint",
                                     "https://api.siliconflow.cn/v1/chat/completions",
-                                    "siliconflow_model", "deepseek-ai/DeepSeek-V3.2"),
+                                    "siliconflow_model", "deepseek-ai/DeepSeek-V4.1-Flash"),
                 }
                 for name, (ekey, evalue, mkey, mvalue) in expect.items():
                     _select(dlg, name)

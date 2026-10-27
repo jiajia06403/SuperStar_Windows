@@ -14,11 +14,14 @@
       "version": 1,
       "last_uid": "12345678",
       "accounts": {
-        "12345678": {"username": "13800000000", "password": "dpapi:...", "use_cookies": false}
+        "12345678": {"username": "13800000000", "name": "小号",
+                     "password": "dpapi:...", "use_cookies": false}
       }
     }
 
 ``password`` 为空字符串表示「只记住账号、不记住密码」。
+``name`` 是用户自定义的本地名称（界面显示与重名判重用），空串表示未设置，
+此时按 :func:`account_display_name` 退回手机号 / uid。
 """
 import base64
 import ctypes
@@ -162,6 +165,16 @@ def decode_password(token: str) -> str:
 # --------------------------------------------------------------------------- #
 # 账号存储
 # --------------------------------------------------------------------------- #
+def account_display_name(uid, acc: dict) -> str:
+    """账号显示名：优先用户自定义名称，其次手机号，最后 uid。"""
+    acc = acc or {}
+    name = str(acc.get("name") or "").strip()
+    if name:
+        return name
+    username = str(acc.get("username") or "").strip()
+    return username or str(uid or "")
+
+
 class AccountStore:
     """账号文件读写。任何异常都不抛出，最多退化为空账号表。"""
 
@@ -171,7 +184,7 @@ class AccountStore:
 
     # ---- 读 ----
     def load(self) -> dict[str, dict]:
-        """返回 ``{uid: {username, password, use_cookies}}``（密码已解密）。"""
+        """返回 ``{uid: {username, name, password, use_cookies}}``（密码已解密）。"""
         if not self.path.exists():
             return {}
         try:
@@ -193,6 +206,7 @@ class AccountStore:
                 continue
             accounts[str(uid)] = {
                 "username": str(item.get("username") or ""),
+                "name": str(item.get("name") or ""),
                 "password": decode_password(str(item.get("password") or "")),
                 "use_cookies": bool(item.get("use_cookies", False)),
             }
@@ -209,6 +223,7 @@ class AccountStore:
             "accounts": {
                 str(uid): {
                     "username": acc.get("username", ""),
+                    "name": str(acc.get("name") or "").strip(),
                     "password": encode_password(acc.get("password", "")),
                     "use_cookies": bool(acc.get("use_cookies", False)),
                 }

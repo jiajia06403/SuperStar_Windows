@@ -100,11 +100,12 @@ def run_selftest(timeout_s: float = 30.0, poll_ms: int = POLL_MS) -> dict:
     def tick() -> None:
         nonlocal started, empty_ticks
 
-        # ① 等课程列表上屏后再全选开刷（演示登录结果经事件泵渲染，不能按固定延时猜）
+        # ① 等课程列表上屏后再开始刷课（演示登录结果经事件泵渲染，不能按固定延时猜）
         if not started:
             app.root.update_idletasks()
             if app.courses and app.course_tree.get_children():
-                app._set_all_checked(True)
+                # 课程列表是单选：选中第一门（选中即展示该课程章节）再开刷
+                app.select_first_course()
                 stats["checked"] = len(app.checked)
                 app.on_start()
                 started = True

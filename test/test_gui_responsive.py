@@ -54,7 +54,7 @@ def _check(app, width: int, height: int, font) -> None:
     assert title_w <= limit, f"{tag}: 章节列 {title_w}px 超出可用宽度（上限 {limit}px）"
 
     # 4) 提示 / 状态栏超宽时截断，且不超出控件宽度
-    app._set_hint("上海市大学生安全教育（2026级） · 已完成 2/244 章 · 未开放 90 章" * 3)
+    app._set_hint("上海市大学生安全教育（2026级） · 已完成 2/244 章 · 待学 90 章" * 3)
     app._set_status_text("学习中 3/244 · " + "很长的章节标题" * 20)
     _pump(app, rounds=2)
     for name, widget in (("hint", app.chapter_hint), ("status", app.status_label)):

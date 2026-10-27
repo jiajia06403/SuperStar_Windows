@@ -293,17 +293,22 @@ def saved_maximized() -> bool:
 # 登录对话框
 # --------------------------------------------------------------------------- #
 class LoginDialog(tk.Toplevel):
-    """手机号/密码登录窗口；结果放在 ``self.result``（None 表示取消）。
+    """手机号/密码/名称登录窗口；结果放在 ``self.result``（None 表示取消）。
 
-    ``result`` 为 ``(username, password, use_cookies, remember)``。
+    ``result`` 为 ``(username, password, use_cookies, remember, name)``。
     ``remember`` 为 True 时账号（密码经 DPAPI 加密）写入本机账号文件，下次启动自动登录。
+    ``name`` 是该账号的本地显示名称：留空则跟随手机号（cookies 登录时退化为 uid），
+    且不允许与其他账号重名（``taken_names`` 由宿主传入，引擎侧还会再校验一次）。
+    ``add_only`` 为 True 表示「添加账号」流程：登录出来的 uid 若已存在，引擎会报错，
+    不重复登记同一个账号。
 
     错误提示不另弹对话框：账号/密码为空或登录失败时，错误信息直接显示在
     「取消 / 登录」两个按钮**左侧**（``msg_label``），窗口保留，用户可直接改密码重试。
     """
 
     def __init__(self, master: tk.Misc, username: str = "", password: str = "",
-                 remember: bool = True, error: str = "", on_submit=None):
+                 remember: bool = True, error: str = "", on_submit=None,
+                 name: str = "", taken_names=(), add_only: bool = False):
         super().__init__(master)
         self.title("登录超星学习通")
         self.resizable(True, True)
@@ -311,6 +316,9 @@ class LoginDialog(tk.Toplevel):
         self.on_closed = None            # 窗口关闭回调（App 用它作废在途登录结果）
         self._on_submit = on_submit
         self._busy = False
+        self.add_only = bool(add_only)   # True = 「添加账号」流程（uid 重复要报错）
+        # 已占用的账号名称（小写），用于行内判重（引擎侧还会再校验一次）
+        self._taken_names = {str(n).strip().casefold() for n in (taken_names or ()) if str(n).strip()}
         _ensure_msg_styles(self)
 
         body = ttk.Frame(self, padding=16)
@@ -318,30 +326,42 @@ class LoginDialog(tk.Toplevel):
         # 列可伸缩：窗口拉宽时输入框跟着变宽（只写 sticky="ew" 而不给 weight 是死代码）
         body.columnconfigure(0, weight=1)
 
-        ttk.Label(body, text="手机号").grid(row=0, column=0, sticky="w", pady=(0, 4))
+        ttk.Label(body, text="名称（本地显示名，留空自动用手机号）").grid(
+            row=0, column=0, sticky="w", pady=(0, 4))
+        self.name_var = tk.StringVar(value=name)
+        self._auto_name = ""             # 最近一次「跟随手机号」写入的名称
+        self.name_entry = ttk.Entry(body, textvariable=self.name_var, width=32)
+        self.name_entry.grid(row=1, column=0, sticky="ew")
+        # 用户手动改过名称后就不再跟随手机号；清空后重新跟随
+        self.name_entry.bind("<Key>", self._on_name_key)
+        self._name_trace = None
+
+        ttk.Label(body, text="手机号").grid(row=2, column=0, sticky="w", pady=(10, 4))
         self.user_var = tk.StringVar(value=username)
         self.user_entry = ttk.Entry(body, textvariable=self.user_var, width=32)
-        self.user_entry.grid(row=1, column=0, sticky="ew")
+        self.user_entry.grid(row=3, column=0, sticky="ew")
+        # 名称留空时跟随手机号输入（= 默认名称就是手机号）
+        self._name_trace = self.user_var.trace_add("write", self._follow_username)
 
-        ttk.Label(body, text="密码").grid(row=2, column=0, sticky="w", pady=(10, 4))
+        ttk.Label(body, text="密码").grid(row=4, column=0, sticky="w", pady=(10, 4))
         self.pass_var = tk.StringVar(value=password)
         self.pass_entry = ttk.Entry(body, textvariable=self.pass_var, show="*", width=32)
-        self.pass_entry.grid(row=3, column=0, sticky="ew")
+        self.pass_entry.grid(row=5, column=0, sticky="ew")
 
         self.cookie_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             body, text="使用 progress_cache\\cookies.txt 登录（忽略账号密码）",
             variable=self.cookie_var,
-        ).grid(row=4, column=0, sticky="w", pady=(10, 0))
+        ).grid(row=6, column=0, sticky="w", pady=(10, 0))
 
         self.remember_var = tk.BooleanVar(value=remember)
         ttk.Checkbutton(
             body, text="记住账号与密码（本机加密保存，下次启动自动登录）",
             variable=self.remember_var,
-        ).grid(row=5, column=0, sticky="w", pady=(4, 0))
+        ).grid(row=7, column=0, sticky="w", pady=(4, 0))
 
         btns = ttk.Frame(body)
-        btns.grid(row=6, column=0, sticky="e", pady=(14, 0))
+        btns.grid(row=8, column=0, sticky="e", pady=(14, 0))
         # 行内提示区：夹在「取消 / 登录」两个按钮左侧，宽度由 _fit_msg_area 定。
         # 高度按字体行高算：写死 24px 在 150% 缩放下会比按钮矮，纵向中心就对不齐。
         self.msg_holder = ttk.Frame(btns, width=160, height=max(24, layout.line_height() + 6))
@@ -452,6 +472,7 @@ class LoginDialog(tk.Toplevel):
             self.pass_var.get(),
             self.cookie_var.get(),
             self.remember_var.get(),
+            self.name_var.get().strip(),
         )
         self.destroy()
 
@@ -475,6 +496,21 @@ class LoginDialog(tk.Toplevel):
                 except Exception:  # noqa: BLE001
                     pass
 
+    # ---------------- 名称默认值 ----------------
+    def _follow_username(self, *_args) -> None:
+        """名称留空（或仍是自动填入值）时跟随手机号，等于「默认名称=手机号」。"""
+        current = self.name_var.get().strip()
+        if current and current != self._auto_name:
+            return                       # 用户自己填过，不再覆盖
+        want = self.user_var.get().strip()
+        self._auto_name = want
+        if current != want:
+            self.name_var.set(want)
+
+    def _on_name_key(self, _event=None) -> None:
+        """名称框有键入手势即视为「用户自定义」，此后不再跟随手机号。"""
+        self._auto_name = "\x00"         # 不可能等于任何真实名称
+
     # ---------------- 交互 ----------------
     def _center(self, master: tk.Misc) -> None:
         self.update_idletasks()
@@ -492,6 +528,11 @@ class LoginDialog(tk.Toplevel):
         pwd = self.pass_var.get()
         use_cookie = self.cookie_var.get()
         remember = self.remember_var.get()
+        name = self.name_var.get().strip()
+        if name and name.casefold() in self._taken_names:
+            # 重名在本地就能判出来：不必等一次网络登录失败，直接行内报错
+            self.show_error(f"名称「{name}」已被其他账号使用")
+            return
         if not use_cookie and not (user and pwd):
             # 账号/密码缺失：行内提示，不弹框、不关窗口
             # （勾选 cookies 的说明就在上方勾选项里，这里不再重复长句）
@@ -500,10 +541,116 @@ class LoginDialog(tk.Toplevel):
         self.show_info("登录中…")
         self.set_busy(True)
         if self._on_submit is not None:
-            self._on_submit(self, user, pwd, use_cookie, remember)
+            self._on_submit(self, user, pwd, use_cookie, remember, name)
         else:
-            self.result = (user, pwd, use_cookie, remember)
+            self.result = (user, pwd, use_cookie, remember, name)
             self.destroy()
+
+
+# --------------------------------------------------------------------------- #
+# 账号设置对话框（改名称 / 删除账号）
+# --------------------------------------------------------------------------- #
+class AccountDialog(tk.Toplevel):
+    """单个已保存账号的本地设置：改名称、删除。
+
+    ``result``：
+      - ``None``                 取消
+      - ``("save", 名称)``        保存名称
+      - ``("delete", "")``       删除该账号（调用方再确认一次并落盘）
+
+    名称在本窗口先做一次判重（``taken_names`` 由宿主传入，已排除本账号），
+    引擎侧写入时还会再校验一次，避免两处判据不一致。
+    """
+
+    def __init__(self, master: tk.Misc, uid: str = "", name: str = "",
+                 username: str = "", taken_names=(), can_delete: bool = True):
+        super().__init__(master)
+        self.title("账号设置")
+        self.resizable(False, False)
+        self.result = None
+        self.uid = str(uid or "")
+        self._taken_names = {str(n).strip().casefold() for n in (taken_names or ())
+                             if str(n).strip()}
+        _ensure_msg_styles(self)
+
+        body = ttk.Frame(self, padding=14)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(1, weight=1)
+
+        ttk.Label(body, text="名称").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.name_var = tk.StringVar(value=str(name or ""))
+        self.name_entry = ttk.Entry(body, textvariable=self.name_var, width=28)
+        self.name_entry.grid(row=0, column=1, sticky="ew")
+
+        ttk.Label(body, text="手机号").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        ttk.Label(body, text=str(username or "（未保存手机号）"),
+                  style="Status.TLabel").grid(row=1, column=1, sticky="w", pady=(8, 0))
+
+        ttk.Label(body, text="uid").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(4, 0))
+        ttk.Label(body, text=self.uid or "（未知）",
+                  style="Status.TLabel").grid(row=2, column=1, sticky="w", pady=(4, 0))
+
+        ttk.Label(body, text="名称只在本机用于区分账号，留空则恢复为默认（手机号 / uid）。",
+                  style="Status.TLabel").grid(row=3, column=0, columnspan=2, sticky="w", pady=(10, 0))
+
+        self.msg_label = ttk.Label(body, text="", style="Info.TLabel", anchor="w")
+        self.msg_label.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+
+        btns = ttk.Frame(body)
+        btns.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        if can_delete:
+            ttk.Button(btns, text="删除账号", command=self._on_delete).pack(side="left")
+        ttk.Button(btns, text="保存", command=self._on_save).pack(side="right")
+        ttk.Button(btns, text="取消", command=self.destroy).pack(side="right", padx=(0, 8))
+
+        self.transient(master)
+        try:
+            self.grab_set()
+        except tk.TclError:
+            pass
+        self.bind("<Return>", lambda _e: self._on_save())
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self._center(master)
+        theme.register_window(self)
+        try:
+            self.focus_force()
+            self.name_entry.focus_set()
+            self.name_entry.select_range(0, "end")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _center(self, master: tk.Misc) -> None:
+        self.update_idletasks()
+        try:
+            x = master.winfo_rootx() + (master.winfo_width() - self.winfo_width()) // 2
+            y = master.winfo_rooty() + (master.winfo_height() - self.winfo_height()) // 3
+            self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _error(self, text: str) -> None:
+        self.msg_label.configure(text=text, style="Error.TLabel")
+
+    def _on_save(self) -> None:
+        name = self.name_var.get().strip()
+        if name and name.casefold() in self._taken_names:
+            self._error(f"名称「{name}」已被其他账号使用")
+            return
+        self.result = ("save", name)
+        self.destroy()
+
+    def _on_delete(self) -> None:
+        who = self.name_var.get().strip() or self.uid
+        if not messagebox.askyesno(
+            "删除账号",
+            f"确定删除账号「{who}」吗？\n\n"
+            f"只删除本机保存的账号信息与登录状态（uid={self.uid}），"
+            f"不影响学习通上的课程与进度。",
+            parent=self,
+        ):
+            return
+        self.result = ("delete", "")
+        self.destroy()
 
 
 # --------------------------------------------------------------------------- #
@@ -528,7 +675,7 @@ class SettingsDialog(tk.Toplevel):
     PROVIDERS = ("TikuYanxi", "TikuLike", "TikuAdapter", "AI", "DeepSeek", "SiliconFlow")
 
     HINTS = {
-        "": "题库已停用：只完成视频/文档/阅读任务点，章节检测与作业不自动答题。",
+        "": "题库已停用：跳过章节检测与作业。",
         "TikuYanxi": "言溪题库：只需 TOKEN（https://tk.enncy.cn/ 获取），多个用英文逗号分隔，按顺序使用。",
         "TikuLike": "LIKE 知识库：需要 TOKEN（https://www.datam.site/ 获取）；可分别开关联网搜索与图片识别。",
         "TikuAdapter": "TikuAdapter：填自建服务的查询地址，通常形如 http://127.0.0.1:5000/api/search。",
@@ -546,18 +693,17 @@ class SettingsDialog(tk.Toplevel):
         ("cover_rate", "最低题库覆盖率（0 表示不要求）", "text"),
         ("delay", "搜题间隔(秒)", "text"),
         ("work_retry", "不合格重答次数（0 不重答；因此导致下章未开放时无限重答）", "text"),
-        ("local_bank", "启用本地题库并核验判分（只存正确答案，按课程入库；"
-                       "开启后提交即自动核验，补缺失 + 纠正答错的题）", "bool"),
+        ("local_bank", "启用本地题库并核验判分（只存正确答案，按课程入库）", "bool"),
     )
     # 大模型方式共用的小项（同一份配置键，切换方式时值保留）
     LLM_SHARED_FIELDS = (
         ("min_interval_seconds", "最小请求间隔(秒)", "text"),
-        ("http_proxy", "HTTP 代理(可留空)", "text"),
+        ("http_proxy", "HTTP 代理", "text"),
     )
     # [common] 段：视频学习 + 并发相关的键（观看进度要求 / 状态日志间隔 / 章内任务点并发）
     RUN_FIELDS = (
         ("point_jobs", "任务点并发（同一章节内同时刷几个任务点，1~8；1 = 章内串行最稳）", "text"),
-        ("video_finish_percent", "观看进度要求(%)，到达后每 5 秒复查（90~100，100 = 看完才查）", "text"),
+        ("video_finish_percent", "观看进度要求(%)，到达后每 5 秒复查（90~100）", "text"),
         ("video_log_interval", "视频状态日志间隔(秒，0 = 不输出)", "text"),
     )
     RUN_DEFAULTS = {"point_jobs": "1", "video_finish_percent": "90", "video_log_interval": "10"}
@@ -622,12 +768,12 @@ class SettingsDialog(tk.Toplevel):
         "DeepSeek": {
             "deepseek_endpoint": "https://api.deepseek.com/v1",
             "deepseek_key": "",
-            "deepseek_model": "deepseek-chat",
+            "deepseek_model": "deepseek-flash",
         },
         "SiliconFlow": {
             "siliconflow_endpoint": "https://api.siliconflow.cn/v1/chat/completions",
             "siliconflow_key": "",
-            "siliconflow_model": "deepseek-ai/DeepSeek-V3.2",
+            "siliconflow_model": "deepseek-ai/DeepSeek-V4.1-Flash",
         },
     }
 
@@ -688,10 +834,8 @@ class SettingsDialog(tk.Toplevel):
         self._build_fields(self.run_frame, self.RUN_FIELDS)
         ttk.Label(
             self.run_frame,
-            text="任务点并发 = 单个章节内同时刷几个任务点（界面「并发章节」管的是同时刷几章，两者相乘是总并发）；\n"
-                 "观看进度要求 = 播到该百分比后每 5 秒复查一次；平台仍未认可就继续看，不会中断，"
-                 "直到通过或看完（100 = 从结尾开始复查）；\n"
-                 "状态日志按间隔在日志输出：章节号 / 视频名 / 进度百分比 / 预计剩余。",
+            text="任务点并发 = 单个章节内同时刷几个任务点；\n"
+                 "观看进度要求 = 播到该百分比后每 5 秒复查一次，直到观看任务完成。",
             style="Status.TLabel", justify="left",
         ).grid(row=len(self.RUN_FIELDS), column=0, columnspan=2, sticky="w", pady=(2, 0))
 
@@ -743,7 +887,7 @@ class SettingsDialog(tk.Toplevel):
         btns = ttk.Frame(body)
         btns.pack(fill="x", pady=(4, 0))
         self.btns = btns
-        ttk.Label(btns, text="保存后立即作用于当前登录账号", style="Status.TLabel").pack(side="left")
+        ttk.Label(btns, text="保存后立即生效", style="Status.TLabel").pack(side="left")
         ttk.Button(btns, text="本地题库…", command=self._open_bank).pack(side="left", padx=(10, 0))
         ttk.Button(btns, text="保存", command=self._on_save).pack(side="right")
         ttk.Button(btns, text="取消", command=self.destroy).pack(side="right", padx=(0, 8))
@@ -1300,6 +1444,9 @@ class App:
         self._login_dialog = None                 # 当前打开的登录框（行内报错用）
         self._login_gen = 0                       # 登录代数：登录框关闭/重开即作废旧结果
         self.silent = False                       # True 时不弹模态框（截图/自检）
+        # 「需手动」提示框：正在显示 / 排队等显示的请求（引擎会一直等我们 ack）
+        self._manual_prompt_open = False
+        self._manual_prompts: "list[tuple[str, str, int]]" = []
         # 自检/测试传了临时 cache_dir：只读配置、不写用户配置，避免污染源码目录
         self._can_save_config = sync_config
 
@@ -1358,6 +1505,7 @@ class App:
         e.on(e.COURSE, lambda cid, phase: q(("course", cid, phase)))
         e.on(e.STATUS, lambda st, msg: q(("status", st, msg)))
         e.on(e.ACCOUNTS, lambda uids: q(("accounts", uids)))
+        e.on(e.PROMPT, lambda t, ct, sec: q(("prompt", t, ct, sec)))
         e.on(e.FINISHED, lambda *_: q(("finished",)))
 
     def _sync_user_config(self) -> None:
@@ -1580,6 +1728,10 @@ class App:
         self.acc_combo.pack(side="left", padx=(4, 6))
         # 选中其他账号 = 自动切换；选中末尾「+ 添加账号」= 触发登录框（无需独立按钮）
         self.acc_combo.bind("<<ComboboxSelected>>", self._on_acc_selected)
+        # 账号设置 = 改当前选中账号的本地名称 / 删除该账号
+        self.acc_set_btn = ttk.Button(left, text="账号设置", width=8,
+                                      command=self.on_account_settings)
+        self.acc_set_btn.pack(side="left", padx=(0, 4))
         ttk.Button(left, text="设置", width=6, command=self.on_open_settings).pack(side="left", padx=4)
         if demo_available():
             # 仅测试包出现：发行包已排除 demo_chaoxing 模块
@@ -1862,19 +2014,18 @@ class App:
 
     # ---------------- 账号 ----------------
     def on_add_account(self) -> None:
-        """打开登录框；已保存过账号时直接回填，通常点一下「登录」即可。"""
-        saved = self.engine.saved_account() or {}
-        self._open_login_dialog(
-            username=saved.get("username", ""),
-            password=saved.get("password", ""),
-        )
+        """打开登录框新增账号：**不回填**当前账号的账密（避免误登录成已有账号）。"""
+        self._open_login_dialog(add_only=True)
 
     def _open_login_dialog(self, username: str = "", password: str = "",
-                           error: str = "") -> None:
+                           error: str = "", add_only: bool = False,
+                           name: str = "") -> None:
         """（重）弹登录框。
 
         ``error`` 非空时直接把原因显示在「取消 / 登录」两个按钮左侧（行内提示），
         不再弹独立的消息框；用户可直接改密码重试。
+        ``add_only`` = 「添加账号」流程：登录出来的 uid 已存在时引擎报错，不重复登记。
+        ``name`` 为空时：新增账号留空（跟随手机号），重登已有账号沿用其名称。
         """
         old = self._login_dialog
         if old is not None and old.winfo_exists():
@@ -1885,16 +2036,109 @@ class App:
             old.lift()
             old.focus_force()
             return
+        if not add_only and not str(name or "").strip():
+            name = self._name_of_username(username)
         self._login_gen += 1
         dlg = LoginDialog(
             self.root,
             username=username,
             password=password,
+            name=name,
             error=error,
             on_submit=self._submit_login,
+            taken_names=self._taken_names(self._uid_of_username(username)),
+            add_only=add_only,
         )
         dlg.on_closed = self._on_login_dialog_closed
         self._login_dialog = dlg
+
+    def _uid_of_username(self, username: str) -> str:
+        """按手机号找已保存账号的 uid（重登已有账号时用于排除自己的名称）。"""
+        target = str(username or "").strip()
+        if not target:
+            return ""
+        for uid, acc in self.engine.accounts.items():
+            if str(acc.get("username") or "").strip() == target:
+                return str(uid)
+        return ""
+
+    def _name_of_username(self, username: str) -> str:
+        """按手机号取已保存账号的名称（重登时预填，避免把自定义名改成手机号）。"""
+        uid = self._uid_of_username(username)
+        if not uid:
+            uid = str(self.engine.last_uid or "")
+        return self.engine.account_name(uid) if uid in self.engine.accounts else ""
+
+    def _taken_names(self, exclude_uid: str = "") -> list:
+        """已被其他账号占用的名称列表（登录框 / 账号设置框本地判重用）。"""
+        skip = str(exclude_uid or "")
+        return [self.engine.account_name(u) for u in self.engine.accounts if str(u) != skip]
+
+    def on_account_settings(self) -> None:
+        """账号设置：改「下拉里选中的那个账号」的名称，或删除它。"""
+        uid = self._selected_acc_uid()
+        if not uid:
+            self._tips("暂无已保存的账号，请在账号下拉选择「+ 添加账号」")
+            return
+        if self.engine.is_running or self._collecting:
+            self._tips("请先停止当前刷课再修改账号")
+            return
+        acc = self.engine.accounts.get(str(uid)) or {}
+        dlg = AccountDialog(
+            self.root,
+            uid=str(uid),
+            name=self.engine.account_name(str(uid)),
+            username=str(acc.get("username") or ""),
+            taken_names=self._taken_names(exclude_uid=str(uid)),
+        )
+        self.root.wait_window(dlg)
+        if not dlg.result:
+            return
+        action, name = dlg.result
+        if action == "delete":
+            self._delete_account(str(uid))
+            return
+        try:
+            new_name = self.engine.rename_account(str(uid), name)
+        except Exception as exc:  # noqa: BLE001 - 重名等业务错误原样提示
+            messagebox.showerror("账号设置", str(exc) or "保存失败", parent=self.root)
+            return
+        self.log(f"【账号】名称已改为「{new_name}」")
+        self._ev_accounts(list(self.engine.accounts.keys()))
+
+    def _delete_account(self, uid: str) -> None:
+        """删除账号：当前账号被删时清空课程列表并回到未登录状态。"""
+        try:
+            dropped = self.engine.delete_account(uid)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("删除账号", str(exc) or "删除失败", parent=self.root)
+            return
+        self._ev_accounts(list(self.engine.accounts.keys()))
+        if dropped:
+            # 会话已清空：课程 / 章节 / 选中状态一并清掉，回到「未登录」界面
+            self._studying_cids.clear()
+            self._studying_pids.clear()
+            self.current_course = None
+            self._ev_courses([])
+            self.chapter_tree.delete(*self.chapter_tree.get_children())
+            self._chapter_rows.clear()
+            self._chapter_titles.clear()
+            self._chapter_states.clear()
+            self._chapter_order = []
+            self._set_hint("")
+            self.set_status("idle", "当前账号已删除，请重新登录或添加账号")
+            self.log("【账号】已删除当前账号，登录状态已清空")
+        else:
+            self.log("【账号】已删除一个未登录的账号")
+
+    def _selected_acc_uid(self) -> str:
+        """账号下拉当前选中项的 uid（选的是「+ 添加账号」或无选中时取当前账号）。"""
+        sel = (self.acc_combo.get() or "").strip()
+        uid = self._acc_uids.get(sel, "")
+        if uid:
+            return str(uid)
+        cur = self.engine.current_uid or self.engine.last_uid
+        return str(cur) if cur else ""
 
     def _on_login_dialog_closed(self, dlg) -> None:
         """登录框被关闭（取消/成功/被替换）：作废在途的登录结果，避免误弹新框。"""
@@ -1903,21 +2147,23 @@ class App:
         self._login_gen += 1
 
     def _submit_login(self, dlg, user: str, pwd: str, use_cookie: bool,
-                      remember: bool) -> None:
+                      remember: bool, name: str = "") -> None:
         """登录框点「登录」：起后台线程执行登录，结果经事件队列回到主线程。"""
         gen = self._login_gen
+        add_only = bool(getattr(dlg, "add_only", False))
         threading.Thread(
             target=self._do_login,
-            args=(gen, user, pwd, use_cookie, load_tiku_config(), remember),
+            args=(gen, user, pwd, use_cookie, load_tiku_config(), remember, name, add_only),
             daemon=True,
         ).start()
 
     def _do_login(self, gen: int, user: str, pwd: str, use_cookie: bool,
-                  tiku: dict, remember: bool = True) -> None:
+                  tiku: dict, remember: bool = True, name: str = "",
+                  add_only: bool = False) -> None:
         try:
             self.events.put(("status", "logging", f"登录中 {user or '(cookies)'}"))
-            self.engine.login(user, pwd, use_cookies=use_cookie,
-                              tiku_config=tiku, remember=remember)
+            self.engine.login(user, pwd, use_cookies=use_cookie, tiku_config=tiku,
+                              remember=remember, name=name, reject_existing=add_only)
             self.events.put(("courses", self.engine.list_courses()))
             self.events.put(("login_result", gen, True, ""))
         except Exception as exc:  # noqa: BLE001
@@ -2057,10 +2303,10 @@ class App:
 
     # ---------------- 课程列表 ----------------
     def _acc_label(self, uid: str) -> str:
-        """账号下拉显示文本：有手机号就显示「手机号 · uid」，否则只显示 uid。"""
-        acc = self.engine.accounts.get(str(uid)) or {}
-        name = str(acc.get("username") or "").strip()
-        return f"{name} · {uid}" if name and name != str(uid) else str(uid)
+        """账号下拉显示文本：「本地名称 · uid」（未设名称时名称即手机号）。"""
+        uid = str(uid)
+        name = self.engine.account_name(uid)
+        return f"{name} · {uid}" if name and name != uid else uid
 
     def _ev_accounts(self, uids) -> None:
         uids = [str(u) for u in (uids or [])]
@@ -2674,6 +2920,40 @@ class App:
 
     def _ev_status(self, state: str, message: str) -> None:
         self.set_status(state, message)
+
+    def _ev_prompt(self, title: str, cur_title: str, seconds: int) -> None:
+        """引擎请求「需手动」确认：弹模态提示，用户关掉后才通知引擎开始计时。
+
+        引擎线程此处在阻塞等待 ``ack_manual()``，所以**必须**保证最终 ack
+        （包括静默模式、弹窗异常），否则刷课线程会一直卡住。
+        """
+        self._manual_prompts.append((str(title), str(cur_title), int(seconds or 0)))
+        self._show_next_manual_prompt()
+
+    def _show_next_manual_prompt(self) -> None:
+        """依次弹出排队中的「需手动」提示（一次只弹一个，避免叠框）。"""
+        if self._manual_prompt_open or not self._manual_prompts:
+            return
+        title, cur_title, seconds = self._manual_prompts.pop(0)
+        self._manual_prompt_open = True
+        try:
+            if not self.silent:
+                messagebox.showinfo(
+                    "需要你手动处理",
+                    f"自动重答已停止，请到浏览器里手动完成本章：\n\n"
+                    f"《{title}》\n\n"
+                    f"完成后程序会自动接着刷课；计时结束仍检测不到进度，"
+                    f"将结束本章所在课程《{cur_title}》。\n\n"
+                    f"关闭本提示后开始计时：{seconds} 秒，"
+                    f"期间每 {max(1, int(self.engine.poll_interval))} 秒检查一次进度。",
+                    parent=self.root,
+                )
+        finally:
+            self._manual_prompt_open = False
+            # 先放行引擎，再处理排队中的下一条
+            self.engine.ack_manual()
+            if self._manual_prompts:
+                self.root.after(50, self._show_next_manual_prompt)
 
     def _ev_course(self, cid: str, phase: str) -> None:
         """课程级开始/结束：维护左侧列表的「进行中」标记。"""

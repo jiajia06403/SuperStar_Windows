@@ -18,9 +18,11 @@ SuperStar Windows 引擎
        - 上一章已完成（或本就首章）则每 15 秒检查当前章节状态，直到开放或软件关闭；
        - 自动重答判定「过不了」之后（轮数到顶 / 一题没搜到 / 判分无进展 / 答案没变 /
          平台阻断提交 ``ChapterResult.NO_RETRY``，例如弹图形验证码），**不再立刻结束**：
-         留出 manual_wait 秒（默认 300）让用户去浏览器手动完成这一章，期间每
-         poll_interval 秒回读一次进度；做完了就自动接着刷，到点仍无变化才结束本课程
-         （否则就是每 15 秒空转的死循环）。
+         先发 ``PROMPT`` 事件让界面弹窗提示「需手动」，**用户关掉弹窗之后**才开始
+         manual_wait 秒（默认 300）的计时，期间每 poll_interval 秒回读一次进度；
+         做完了就自动接着刷，到点仍无变化才结束本课程
+         （否则就是每 15 秒空转的死循环）。没有界面消费 ``PROMPT`` 时（CLI/测试/自检）
+         不等待确认，直接开始计时。
 
   4. **异常隔离**：任务点 / 章节 / 课程三层各自兜底，单点网络或解析异常只会让
      该任务点（最多该章节、该课程）失败，绝不会穿透到主循环把整轮刷课结束掉：
@@ -59,7 +61,7 @@ from api.exceptions import LoginError
 from api.logger import logger
 from api.live import Live
 from api.live_process import LiveProcessor
-from account_store import AccountStore
+from account_store import AccountStore, account_display_name
 from paths import data_dir as _data_dir
 
 # 视频状态日志默认间隔（秒）；0 表示不输出。可在 config_win.ini 的 [common] 段调整。
@@ -75,8 +77,9 @@ DEFAULT_REANSWER_ROUNDS = 3
 
 # 自动重答判定「过不了」（轮数到顶 / 平台弹验证码 / 一题没搜到 / 判分无进展）之后，
 # 留出用户手动在浏览器完成本章的窗口期（秒，[tiku] manual_wait）。
-# 期间每 poll_interval 秒回读一次服务端进度：用户真做完了就自动接着刷，
-# 到点仍没变化才判无解、结束本课程。0 = 不等（立刻结束）。
+# 界面会先弹窗提示，**用户关掉弹窗之后**才开始计时，期间每 poll_interval 秒回读一次
+# 服务端进度：用户真做完了就自动接着刷，到点仍没变化才判无解、结束本课程。
+# 0 = 不等（立刻结束）。
 DEFAULT_MANUAL_WAIT = 300
 
 # 连续多少轮「判对题数没涨、也没拿到正确答案」就判定重答毫无进展（停止重答）
@@ -660,6 +663,9 @@ class StudyEngine:
     STATUS = "status"              # (state, message)
     ACCOUNTS = "accounts"          # (uid_list)
     FINISHED = "finished"          # (stopped: bool)；同时记录到 engine.last_stopped
+    # (prev_title, cur_title, seconds)：需要用户手动处理，界面弹窗提示；
+    # 用户关掉弹窗后必须调用 ack_manual()，引擎才真正开始 manual_wait 计时。
+    PROMPT = "prompt"
 
     def __init__(self, cache_dir: "str | None" = None, poll_interval: int = 15,
                  reanswer_interval: float = 5.0):
@@ -690,6 +696,8 @@ class StudyEngine:
         self.reanswer_rounds = DEFAULT_REANSWER_ROUNDS
         # 自动重答放弃后，等待用户手动完成本章的秒数（[tiku] manual_wait）
         self.manual_wait = DEFAULT_MANUAL_WAIT
+        # 等待界面确认「需手动」提示的事件队列（FIFO：并发章节各等各的）
+        self._manual_acks: list[threading.Event] = []
         # 视频状态日志间隔（秒，0=关闭）：观看视频时每 N 秒输出章节号/进度百分比等
         self.video_log_interval = video_log_interval_from_config()
         # 观看进度要求（90~100）：播到该比例后每 5 秒复查一次，未通过就继续看
@@ -706,6 +714,17 @@ class StudyEngine:
                 cb(*args)
             except Exception:  # noqa: BLE001
                 logger.debug(f"事件回调异常({event}): {traceback.format_exc()}")
+
+    def ack_manual(self) -> None:
+        """界面确认「需手动」提示已关闭：放行最早一个等待中的计时。
+
+        必须由 **主线程** 在弹窗关闭后调用（引擎线程此时正阻塞在
+        ``_await_manual_ack`` 里）。没有等待中的请求时是空操作。
+        """
+        with self._lock:
+            pending = self._manual_acks.pop(0) if self._manual_acks else None
+        if pending is not None:
+            pending.set()
 
     # ---- 登录 / 账号切换 ----
     @staticmethod
@@ -788,29 +807,40 @@ class StudyEngine:
             logger.debug(f"设置章节上下文失败: {exc}")
 
     def login(self, username: str, password: str, use_cookies: bool = False,
-              tiku_config: Optional[dict] = None, remember: bool = True) -> str:
+              tiku_config: Optional[dict] = None, remember: bool = True,
+              name: Optional[str] = None, reject_existing: bool = False) -> str:
         """登录并返回当前账号 uid；同时建立/切换该 uid 的进度缓存。
 
         ``remember``：是否把账号（含密码，DPAPI 加密）写入本机账号文件，
         以便下次启动自动登录。False 时只记住账号名、不保存密码。
+        ``name``：本地显示名称；缺省沿用该账号原有名称，再退回手机号 / uid。
+        ``reject_existing``：新增账号时置 True —— 登录出来的 uid 已存在则报错，
+        避免「重复添加同一个账号」把列表搞乱（自动登录 / 切换账号不要传它，
+        那种场景下重复登录就是刷新凭据）。
         """
         chaoxing = self._build_chaoxing(username, password, use_cookies, tiku_config)
         state = chaoxing.login(login_with_cookies=use_cookies)
         if not state.get("status"):
             raise LoginError(state.get("msg", "登录失败"))
         self._apply_work_retry(tiku_config)
-        uid = chaoxing.get_uid()
+        uid = str(chaoxing.get_uid())
         with self._lock:
+            if reject_existing and uid in self.accounts:
+                raise LoginError(
+                    f"该账号已在列表中（名称：{self.account_name(uid)}），无需重复添加"
+                )
+            resolved = self._resolve_name(name, uid, username)
             self.chaoxing = chaoxing
             self.current_uid = uid
             self.accounts[uid] = {
                 "username": username,
+                "name": resolved,
                 "password": password if remember else "",
                 "use_cookies": use_cookies,
             }
             self.cache.load(uid)  # 切换缓存
         self._persist_accounts(uid)
-        logger.info("登录成功")
+        logger.info(f"登录成功（名称：{resolved}）")
         self._emit(self.ACCOUNTS, list(self.accounts.keys()))
         self._emit(self.STATUS, "logged_in", f"uid={uid}")
         return uid
@@ -871,9 +901,89 @@ class StudyEngine:
         return {
             "uid": target,
             "username": acc.get("username", ""),
+            "name": account_display_name(target, acc),
             "password": acc.get("password", ""),
             "use_cookies": bool(acc.get("use_cookies", False)),
         }
+
+    # ---- 账号名称（本地显示名 / 重名判重）----
+    def account_name(self, uid: str) -> str:
+        """账号的本地显示名：自定义名称 > 手机号 > uid（永远非空，除非没这个账号）。"""
+        uid = str(uid or "")
+        return account_display_name(uid, self.accounts.get(uid) or {})
+
+    def name_owner(self, name: str, exclude_uid: str = "") -> str:
+        """返回占用该名称的账号 uid（没有则空串）。
+
+        ``exclude_uid`` 用于改名：排除账号自己，否则「改成原名」会被判成重名。
+        比较忽略大小写与首尾空白（中文名称等价于精确比较）。
+        """
+        target = str(name or "").strip().casefold()
+        if not target:
+            return ""
+        skip = str(exclude_uid or "")
+        for uid in list(self.accounts.keys()):
+            if str(uid) == skip:
+                continue
+            if self.account_name(uid).casefold() == target:
+                return str(uid)
+        return ""
+
+    def _resolve_name(self, name: Optional[str], uid: str, username: str = "") -> str:
+        """确定账号名称：显式取名 > 原有名称 > 手机号 > uid；重名抛 ``LoginError``。"""
+        target = str(name or "").strip()
+        if not target:
+            prev = self.accounts.get(str(uid)) or {}
+            target = str(prev.get("name") or "").strip()
+        if not target:
+            target = str(username or "").strip() or str(uid)
+        owner = self.name_owner(target, exclude_uid=uid)
+        if owner:
+            raise LoginError(f"名称「{target}」已被账号 {owner} 使用，请换一个")
+        return target
+
+    def rename_account(self, uid: str, name: str) -> str:
+        """修改账号的本地名称并落盘，返回生效后的名称。
+
+        名称不得与其他账号重名，冲突抛 ``LoginError``（界面据此行内报错，不改动任何数据）。
+        """
+        uid = str(uid or "")
+        with self._lock:
+            acc = self.accounts.get(uid)
+            if acc is None:
+                raise LoginError(f"未找到账号: {uid}")
+            target = str(name or "").strip()
+            if not target:                     # 留空 = 用该账号的默认名称
+                target = account_display_name(uid, acc) or uid
+            owner = self.name_owner(target, exclude_uid=uid)
+            if owner:
+                raise LoginError(f"名称「{target}」已被账号 {owner} 使用，请换一个")
+            acc["name"] = target
+        self._persist_accounts()
+        logger.info(f"账号名称已改为「{target}」（uid={uid}）")
+        self._emit(self.ACCOUNTS, list(self.accounts.keys()))
+        return target
+
+    def delete_account(self, uid: str) -> bool:
+        """删除已保存的账号（连同其登录状态），返回「删掉的是否当前账号」。
+
+        当前账号被删时清空 ``chaoxing`` / ``current_uid``，界面据此清空课程列表
+        并回到「未登录」，避免删完后还用着已删除账号的会话。
+        """
+        uid = str(uid or "")
+        with self._lock:
+            if uid not in self.accounts:
+                return False
+            name = self.account_name(uid)
+            self.accounts.pop(uid, None)
+            dropped = uid == str(self.current_uid or "")
+            if dropped:
+                self.current_uid = None
+                self.chaoxing = None
+        self._persist_accounts("" if dropped else None)
+        logger.info(f"已删除账号「{name}」（uid={uid}）")
+        self._emit(self.ACCOUNTS, list(self.accounts.keys()))
+        return dropped
 
     def auto_login(self, tiku_config: Optional[dict] = None) -> Optional[str]:
         """用最近一次的已保存账号自动登录；无可用账号时返回 None。"""
@@ -1596,7 +1706,8 @@ class StudyEngine:
 
         平台弹图形验证码 / 重做次数用尽 / 题库换不出答案时，自动重答此后怎么试都不会过，
         但**用户自己在浏览器里做完这一章**是完全可行的（尤其验证码只能人工过）。
-        所以不立刻判死，而是每 ``poll_interval`` 秒回读一次服务端进度：
+        所以不立刻判死，而是先弹窗提示（``PROMPT`` + ``ack_manual``，用户关掉弹窗
+        之后才开始计时），再每 ``poll_interval`` 秒回读一次服务端进度：
 
           * 上一章被手动做完了 -> 检查当前章节是否解锁：已解锁返回 True（继续刷课），
             仍锁着（老师还没放行）则转 ``_poll_until_open``；
@@ -1616,6 +1727,12 @@ class StudyEngine:
         cid = str(course.get("courseId", ""))
         pid = str(prev.get("id", ""))
         self._emit(self.PROGRESS, cid, pid, "manual")
+        self._emit(self.STATUS, "manual_wait",
+                   f"需手动完成: {title}")
+        # 先等用户看完/关掉提示弹窗，再开始计时：用户还没看到提示就开始倒计时
+        # 等于白等（关窗那一刻 5 分钟可能已经耗掉大半）。
+        if not self._await_manual_ack(title, cur_title, seconds):
+            return False
         self._emit(self.STATUS, "manual_wait",
                    f"等待手动完成（最多 {seconds}s）: {title}")
         deadline = time.monotonic() + seconds
@@ -1647,6 +1764,34 @@ class StudyEngine:
             prev, title, cur_title,
             f"{reason}；已等待用户手动完成 {seconds} 秒仍无进展",
         )
+
+    def _await_manual_ack(self, title: str, cur_title: str, seconds: int) -> bool:
+        """发 ``PROMPT`` 事件让界面弹窗，等用户关掉弹窗后才返回 True（开始计时）。
+
+        期间**不回读进度、不判断超时**——用户还没看到提示就倒计时，等于白等。
+        没有界面注册 ``PROMPT`` 回调时（CLI / 测试 / 自检）直接返回 True，
+        保持旧的「立刻开始计时」行为。用户点「停止」返回 False。
+        """
+        if not self._handlers.get(self.PROMPT):
+            return True
+        ack = threading.Event()
+        with self._lock:
+            self._manual_acks.append(ack)
+        try:
+            self._emit(self.PROMPT, title, cur_title, seconds)
+            logger.info("已弹出「需手动」提示，等待用户关闭后开始计时")
+            while not self._stop:
+                if ack.wait(0.2):
+                    logger.info(f"用户已关闭「需手动」提示，开始 {seconds} 秒计时: {title}")
+                    return True
+                if cancel.is_set():
+                    logger.info("等待用户确认「需手动」提示期间收到停止请求")
+                    return False
+            return False
+        finally:
+            with self._lock:
+                if ack in self._manual_acks:
+                    self._manual_acks.remove(ack)
 
     def _refresh_points_inplace(self, course: dict, points: list[dict]) -> bool:
         """从服务端回读章节完成状态并写回 ``points``（成功返回 True）。"""
