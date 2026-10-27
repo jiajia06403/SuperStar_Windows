@@ -930,13 +930,13 @@ class StudyEngine:
         return ""
 
     def _resolve_name(self, name: Optional[str], uid: str, username: str = "") -> str:
-        """确定账号名称：显式取名 > 原有名称 > 手机号 > uid；重名抛 ``LoginError``。"""
+        """确定账号名称：显式取名 > 原有名称 > uid（默认不展示手机号）；重名抛 ``LoginError``。"""
         target = str(name or "").strip()
         if not target:
             prev = self.accounts.get(str(uid)) or {}
             target = str(prev.get("name") or "").strip()
         if not target:
-            target = str(username or "").strip() or str(uid)
+            target = str(uid)
         owner = self.name_owner(target, exclude_uid=uid)
         if owner:
             raise LoginError(f"名称「{target}」已被账号 {owner} 使用，请换一个")

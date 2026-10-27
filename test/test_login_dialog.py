@@ -187,7 +187,8 @@ def test_login_failure_then_retry_succeeds():
     app.silent = True
     calls = {"n": 0}
 
-    def fake_login(username, password, use_cookies=False, tiku_config=None, remember=True):
+    def fake_login(username, password, use_cookies=False, tiku_config=None,
+                   remember=True, name=None, reject_existing=False):
         calls["n"] += 1
         if password != "goodpass":
             raise LoginError("手机号或密码错误")

@@ -326,22 +326,16 @@ class LoginDialog(tk.Toplevel):
         # 列可伸缩：窗口拉宽时输入框跟着变宽（只写 sticky="ew" 而不给 weight 是死代码）
         body.columnconfigure(0, weight=1)
 
-        ttk.Label(body, text="名称（本地显示名，留空自动用手机号）").grid(
+        ttk.Label(body, text="名称（本地显示名，留空默认用 uid）").grid(
             row=0, column=0, sticky="w", pady=(0, 4))
         self.name_var = tk.StringVar(value=name)
-        self._auto_name = ""             # 最近一次「跟随手机号」写入的名称
         self.name_entry = ttk.Entry(body, textvariable=self.name_var, width=32)
         self.name_entry.grid(row=1, column=0, sticky="ew")
-        # 用户手动改过名称后就不再跟随手机号；清空后重新跟随
-        self.name_entry.bind("<Key>", self._on_name_key)
-        self._name_trace = None
 
         ttk.Label(body, text="手机号").grid(row=2, column=0, sticky="w", pady=(10, 4))
         self.user_var = tk.StringVar(value=username)
         self.user_entry = ttk.Entry(body, textvariable=self.user_var, width=32)
         self.user_entry.grid(row=3, column=0, sticky="ew")
-        # 名称留空时跟随手机号输入（= 默认名称就是手机号）
-        self._name_trace = self.user_var.trace_add("write", self._follow_username)
 
         ttk.Label(body, text="密码").grid(row=4, column=0, sticky="w", pady=(10, 4))
         self.pass_var = tk.StringVar(value=password)
@@ -495,21 +489,6 @@ class LoginDialog(tk.Toplevel):
                     callback(self)
                 except Exception:  # noqa: BLE001
                     pass
-
-    # ---------------- 名称默认值 ----------------
-    def _follow_username(self, *_args) -> None:
-        """名称留空（或仍是自动填入值）时跟随手机号，等于「默认名称=手机号」。"""
-        current = self.name_var.get().strip()
-        if current and current != self._auto_name:
-            return                       # 用户自己填过，不再覆盖
-        want = self.user_var.get().strip()
-        self._auto_name = want
-        if current != want:
-            self.name_var.set(want)
-
-    def _on_name_key(self, _event=None) -> None:
-        """名称框有键入手势即视为「用户自定义」，此后不再跟随手机号。"""
-        self._auto_name = "\x00"         # 不可能等于任何真实名称
 
     # ---------------- 交互 ----------------
     def _center(self, master: tk.Misc) -> None:
@@ -2063,11 +2042,12 @@ class App:
         return ""
 
     def _name_of_username(self, username: str) -> str:
-        """按手机号取已保存账号的名称（重登时预填，避免把自定义名改成手机号）。"""
+        """按手机号取该账号已设置的**自定义**名称（重登时预填，空 = 默认用 uid）。"""
         uid = self._uid_of_username(username)
         if not uid:
             uid = str(self.engine.last_uid or "")
-        return self.engine.account_name(uid) if uid in self.engine.accounts else ""
+        acc = self.engine.accounts.get(str(uid)) or {}
+        return str(acc.get("name") or "").strip()
 
     def _taken_names(self, exclude_uid: str = "") -> list:
         """已被其他账号占用的名称列表（登录框 / 账号设置框本地判重用）。"""

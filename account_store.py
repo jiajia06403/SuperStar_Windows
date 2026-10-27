@@ -166,13 +166,10 @@ def decode_password(token: str) -> str:
 # 账号存储
 # --------------------------------------------------------------------------- #
 def account_display_name(uid, acc: dict) -> str:
-    """账号显示名：优先用户自定义名称，其次手机号，最后 uid。"""
+    """账号显示名：优先用户自定义名称，没设就用 uid（不展示手机号）。"""
     acc = acc or {}
     name = str(acc.get("name") or "").strip()
-    if name:
-        return name
-    username = str(acc.get("username") or "").strip()
-    return username or str(uid or "")
+    return name or str(uid or "")
 
 
 class AccountStore:
