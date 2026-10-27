@@ -150,11 +150,12 @@ def test_backtrack_when_prev_not_done():
 
 
 def test_reanswer_unlimited_when_quiz_failed():
-    """上一章答题不合格导致本章未开放 -> 重答不设上限，直到平台判通过。"""
+    """上一章答题不合格导致本章未开放 -> 在 reanswer_rounds 上限内一直重答，直到通过。"""
     tmp_path = tempfile.mkdtemp()
     eng = StudyEngine(cache_dir=str(tmp_path), poll_interval=0.01, reanswer_interval=0.01)
     eng.current_uid = "778"
     eng.work_retry = 1
+    eng.reanswer_rounds = 5
     fake = FakeChaoxing("778")
     fake.job_info_seq = [{"notOpen": False}]      # 重答成功后本章已解锁
     eng.chaoxing = fake
@@ -167,7 +168,7 @@ def test_reanswer_unlimited_when_quiz_failed():
 
     def _fail_then_ok(ch, course, point, speed, work_retry=1, **kw):
         rounds["n"] += 1
-        # 前 3 轮都判「不合格」，第 4 轮才通过（远超 work_retry=1 的次数）
+        # 前 3 轮都判「不合格」，第 4 轮才通过（work_retry=1 之外的额外重答）
         return ChapterResult.UNVERIFIED if rounds["n"] <= 3 else ChapterResult.SUCCESS
 
     engine.process_chapter = _fail_then_ok
@@ -178,8 +179,103 @@ def test_reanswer_unlimited_when_quiz_failed():
         engine.process_chapter = _ORIG_PROCESS_CHAPTER
 
     assert opened is True, "重答通过且本章解锁后应返回 True"
-    assert rounds["n"] == 4, f"不合格必须无限重答，实际只重答了 {rounds['n']} 轮"
+    assert rounds["n"] == 4, f"上限内应继续重答，实际只重答了 {rounds['n']} 轮"
     assert eng.cache.is_done("778", "C", "p0") is True
+
+
+def test_reanswer_stops_after_max_rounds():
+    """重答轮数达到 reanswer_rounds 仍不合格 -> 停止刷课（不再轮询解锁）。"""
+    tmp_path = tempfile.mkdtemp()
+    eng = StudyEngine(cache_dir=str(tmp_path), poll_interval=0.01, reanswer_interval=0.01)
+    eng.current_uid = "779"
+    eng.work_retry = 1
+    eng.reanswer_rounds = 3
+    fake = FakeChaoxing("779")
+    fake.job_info_seq = [{"notOpen": True}] * 100
+    eng.chaoxing = fake
+    points = [{"id": "p0", "title": "上一章"}, {"id": "p1", "title": "当前章"}]
+
+    rounds = {"n": 0}
+
+    def _always_unverified(ch, course, point, speed, work_retry=1, **kw):
+        rounds["n"] += 1
+        return ChapterResult.UNVERIFIED
+
+    engine.process_chapter = _always_unverified
+    try:
+        opened = eng._handle_not_open({"courseId": "C", "title": "x"}, points,
+                                      i=1, cid="C", uid="779")
+    finally:
+        engine.process_chapter = _ORIG_PROCESS_CHAPTER
+
+    assert opened is None, "重答无果时必须判「无解」并结束课程"
+    assert rounds["n"] == 3, f"应最多重答 {3} 轮，实际 {rounds['n']} 轮"
+    assert len(fake.job_info_seq) == 100, "停止重答后不得再查开放状态"
+    assert points[0]["work_refused"] is True
+
+
+def test_reanswer_stops_when_no_progress():
+    """判分没进展（判对题数不涨、拿不到正确答案）连续两轮 -> 停止重答。"""
+    tmp_path = tempfile.mkdtemp()
+    eng = StudyEngine(cache_dir=str(tmp_path), poll_interval=0.01, reanswer_interval=0.01)
+    eng.current_uid = "77a"
+    eng.work_retry = 1
+    eng.reanswer_rounds = 9          # 只靠「无进展」早停
+    fake = FakeChaoxing("77a")
+    fake.last_verdict_stats = {}
+    fake.job_info_seq = [{"notOpen": True}] * 100
+    eng.chaoxing = fake
+    points = [{"id": "p0", "title": "上一章"}, {"id": "p1", "title": "当前章"}]
+
+    rounds = {"n": 0}
+
+    def _no_progress(ch, course, point, speed, work_retry=1, **kw):
+        rounds["n"] += 1
+        # 每轮答案都不同（digest 会变），但判分始终「对 2 错 1、没拿到正确答案」
+        fake.last_submitted_digest = f"digest-{rounds['n']}"
+        fake.last_verdict_stats = {"right": 2, "wrong": 1, "fixed": 0}
+        return ChapterResult.UNVERIFIED
+
+    engine.process_chapter = _no_progress
+    try:
+        opened = eng._handle_not_open({"courseId": "C", "title": "x"}, points,
+                                      i=1, cid="C", uid="77a")
+    finally:
+        engine.process_chapter = _ORIG_PROCESS_CHAPTER
+
+    assert opened is None, opened
+    # 第 1 轮 establish best_right=2；第 2、3 轮无进展 -> 停（不跑满 9 轮）
+    assert rounds["n"] == 3, f"无进展应在 {3} 轮内停手，实际 {rounds['n']} 轮"
+
+
+def test_reanswer_stops_when_no_answer_found():
+    """整份作业一题答案都没搜到（全靠随机）-> 一轮后就停，不再重做提交。"""
+    tmp_path = tempfile.mkdtemp()
+    eng = StudyEngine(cache_dir=str(tmp_path), poll_interval=0.01, reanswer_interval=0.01)
+    eng.current_uid = "77b"
+    eng.work_retry = 1
+    eng.reanswer_rounds = 9
+    fake = FakeChaoxing("77b")
+    fake.job_info_seq = [{"notOpen": True}] * 100
+    eng.chaoxing = fake
+    points = [{"id": "p0", "title": "上一章"}, {"id": "p1", "title": "当前章"}]
+
+    rounds = {"n": 0}
+
+    def _no_answer(ch, course, point, speed, work_retry=1, **kw):
+        rounds["n"] += 1
+        fake.last_answer_stats = {"total": 4, "found": 0}
+        return ChapterResult.UNVERIFIED
+
+    engine.process_chapter = _no_answer
+    try:
+        opened = eng._handle_not_open({"courseId": "C", "title": "x"}, points,
+                                      i=1, cid="C", uid="77b")
+    finally:
+        engine.process_chapter = _ORIG_PROCESS_CHAPTER
+
+    assert opened is None, opened
+    assert rounds["n"] == 1, f"没搜到答案应立即停手，实际 {rounds['n']} 轮"
 
 
 def test_poll_until_open():
@@ -275,6 +371,36 @@ def test_study_course_skip_server_finished():
     assert "a" not in seen          # 服务端已完成，跳过
     assert "b" in seen
     assert eng.cache.is_done("223", "C", "b")
+
+
+def test_course_events_and_no_not_open_status():
+    """课程开始/结束事件（界面「进行中」的依据）；未开放章节不再上报 not_open。"""
+    tmp_path = tempfile.mkdtemp()
+    eng = StudyEngine(cache_dir=str(tmp_path), poll_interval=0.01)
+    fake = FakeChaoxing("225")
+    eng.chaoxing = fake
+    eng.current_uid = "225"
+    course = {"courseId": "C", "clazzId": "cz", "cpi": "cp", "title": "课"}
+    fake.points = [{"id": "a", "title": "锁章", "has_finished": False}]
+    fake.job_info_seq = [{"notOpen": True}, {"notOpen": False}]   # 轮询一次后解锁
+
+    seen_course, seen_status = [], []
+    eng.on(eng.COURSE, lambda cid, phase: seen_course.append((cid, phase)))
+    eng.on(eng.PROGRESS, lambda cid, pid, st: seen_status.append(st))
+
+    calls = {"n": 0}
+
+    def fake_process(ch, c2, point, speed, work_retry=1, **kw):
+        calls["n"] += 1
+        return ChapterResult.NOT_OPEN if calls["n"] == 1 else ChapterResult.SUCCESS
+
+    engine.process_chapter = fake_process
+    eng._run([course])
+
+    assert seen_course == [("C", "start"), ("C", "end")], seen_course
+    assert "not_open" not in seen_status, f"界面已不再展示「未开放」，不应上报: {seen_status}"
+    assert "pending" in seen_status, seen_status      # 等待解锁期间保持「待学」
+    assert eng.cache.is_done("225", "C", "a")
 
 
 def test_study_course_ignores_stale_cache():
@@ -583,7 +709,7 @@ def test_study_course_rejected_keeps_pending_after_retry():
 
 
 # --------------------------------------------------------------------------- #
-# 并发数（界面「并发」设置）
+# 并发（界面「并发章节」= 章节级；设置里「任务点并发」= 章内级）
 # --------------------------------------------------------------------------- #
 class _SpiedLimiter:
     def limit_rate(self, *a, **k):
@@ -595,7 +721,7 @@ class _SpiedTiku:
 
 
 class _MultiJobChaoxing:
-    """一章多个任务点（非章节检测），用来观察并发行为。"""
+    """一章多个任务点（非章节检测），用来观察「任务点并发」。"""
 
     def __init__(self, count):
         self.rate_limiter = _SpiedLimiter()
@@ -604,6 +730,116 @@ class _MultiJobChaoxing:
 
     def get_job_list(self, course, point, **kwargs):
         return list(self.jobs), {"knowledgeid": point["id"]}
+
+
+class _MultiChapterChaoxing:
+    """一门课多个章节，用来观察「章节并发」/降级行为。"""
+
+    def __init__(self, count):
+        self.rate_limiter = _SpiedLimiter()
+        self.tiku = _SpiedTiku()
+        self.points = [{"id": f"p{i}", "title": f"第{i}章", "has_finished": False}
+                       for i in range(count)]
+
+    def get_course_point(self, *a, **k):
+        return {"points": self.points}
+
+
+def _course() -> dict:
+    return {"courseId": "C", "clazzId": "cz", "cpi": "cp", "title": "课"}
+
+
+def test_chapters_run_concurrently():
+    """界面「并发章节」= 3 时，确实有 3 个章节同时在跑。"""
+    state = {"active": 0, "max": 0}
+    done: list[str] = []
+    lock = threading.Lock()
+
+    def _fake(ch, course, point, speed, work_retry=3, jobs=1):
+        with lock:
+            state["active"] += 1
+            state["max"] = max(state["max"], state["active"])
+        time.sleep(0.05)
+        with lock:
+            state["active"] -= 1
+            done.append(point["id"])
+        return ChapterResult.SUCCESS
+
+    old = engine.process_chapter
+    engine.process_chapter = _fake
+    try:
+        eng = StudyEngine(cache_dir=tempfile.mkdtemp(), poll_interval=0.01)
+        eng.chaoxing = _MultiChapterChaoxing(6)
+        eng.current_uid = "u"
+        eng.jobs = 3
+        eng._study_course(_course())
+    finally:
+        engine.process_chapter = old
+
+    assert state["max"] == 3, f"章节并发上限应为 3，实际 {state['max']}"
+    assert sorted(done) == [f"p{i}" for i in range(6)], done
+    assert all(p["has_finished"] for p in eng.chaoxing.points)
+
+
+def test_not_open_degrades_to_serial():
+    """出现「未开放」章节后，剩余章节必须回到串行（不再用并发 worker）。"""
+    lock = threading.Lock()
+    seen: "list[tuple[str, str]]" = []      # (pid, 线程名)
+    first_not_open = {"hit": False, "at": None}
+
+    def _fake(ch, course, point, speed, work_retry=3, jobs=1):
+        with lock:
+            seen.append((point["id"], threading.current_thread().name))
+            if point["id"] == "p2" and not first_not_open["hit"]:
+                first_not_open["hit"] = True
+                first_not_open["at"] = len(seen)
+                return ChapterResult.NOT_OPEN
+        time.sleep(0.01)
+        return ChapterResult.SUCCESS
+
+    old = engine.process_chapter
+    engine.process_chapter = _fake
+    try:
+        eng = StudyEngine(cache_dir=tempfile.mkdtemp(), poll_interval=0.01)
+        eng.chaoxing = _MultiChapterChaoxing(5)
+        eng.current_uid = "u"
+        eng.jobs = 3
+        eng._study_course(_course())
+    finally:
+        engine.process_chapter = old
+
+    assert first_not_open["hit"] is True, "假后端没有触发 NOT_OPEN"
+    assert all(p["has_finished"] for p in eng.chaoxing.points), \
+        [p["title"] for p in eng.chaoxing.points if not p["has_finished"]]
+    tail = seen[first_not_open["at"]:]
+    assert tail, "降级之后没有任何章节被续跑"
+    assert all(not name.startswith("chapter-") for _pid, name in tail), \
+        f"降级后仍在用并发 worker: {tail}"
+
+
+def test_jobs_one_runs_serial():
+    """并发章节=1 时不建 worker 线程，全部在刷课主线程上顺序执行。"""
+    seen: "list[tuple[str, str]]" = []
+    lock = threading.Lock()
+
+    def _fake(ch, course, point, speed, work_retry=3, jobs=1):
+        with lock:
+            seen.append((point["id"], threading.current_thread().name))
+        return ChapterResult.SUCCESS
+
+    old = engine.process_chapter
+    engine.process_chapter = _fake
+    try:
+        eng = StudyEngine(cache_dir=tempfile.mkdtemp(), poll_interval=0.01)
+        eng.chaoxing = _MultiChapterChaoxing(5)
+        eng.current_uid = "u"
+        eng.jobs = 1
+        eng._study_course(_course())
+    finally:
+        engine.process_chapter = old
+
+    assert [pid for pid, _n in seen] == [f"p{i}" for i in range(5)], seen
+    assert all(not name.startswith("chapter-") for _pid, name in seen), seen
 
 
 class _RecordingExecutor:
@@ -623,8 +859,8 @@ class _RecordingExecutor:
         return [fn(item) for item in iterable]
 
 
-def test_jobs_is_forwarded_to_thread_pool():
-    """界面并发数必须真的生效：StudyEngine.jobs=3 -> 线程池 max_workers=3。"""
+def test_point_jobs_is_forwarded_to_thread_pool():
+    """「任务点并发」必须真的生效：StudyEngine.point_jobs=3 -> 线程池 max_workers=3。"""
     _RecordingExecutor.seen = []
     old_executor, old_process_job = engine.ThreadPoolExecutor, engine.process_job
     engine.process_chapter = _ORIG_PROCESS_CHAPTER
@@ -641,7 +877,7 @@ def test_jobs_is_forwarded_to_thread_pool():
         eng = StudyEngine(cache_dir=tempfile.mkdtemp(), poll_interval=0.01)
         eng.chaoxing = _MultiJobChaoxing(6)
         eng.current_uid = "u9"
-        eng.jobs = 3                       # 相当于界面上选了「并发 3」
+        eng.point_jobs = 3                 # 相当于设置里填了「任务点并发 3」
 
         r = eng._process_chapter({"courseId": "C", "title": "课"},
                                  {"id": "p1", "title": "章", "has_finished": False})
@@ -653,8 +889,8 @@ def test_jobs_is_forwarded_to_thread_pool():
         engine.process_job = old_process_job
 
 
-def test_jobs_one_runs_serial():
-    """并发=1 时任务点必须严格串行（不建线程池、不出现重叠执行）。"""
+def test_point_jobs_one_runs_serial():
+    """任务点并发=1 时章内必须严格串行（不建线程池、不出现重叠执行）。"""
     state = {"active": 0, "max_active": 0, "threads": set(), "order": []}
     lock = threading.Lock()
 
@@ -671,7 +907,7 @@ def test_jobs_one_runs_serial():
 
     class _NoExecutor:
         def __init__(self, *a, **k):
-            raise AssertionError("并发=1 时不应创建线程池")
+            raise AssertionError("任务点并发=1 时不应创建线程池")
 
     old_executor, old_process_job = engine.ThreadPoolExecutor, engine.process_job
     engine.process_chapter = _ORIG_PROCESS_CHAPTER
@@ -682,7 +918,7 @@ def test_jobs_one_runs_serial():
         eng = StudyEngine(cache_dir=tempfile.mkdtemp(), poll_interval=0.01)
         eng.chaoxing = _MultiJobChaoxing(5)
         eng.current_uid = "u9"
-        eng.jobs = 1
+        eng.point_jobs = 1
 
         r = eng._process_chapter({"courseId": "C", "title": "课"},
                                  {"id": "p1", "title": "章", "has_finished": False})
@@ -696,7 +932,7 @@ def test_jobs_one_runs_serial():
 
 
 def test_normalize_jobs_clamps():
-    """并发数收敛到 1~8：非法/越界都回到合法区间。"""
+    """章节并发/任务点并发都收敛到合法区间；引擎默认章节并发为 1（最稳）。"""
     assert engine.normalize_jobs(3) == 3
     assert engine.normalize_jobs("2") == 2
     assert engine.normalize_jobs(0) == 1
@@ -704,7 +940,14 @@ def test_normalize_jobs_clamps():
     assert engine.normalize_jobs(99) == engine.MAX_JOBS
     assert engine.normalize_jobs("x") == engine.DEFAULT_JOBS
     assert engine.normalize_jobs(None) == engine.DEFAULT_JOBS
-    assert StudyEngine(cache_dir=tempfile.mkdtemp()).jobs == engine.DEFAULT_JOBS
+    assert StudyEngine(cache_dir=tempfile.mkdtemp()).jobs == engine.DEFAULT_CHAPTER_JOBS
+
+    assert engine.normalize_point_jobs(3) == 3
+    assert engine.normalize_point_jobs(0) == 1
+    assert engine.normalize_point_jobs(99) == engine.MAX_POINT_JOBS
+    assert engine.normalize_point_jobs("x") == engine.DEFAULT_POINT_JOBS
+    assert engine.normalize_point_jobs(None) == engine.DEFAULT_POINT_JOBS
+    assert engine.normalize_point_jobs("") == engine.DEFAULT_POINT_JOBS
 
 
 # --------------------------------------------------------------------------- #
@@ -779,6 +1022,200 @@ def test_engine_remembers_account_across_restart():
     demo.login_demo()
     assert not os.path.exists(os.path.join(demo_cache, "accounts.json"))
     assert demo.saved_account() is None
+
+
+# --------------------------------------------------------------------------- #
+# 平台拒绝重答（「提交失败，重做次数过多」）不能变成「每 15 秒查一次开放」的死循环
+# --------------------------------------------------------------------------- #
+def test_work_retry_refused_detector():
+    """平台阻断提交：重做次数用尽 / 图形验证码都要能识别，普通失败不能误判。"""
+    from api.base import CAPTCHA_HINT, work_block_reason, work_retry_refused
+    # 实测「提交失败，重做次数过多！」的真实原因是弹了图形验证码，两种都算阻断
+    assert work_retry_refused("提交失败，重做次数过多！")
+    assert work_retry_refused("您的重做次数已用尽")
+    assert work_retry_refused("不允许重做")
+    assert work_retry_refused("请输入验证码")
+    assert work_retry_refused("请完成安全验证后重试")
+    assert not work_retry_refused("提交失败")
+    assert not work_retry_refused("")
+    assert not work_retry_refused(None)
+    # 原因可读（提示用户去浏览器手动验证）
+    assert "验证码" in work_block_reason("请输入验证码")
+    assert "重做次数" in work_block_reason("提交失败，重做次数过多！")
+    assert work_block_reason("") == ""
+    assert "验证码" in CAPTCHA_HINT
+
+
+class _RefuseBackend:
+    """最小后端：章节检测提交被平台拒绝（StudyResult.REFUSED）。"""
+
+    def __init__(self):
+        import types
+        self.rate_limiter = types.SimpleNamespace(limit_rate=lambda *a, **k: None)
+        self.tiku = types.SimpleNamespace(DISABLE=False)
+        self.work_refused_reason = ""
+        self.study_calls = 0
+
+    def get_job_list(self, course, point, **kwargs):
+        return [{"type": "workid", "jobid": "w"}], {"knowledgeid": "p1"}
+
+    def study_work(self, *a, **k):
+        self.study_calls += 1
+        self.work_refused_reason = "提交失败，重做次数过多！"
+        return StudyResult.REFUSED
+
+
+def test_process_chapter_refused_is_no_retry():
+    """拒绝重答必须映射成 NO_RETRY，绝不能是 ERROR（ERROR 会触发回退重答/轮询）。"""
+    be = _RefuseBackend()
+    # 前面的用例会把 engine.process_chapter 换成假实现且不还原：这里显式用原始实现
+    r = _ORIG_PROCESS_CHAPTER(be, {"courseId": "C", "title": "课"},
+                              {"id": "p1", "title": "章节"}, 1.0, work_retry=1)
+    assert r == ChapterResult.NO_RETRY, r
+    assert be.study_calls == 1, "拒绝重答后不得再重答"
+
+
+def test_refused_prev_stops_polling():
+    """上一章被平台拒绝重答 -> _handle_not_open 返回 None，一次轮询都不做。"""
+    tmp_path = tempfile.mkdtemp()
+    eng = StudyEngine(cache_dir=str(tmp_path), poll_interval=0.01, reanswer_interval=0.01)
+    eng.current_uid = "781"
+    eng.work_retry = 1
+    fake = FakeChaoxing("781")
+    fake.job_info_seq = [{"notOpen": True}] * 100     # 怎么问都是未开放
+    eng.chaoxing = fake
+    points = [{"id": "p0", "title": "上一章"}, {"id": "p1", "title": "当前章"}]
+
+    calls = {"n": 0}
+
+    def _refused(ch, course, point, speed, work_retry=1, **kw):
+        calls["n"] += 1
+        return ChapterResult.NO_RETRY
+
+    engine.process_chapter = _refused
+    try:
+        opened = eng._handle_not_open({"courseId": "C", "title": "x"}, points,
+                                      i=1, cid="C", uid="781")
+    finally:
+        engine.process_chapter = _ORIG_PROCESS_CHAPTER
+
+    assert opened is None, "拒绝重答后必须判「无解」，不能继续轮询"
+    assert calls["n"] == 1, f"只允许尝试重做一次，实际 {calls['n']} 次"
+    assert points[0]["work_refused"] is True
+    assert len(fake.job_info_seq) == 100, "拒绝重答后不得再查开放状态"
+
+
+def test_refused_flag_short_circuits_later_chapters():
+    """前面任一章节被拒 -> 后续章节直接判无解，不重做也不轮询。"""
+    tmp_path = tempfile.mkdtemp()
+    eng = StudyEngine(cache_dir=str(tmp_path), poll_interval=0.01)
+    fake = FakeChaoxing("782")
+    eng.chaoxing = fake
+    eng.current_uid = "782"
+    points = [
+        {"id": "p0", "title": "被拒章", "work_refused": True},
+        {"id": "p1", "title": "锁章"},
+    ]
+
+    def _boom(*a, **k):     # 不允许再处理任何章节
+        raise AssertionError("被拒章节之后的章节不应再回退重做")
+
+    engine.process_chapter = _boom
+    try:
+        opened = eng._handle_not_open({"courseId": "C", "title": "x"}, points,
+                                      i=1, cid="C", uid="782")
+    finally:
+        engine.process_chapter = _ORIG_PROCESS_CHAPTER
+    assert opened is None, opened
+    assert fake.job_info_seq == [], "不得发起开放状态查询"
+
+
+def test_study_course_refused_does_not_hang():
+    """端到端：上一章被拒、下一章始终未开放 -> 必须结束本课程（不能空转）。"""
+    tmp_path = tempfile.mkdtemp()
+    eng = StudyEngine(cache_dir=str(tmp_path), poll_interval=0.01, reanswer_interval=0.01)
+    eng.current_uid = "783"
+    eng.work_retry = 1
+    fake = FakeChaoxing("783")
+    fake.job_info_seq = [{"notOpen": True}] * 1000
+    eng.chaoxing = fake
+    course = {"courseId": "C", "clazzId": "cz", "cpi": "cp", "title": "课"}
+    fake.points = [
+        {"id": "a", "title": "被拒章", "has_finished": False},
+        {"id": "b", "title": "锁章", "has_finished": False},
+    ]
+
+    def _fake_process(ch, c2, point, speed, work_retry=1, **kw):
+        # a 被平台拒绝重答；b 因 a 未通过而始终未开放
+        return ChapterResult.NO_RETRY if point["id"] == "a" else ChapterResult.NOT_OPEN
+
+    statuses = []
+    eng.on(eng.STATUS, lambda kind, msg: statuses.append(kind))
+    engine.process_chapter = _fake_process
+    t = threading.Thread(target=eng._study_course, args=(course,), daemon=True)
+    try:
+        t.start()
+        t.join(10)
+    finally:
+        engine.process_chapter = _ORIG_PROCESS_CHAPTER
+    assert not t.is_alive(), "拒绝重答 + 后续章节未开放时不得无限轮询"
+    assert "blocked" in statuses, statuses
+    assert not eng.cache.is_done("783", "C", "a"), "被拒章节绝不能标记完成"
+    assert not eng.cache.is_done("783", "C", "b")
+
+
+def test_study_work_refused_returns_refused():
+    """真实提交链路：平台返回「重做次数过多」-> StudyResult.REFUSED + 记录原因。"""
+    import api.base as base
+
+    class _Resp:
+        def __init__(self, json_data):
+            self.status_code = 200
+            self.text = "ok"
+            self._json = json_data
+
+        def json(self):
+            return self._json
+
+    class _Session:
+        def get(self, url, params=None, **kw):
+            return _Resp({})
+
+        def post(self, url, data=None, **kw):
+            return _Resp({"status": False, "msg": "提交失败，重做次数过多！"})
+
+    class _Tiku:
+        DISABLE = False
+        COVER_RATE = 0        # 覆盖率门槛 0 -> 直接提交
+
+        def query(self, q):
+            return None
+
+        def get_submit_params(self):
+            return ""
+
+        def judgement_select(self, res):
+            return True
+
+    questions = {"questions": [
+        {"id": 1, "type": "single", "title": "Q1", "options": "A. x\nB. y",
+         "answerField": {"answer1": "", "answertype1": "0"}},
+    ]}
+    old_get_session = base.SessionManager.get_session
+    old_decode = base.decode_questions_info
+    base.SessionManager.get_session = staticmethod(lambda: _Session())
+    base.decode_questions_info = lambda text: {"questions": [dict(q) for q in questions["questions"]]}
+    try:
+        c = base.Chaoxing(account=None, tiku=_Tiku())
+        r = c.study_work({"courseId": "C", "clazzId": "cz", "title": "课"},
+                         {"type": "workid", "jobid": "work-1", "enc": "e"},
+                         {"knowledgeid": "p1", "ktoken": "k", "cpi": "cp"})
+    finally:
+        base.SessionManager.get_session = old_get_session
+        base.decode_questions_info = old_decode
+
+    assert r == StudyResult.REFUSED, r
+    assert "重做次数" in c.work_refused_reason, c.work_refused_reason
 
 
 # --------------------------------------------------------------------------- #

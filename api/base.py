@@ -75,6 +75,50 @@ def _tiku_query(tiku, q_info: dict, course: str = "", course_id: str = "") -> Op
     return query(q_info)
 
 
+def _wrong_keys(q_info: dict) -> set:
+    """这道题被平台判错过的答案键（按选项正文比对，选项乱序也对得上）。"""
+    try:
+        return wrong_answers.known_keys(str(q_info.get("title") or ""),
+                                        str(q_info.get("type") or ""),
+                                        str(q_info.get("options") or ""))
+    except Exception as exc:  # noqa: BLE001 - 错题本异常不能影响正常作答
+        logger.error(f"错题本查询异常：{type(exc).__name__}: {exc}")
+        return set()
+
+
+def avoid_judged_wrong(q_info: dict, answer: str) -> str:
+    """提交形态兜底：这个答案已被平台判错 -> 换成没判错过的。
+
+    题库 / 缓存 / AI / 随机四条来源都要过这一关：重做错题时**绝不原样再交同一个
+    错答案**，否则平台只会再判一次不合格（「重答却还是同一批答案」的死循环根因）。
+    换不出来（所有选项都判错过 / 填空题没有排除法）就原样返回，由平台判分再来一轮。
+    """
+    if not answer:
+        return answer
+    known = _wrong_keys(q_info)
+    if not known:
+        return answer
+    title = str(q_info.get("title") or "")
+    qtype = str(q_info.get("type") or "")
+    options = str(q_info.get("options") or "")
+    try:
+        if local_bank.answer_key(qtype, answer, options) not in known:
+            return answer
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"错题比对异常：{type(exc).__name__}: {exc}")
+        return answer
+    try:
+        alt = wrong_answers.pick_submit_answer(qtype, options, known, answer)
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"排除法换答案异常：{type(exc).__name__}: {exc}")
+        alt = None
+    if not alt:
+        logger.warning(f"该题可选答案都已被平台判错，无法再换答案：{title}")
+        return answer
+    logger.warning(f"答案已被平台判错，改用排除法：{title} {answer} -> {alt}")
+    return alt
+
+
 def _clip_text(text, limit: int) -> str:
     """截断过长文本（章节名/视频名），保证状态日志一行能看完。"""
     text = str(text or "").strip()
@@ -122,6 +166,50 @@ def _normalize_play_time(raw, duration) -> int:
         return value // 1000
     logger.warning("playTime 异常（{}s 的视频报 {}），已按 0 处理", total, value)
     return 0
+
+
+# 视频任务点「观看进度要求」：达到该比例即判定任务点完成，不必看完。
+# 取值范围限定 90~100（低于 90 没有意义且容易被手改成「不看也过」）；
+# 100 = 旧行为（必须播到结尾，并且要等平台返回 isPassed）。
+# 由引擎按 [common] video_finish_percent 写入 self.video_finish_percent。
+DEFAULT_VIDEO_FINISH_PERCENT = 90
+MIN_VIDEO_FINISH_PERCENT = 90
+MAX_VIDEO_FINISH_PERCENT = 100
+
+
+def _clamp_finish_percent(value: float) -> float:
+    return min(float(MAX_VIDEO_FINISH_PERCENT),
+               max(float(MIN_VIDEO_FINISH_PERCENT), float(value)))
+
+
+def normalize_finish_percent(raw, default: float = DEFAULT_VIDEO_FINISH_PERCENT) -> float:
+    """把任意来源的观看比例收敛到 90~100；空值/非法值回落 ``default``。
+
+    边界收敛而不是抛错：脏数据绝不能让任务点变成「必须看到 N 倍时长」而永久卡死，
+    也不会低于 90%（那等于允许不看就判完成）。
+    """
+    text = "" if raw is None else str(raw).strip()
+    if text == "":
+        return _clamp_finish_percent(default)
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        logger.warning("观看进度百分比取值非法，已使用默认值 {}: {!r}", default, raw)
+        return _clamp_finish_percent(default)
+    return _clamp_finish_percent(value)
+
+
+def _video_finish_target(duration, percent) -> int:
+    """观看进度达标所需的秒数：``duration * percent%``，收敛到 ``0..duration``。
+
+    返回 duration 表示与旧行为一致（必须看完）。percent 的下界是 90（见
+    :data:`MIN_VIDEO_FINISH_PERCENT`），所以这里恒为正数。
+    """
+    total = int(duration or 0)
+    if total <= 0:
+        return 0
+    pct = normalize_finish_percent(percent)
+    return min(total, max(1, int(round(total * pct / 100.0))))
 
 
 # 任务点请求的重试策略：最多 3 次、指数退避（1s -> 2s）
@@ -172,6 +260,51 @@ def _request_json(session, method, url, *, what, params=None, data=None, headers
             last_reason = f"响应不是合法 JSON: {exc}"
             continue
     raise StudyRequestError(f"{what}失败（已重试 {retries} 次）: {last_reason}")
+
+
+# 平台**阻断提交**的响应文案特征。两种情况都意味着「继续提交下去没有意义」：
+#   1) 作业重做次数用尽（msg 里带「重做次数过多」）；
+#   2) 平台弹出图形验证码 / 人机验证（实测「提交失败，重做次数过多！」的真实原因
+#      往往就是验证码拦截，msg 具有误导性，所以两类一起当阻断处理）。
+# 只有命中这些词才算「不可恢复」，普通网络错误 / 覆盖率不足都不算 ——
+# 误判会让整门课被过早放弃，所以宁可少判（继续走原有的重答流程）。
+_WORK_BLOCK_MARKS = (
+    ("重做次数", "作业的重做次数已用尽"),
+    ("次数过多", "作业的重做次数已用尽"),
+    ("次数已用尽", "作业的重做次数已用尽"),
+    ("次数用完", "作业的重做次数已用尽"),
+    ("超过重做", "作业的重做次数已用尽"),
+    ("不能重做", "平台不允许重做"),
+    ("不允许重做", "平台不允许重做"),
+    ("不能再做", "平台不允许重做"),
+    ("无法再次提交", "平台不允许重做"),
+    ("验证码", "平台要求图形验证码"),
+    ("人机验证", "平台要求图形验证码"),
+    ("安全验证", "平台要求图形验证码"),
+    ("滑动验证", "平台要求图形验证码"),
+    ("verify", "平台要求图形验证码"),
+)
+# 命中后提示用户怎么处理（GUI 面板/日志都看得到）
+CAPTCHA_HINT = "请到浏览器打开该课程手动完成验证码（或稍后重试），本次刷课已停止"
+
+
+def work_block_reason(msg) -> str:
+    """``msg`` 是否表示「平台阻断提交」；返回可读原因，未命中返回空串。"""
+    text = str(msg or "")
+    if not text:
+        return ""
+    low = text.lower()
+    for mark, reason in _WORK_BLOCK_MARKS:
+        if mark in text or mark.lower() in low:
+            return reason
+    return ""
+
+
+# 兼容旧名（历史调用方/测试用的是这个语义）
+def work_retry_refused(msg) -> bool:
+    return bool(work_block_reason(msg))
+
+
 
 
 class SessionManager:
@@ -299,6 +432,9 @@ class StudyResult(Enum):
     # 已保存但未提交（题库覆盖率不足），平台侧仍需「重新作答」，
     # 因此不能视为本章已完成，交由上层重试后再提交。
     UNSUBMITTED = 4
+    # 平台明确**拒绝重答**（返回「提交失败，重做次数过多」之类）：作业的重做次数已用尽，
+    # 再提交一万次也是同一个结果。上层必须据此「放弃本章」，绝不能再回退重答/轮询解锁。
+    REFUSED = 5
 
     def is_success(self):
         return self == StudyResult.SUCCESS
@@ -327,8 +463,16 @@ class Chaoxing:
         # 视频状态日志：每 N 秒在日志输出一条「章节号 + 进度百分比 + 预计剩余」，0 = 关闭。
         # 由引擎按配置（config_win.ini [common] video_log_interval）写入。
         self.video_log_interval: float = 0
+        # 视频任务点的「观看进度要求」（90~100，默认 90）：播到该比例即判定任务点完成，
+        # 不必看完；100 = 旧行为（必须看完且等平台返回已通过）。
+        # 由引擎按配置（config_win.ini [common] video_finish_percent）写入。
+        self.video_finish_percent: float = float(DEFAULT_VIDEO_FINISH_PERCENT)
         # 当前章节上下文（引擎在进入章节前写入）：章节序号/总数/名称，供视频日志显示。
-        self.video_context: dict = {}
+        # **按线程隔离**：章节并发时每章的「章节 x/y」写在各自 worker 线程里，
+        # 不会互相覆盖；读不到本线程上下文时才回落到下面这份共享默认值。
+        # 对外仍然是 ``self.video_context``（见下面的 property），调用方无需改动。
+        self._video_context_default: dict = {}
+        self._video_context_local = threading.local()
         # 最近一次**真正提交**的作答明细（引擎回读发现平台要求重新作答时，用它作废这批答案）
         self.last_submitted: list[dict] = []
         # 这批答案的指纹（标题+答案）：两轮完全一样时说明重答不会带来任何新信息，
@@ -337,6 +481,28 @@ class Chaoxing:
         # 这批答案的**逐题判分**（{qid: True/False/{ok, answer}}，已对齐到提交明细的 qid）：
         # 作废/隔离答案时据此保留「平台已判对」的题，避免下次重做把做对的题再搜一遍。
         self.last_verdicts: dict = {}
+        # 平台**拒绝重答**的原因（非空 = 本次作业的重做次数已用尽）。
+        # 引擎读到它必须停止「回退重答 / 轮询下一章解锁」—— 那条路只会死循环。
+        self.work_refused_reason: str = ""
+        # 最近一次作答的「答案来源」统计：{"total": 题数, "found": 题库/AI/缓存命中的题数}。
+        # found=0 意味着整份作业全靠随机兜底 —— 再重答也不会变出正确答案，
+        # 引擎据此停止「无效重答」，避免把平台的重做次数耗光。
+        self.last_answer_stats: dict = {}
+        # 最近一次判分统计：{"right": 判对题数, "wrong": 判错题数, "fixed": 拿到正确答案的题数}。
+        # 引擎用它判断「这一轮重答到底有没有进展」，没有进展就不再重答。
+        self.last_verdict_stats: dict = {}
+
+    # ---- 视频日志的章节上下文（线程隔离，章节并发时不串台） ----
+    @property
+    def video_context(self) -> dict:
+        """当前线程的章节上下文；本线程没写过时回落到共享默认值。"""
+        ctx = getattr(self._video_context_local, "ctx", None)
+        return ctx if ctx is not None else self._video_context_default
+
+    @video_context.setter
+    def video_context(self, value) -> None:
+        """只在**当前线程**写入上下文（并发章节各写各的）。"""
+        self._video_context_local.ctx = dict(value or {})
 
     def login(self, login_with_cookies=False):
         if login_with_cookies:
@@ -830,6 +996,21 @@ class Chaoxing:
 
         logger.info(f"开始任务: {_job['name']}, 总时长: {duration}s, 已进行: {play_time}s")
 
+        # 观看进度要求：达到 target_time 即判定任务点完成（默认 90%）。
+        # target_time >= duration 说明用户要的是「全部看完」，走原有逻辑：
+        # 播到结尾后继续上报，直到平台返回 isPassed（结尾那几次上报常常要多发几遍）。
+        finish_percent = normalize_finish_percent(
+            getattr(self, "video_finish_percent", DEFAULT_VIDEO_FINISH_PERCENT))
+        target_time = _video_finish_target(duration, finish_percent)
+        finish_full = target_time >= duration
+        if finish_full:
+            logger.debug("观看进度要求：{}%（需完整看完）", f"{finish_percent:g}")
+        else:
+            logger.info(
+                "观看进度要求: {:g}%，即看到 {}s（总时长 {}s）即判定该任务点完成",
+                finish_percent, target_time, duration,
+            )
+
         pbar = tqdm(total=duration, initial=play_time, desc=_job["name"],
                     unit_scale=True, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}',
                     file=_progress_stream())
@@ -866,7 +1047,9 @@ class Chaoxing:
                 # 只在章节边界检查会让界面长时间卡在「停止中」。
                 cancel.check()
                 # Sometimes the last request needs to be sent several times to complete the task
-                if play_time - last_log_time >= wait_time or play_time == duration:
+                # play_time >= target_time：到点（含「播到结尾」）必须上报一次，
+                # 让平台记下最终位置，再按比例规则判定。
+                if play_time - last_log_time >= wait_time or play_time >= target_time:
 
                     passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration,
                                                             int(play_time), _type, headers=headers)
@@ -895,6 +1078,17 @@ class Chaoxing:
 
                     elif not passed and state != 200:
                         return StudyResult.ERROR
+
+                    # 观看比例已达标（且不是「必须看完」）：按本地规则判定任务点完成。
+                    # 服务端 isPassed 要等它自己的规则满足，这里不再无限等下去 ——
+                    # 这正是「达到百分比即可完成，无需全部看完」的落点。
+                    # finish_full 时走原逻辑：继续上报直到平台返回已通过。
+                    if not passed and not finish_full and play_time >= target_time:
+                        logger.info(
+                            "观看比例已达 {:g}%（{}/{}s ≥ {}s），按设定判定任务点完成: {}",
+                            finish_percent, int(play_time), duration, target_time, _job["name"],
+                        )
+                        return StudyResult.SUCCESS
 
 
 
@@ -972,10 +1166,48 @@ class Chaoxing:
         _course_id = str(_course.get("courseId") or "") if isinstance(_course, dict) else ""
         _ORIGIN_HTML_CONTENT = ""  # 用于配合输出网页源码, 帮助修复#391错误
 
+        def multi_select_count(available_options: int) -> int:
+            """多选题随机选几个（沿用原加权策略：2 个最常见，最多 4 个）。"""
+            if available_options <= 1:
+                return max(0, available_options)
+            max_possible = min(4, available_options)
+            min_possible = min(2, available_options)
+            weights_map = {
+                2: [1.0],
+                3: [0.3, 0.7],
+                4: [0.1, 0.5, 0.4],
+                5: [0.1, 0.4, 0.3, 0.2],
+            }
+            weights = weights_map.get(max_possible, [0.3, 0.4, 0.3])
+            possible_counts = list(range(min_possible, max_possible + 1))
+            weights = weights[:len(possible_counts)]
+            weights_sum = sum(weights)
+            if weights_sum > 0:
+                weights = [w / weights_sum for w in weights]
+            return random.choices(possible_counts, weights=weights, k=1)[0]
+
         def random_answer(options: str) -> str:
             answer = ""
             if not options:
                 return answer
+
+            # 随机也要排除「平台判错过的选项」：否则判断题这种 2 选 1 的题有一半概率
+            # 把同一个错答案再交一遍，重答等于原地踏步（多选题按同一档选项数换组合）。
+            known = _wrong_keys(q)
+            if known:
+                size = None
+                if q["type"] == "multiple":
+                    size = multi_select_count(len(local_bank.option_lines(options))) or None
+                try:
+                    picked = wrong_answers.pick_submit_answer(q["type"], options, known,
+                                                              "", size=size)
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(f"排除法挑答案异常：{type(exc).__name__}: {exc}")
+                    picked = None
+                if picked:
+                    logger.info(f"随机选择（已避开平台判错的答案）-> {picked}")
+                    return picked
+                logger.warning("随机作答：这道题的可选答案都已被平台判错，只能照旧随机")
 
             if q["type"] == "multiple":
                 logger.debug(f"当前选项列表[cut前] -> {options}")
@@ -988,34 +1220,7 @@ class Chaoxing:
                     )
                     return answer
 
-                available_options = len(_op_list)
-                select_count = 0
-
-                # 根据可用选项数量调整可能选择的选项数
-                if available_options <= 1:
-                    select_count = available_options
-                else:
-                    max_possible = min(4, available_options)
-                    min_possible = min(2, available_options)
-
-                    weights_map = {
-                        2: [1.0],
-                        3: [0.3, 0.7],
-                        4: [0.1, 0.5, 0.4],
-                        5: [0.1, 0.4, 0.3, 0.2],
-                    }
-
-                    weights = weights_map.get(max_possible, [0.3, 0.4, 0.3])
-                    possible_counts = list(range(min_possible, max_possible + 1))
-
-                    weights = weights[:len(possible_counts)]
-
-                    weights_sum = sum(weights)
-                    if weights_sum > 0:
-                        weights = [w / weights_sum for w in weights]
-
-                    select_count = random.choices(possible_counts, weights=weights, k=1)[0]
-
+                select_count = multi_select_count(len(_op_list))
                 selected_options = random.sample(_op_list, select_count) if select_count > 0 else []
 
                 for option in selected_options:
@@ -1023,7 +1228,14 @@ class Chaoxing:
 
                 answer = "".join(sorted(answer))
             elif q["type"] == "single":
-                answer = random.choice(options.split("\n"))[:1]  # 取首字为答案, 例如A或B
+                lines = [ln for ln in options.split("\n") if ln.strip()]
+                if known:
+                    lines = [ln for ln in lines
+                             if local_bank.answer_key(
+                                 "single", local_bank.option_letter(ln) or ln, options
+                             ) not in known]
+                if lines:
+                    answer = random.choice(lines)[:1]  # 取首字为答案, 例如A或B
             # 判断题处理
             elif q["type"] == "judgement":
                 # answer = self.tiku.jugement_select(_answer)
@@ -1218,6 +1430,9 @@ class Chaoxing:
                     logger.info(f"成功获取到答案：{answer}")
                     q[f'answerSource{q["id"]}'] = "cover"
                     found_answers += 1
+            # 提交前最后一道闸：不管答案来自题库 / 缓存 / AI / 随机，撞到「平台判过错
+            # 的答案」一律换掉。重做错题时这是唯一能保证「不再交同一个错答案」的地方。
+            answer = avoid_judged_wrong(q, answer)
             # 填充答案
             q["answerField"][f'answer{q["id"]}'] = answer
             logger.info(f'{q["title"]} 填写答案为 {answer}')
@@ -1230,6 +1445,8 @@ class Chaoxing:
             })
         cover_rate = (found_answers / total_questions) * 100
         logger.info(f"章节检测题库覆盖率： {cover_rate:.0f}%")
+        # 记下本轮答案的来源：found=0 表示整份作业全靠随机兜底，重答不会变出正确答案。
+        self.last_answer_stats = {"total": total_questions, "found": found_answers}
         # 提交模式  现在与题库绑定,留空直接提交, 1保存但不提交
         # need_reanswer: 因覆盖率不足而仅保存草稿、未真正提交，平台侧会要求「重新作答」
         need_reanswer = False
@@ -1272,28 +1489,38 @@ class Chaoxing:
 
         # 提交/保存请求：状态码检查 + 有限重试（同 study_video 的元数据请求），
         # 失败抛 StudyRequestError，由上层按 ERROR 处理 —— 一次网络抖动不该废掉整轮刷课。
-        res_json = _request_json(
-            _session, "post",
-            "https://mooc1.chaoxing.com/mooc-ans/work/addStudentWorkNew",
-            data=questions,
-            headers={
-                "Host": "mooc1.chaoxing.com",
-                "sec-ch-ua-platform": '"Windows"',
-                "X-Requested-With": "XMLHttpRequest",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36 Edg/129.0.0.0",
-                "Accept": "application/json, text/javascript, */*; q=0.01",
-                "sec-ch-ua": '"Microsoft Edge";v="129", "Not=A?Brand";v="8", "Chromium";v="129"',
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "sec-ch-ua-mobile": "?0",
-                "Origin": "https://mooc1.chaoxing.com",
-                "Sec-Fetch-Site": "same-origin",
-                "Sec-Fetch-Mode": "cors",
-                "Sec-Fetch-Dest": "empty",
-                # "Referer": "https://mooc1.chaoxing.com/mooc-ans/work/doHomeWorkNew?courseId=246831735&workAnswerId=52680423&workId=37778125&api=1&knowledgeid=913820156&classId=107515845&oldWorkId=07647c38d8de4c648a9277c5bed7075a&jobid=work-07647c38d8de4c648a9277c5bed7075a&type=&isphone=false&submit=false&enc=1d826aab06d44a1198fc983ed3d243b1&cpi=338350298&mooc2=1&skipHeader=true&originJobId=work-07647c38d8de4c648a9277c5bed7075a",
-                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,ja;q=0.5",
-            },
-            what="章节检测提交",
-        )
+        try:
+            res_json = _request_json(
+                _session, "post",
+                "https://mooc1.chaoxing.com/mooc-ans/work/addStudentWorkNew",
+                data=questions,
+                headers={
+                    "Host": "mooc1.chaoxing.com",
+                    "sec-ch-ua-platform": '"Windows"',
+                    "X-Requested-With": "XMLHttpRequest",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36 Edg/129.0.0.0",
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "sec-ch-ua": '"Microsoft Edge";v="129", "Not=A?Brand";v="8", "Chromium";v="129"',
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "sec-ch-ua-mobile": "?0",
+                    "Origin": "https://mooc1.chaoxing.com",
+                    "Sec-Fetch-Site": "same-origin",
+                    "Sec-Fetch-Mode": "cors",
+                    "Sec-Fetch-Dest": "empty",
+                    # "Referer": "https://mooc1.chaoxing.com/mooc-ans/work/doHomeWorkNew?courseId=246831735&workAnswerId=52680423&workId=37778125&api=1&knowledgeid=913820156&classId=107515845&oldWorkId=07647c38d8de4c648a9277c5bed7075a&jobid=work-07647c38d8de4c648a9277c5bed7075a&type=&isphone=false&submit=false&enc=1d826aab06d44a1198fc983ed3d243b1&cpi=338350298&mooc2=1&skipHeader=true&originJobId=work-07647c38d8de4c648a9277c5bed7075a",
+                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,ja;q=0.5",
+                },
+                what="章节检测提交",
+            )
+        except StudyRequestError as exc:
+            # 验证码通常是「HTML 页面」而不是 JSON：重试耗尽后异常文本里会带着页面片段。
+            # 命中验证码特征就按「平台阻断」处理，别再让上层当成网络抖动反复重试。
+            reason = work_block_reason(str(exc))
+            if reason:
+                self.work_refused_reason = f"{reason}（{exc}）"
+                logger.error(f'{action}答题被平台阻断：{reason}。{CAPTCHA_HINT}')
+                return StudyResult.REFUSED
+            raise
 
         action = "提交" if questions["pyFlag"] == "" else "保存"
         if res_json.get("status"):
@@ -1301,7 +1528,18 @@ class Chaoxing:
             logger.info(f'章节检测已{action}（共 {total_questions} 题，'
                         f'题库命中 {found_answers} 题）')
         else:
-            logger.error(f'{action}答题失败 -> {res_json.get("msg")}')
+            msg = res_json.get("msg")
+            reason = work_block_reason(msg)
+            if reason:
+                # 平台阻断提交（图形验证码 / 重做次数用尽）：这是**终局**，不是可重试的
+                # 失败。再提交既不会成功、还会把验证码/风控越惹越凶，必须交给引擎停手。
+                self.work_refused_reason = f"{reason}（平台返回：{msg}）"
+                logger.error(
+                    f'{action}答题被平台阻断：{reason}。'
+                    f'{"平台提示：" + str(msg) + "；" if msg else ""}{CAPTCHA_HINT}'
+                )
+                return StudyResult.REFUSED
+            logger.error(f'{action}答题失败 -> {msg}')
             return StudyResult.ERROR
 
         if need_reanswer:
@@ -1314,6 +1552,7 @@ class Chaoxing:
         # 真正提交成功后重置回退计数，使后续章节仍按覆盖率阈值判断
         if questions["pyFlag"] == "":
             self.rollback_times = 0
+            self.work_refused_reason = ""     # 新的作业能正常提交，旧的拒绝记录作废
             # 记住这批答案：引擎回读发现平台仍要重新作答时，用它作废这批答案。
             # 没有这一步，重答会命中同一个缓存答案 -> 再判一次不合格 -> 无限循环。
             self.last_submitted = [dict(item) for item in submitted]
@@ -1426,17 +1665,6 @@ class Chaoxing:
             )
         return marked
 
-    def _judged_right_qids_of(self, items: list) -> set:
-        """给定一批作答明细，返回其中**平台已判对**的 qid 集合（没有判分则空集）。"""
-        verdicts = getattr(self, "last_verdicts", None) or {}
-        if not verdicts:
-            return set()
-        right = set()
-        for item in items or []:
-            if self._judged(item, local_bank.verdict_of(verdicts, item.get("qid"))) is True:
-                right.add(str(item.get("qid")))
-        return right
-
     def _sync_after_submit(self, course, submitted: list, work_params: dict) -> None:
         """提交后按平台判分结果同步错题本与本地题库。
 
@@ -1464,6 +1692,14 @@ class Chaoxing:
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"判分结果对齐异常（按原样使用）：{type(exc).__name__}: {exc}")
         self.last_verdicts = dict(verdicts or {})
+        # 记录判分统计：引擎用它判断「这一轮重答有没有进展」。判对题数没涨、
+        # 也没拿到新的正确答案 -> 再答一百轮都是同一个结果，必须停下来。
+        try:
+            right, wrong, fixed = work_verify._counts(self.last_verdicts)
+            self.last_verdict_stats = {"right": right, "wrong": wrong, "fixed": fixed}
+        except Exception as exc:  # noqa: BLE001 - 统计失败不影响主流程
+            logger.debug(f"判分统计失败: {type(exc).__name__}: {exc}")
+            self.last_verdict_stats = {}
         try:
             self._record_rejected(submitted, verdicts)
         except Exception as exc:  # noqa: BLE001

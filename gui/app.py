@@ -38,7 +38,9 @@ STATE_TEXT = {
     "logged_in": "已登录", "switched": "已切换账号", "logging": "登录中",
     "running": "刷课中", "stopping": "停止中", "idle": "空闲",
     "backtrack": "回退重做", "polling": "等待章节开放", "reanswer": "答题不合格重答",
+    "blocked": "已被平台阻断",
     "read_progress": "已读取进度", "reading": "读取进度", "ok": "就绪", "error": "错误", "warn": "提示",
+    "degraded": "已降为串行",
 }
 
 # 章节状态 -> (展示文本, 浅色主题下的前景色)
@@ -51,6 +53,10 @@ CHAPTER_STYLE = {
     "studying": ("进行中", "#ef6c00"),
     "error": ("失败", "#c62828"),
 }
+
+# 课程列表：单选（选中 = 下次开始刷课要跑的那门课）。
+COURSE_PANE_TITLE = "课程（点击切换课程）"
+COURSE_SWITCH_BLOCKED = "刷课中不能切换课程"
 
 
 # 运行日志面板只显示用户看得懂的进度与结果；答题明细、题库/Token 等技术细节
@@ -157,8 +163,9 @@ def load_ui_config() -> dict:
 # 倍速 / 并发：界面取值与持久化
 # --------------------------------------------------------------------------- #
 SPEED_MIN, SPEED_MAX = 1.0, 2.0
+# 「并发章节」：同一门课同时处理几个章节（界面右侧那个 Spinbox）
 JOBS_MIN, JOBS_MAX = 1, 8
-DEFAULT_SPEED, DEFAULT_JOBS = 2.0, 4
+DEFAULT_SPEED, DEFAULT_JOBS = 2.0, 1
 
 # 登录框「取消 / 登录」按钮左侧的行内提示区宽度（像素）。
 # 必须给足：最小可用文案「账号或密码错误」约 84px，最长的一条
@@ -546,12 +553,13 @@ class SettingsDialog(tk.Toplevel):
         ("min_interval_seconds", "最小请求间隔(秒)", "text"),
         ("http_proxy", "HTTP 代理(可留空)", "text"),
     )
-    # [common] 段：视频学习相关的两个键（观看进度要求 + 状态日志间隔）
+    # [common] 段：视频学习 + 并发相关的键（观看进度要求 / 状态日志间隔 / 章内任务点并发）
     RUN_FIELDS = (
+        ("point_jobs", "任务点并发（同一章节内同时刷几个任务点，1~8；1 = 章内串行最稳）", "text"),
         ("video_finish_percent", "观看进度要求(%)，达到即判定完成（90~100，100 = 必须看完）", "text"),
         ("video_log_interval", "视频状态日志间隔(秒，0 = 不输出)", "text"),
     )
-    RUN_DEFAULTS = {"video_finish_percent": "90", "video_log_interval": "10"}
+    RUN_DEFAULTS = {"point_jobs": "1", "video_finish_percent": "90", "video_log_interval": "10"}
     PROVIDER_FIELDS = {
         "TikuYanxi": (
             ("tokens", "言溪 TOKEN（多个用英文逗号分隔）", "secret"),
@@ -673,13 +681,14 @@ class SettingsDialog(tk.Toplevel):
         self.common_frame.pack(fill="x", pady=(10, 0))
         self._build_fields(self.common_frame, self.COMMON_FIELDS)
 
-        # [common] 段：与答题无关的运行参数（观看进度要求 + 视频状态日志）
-        self.run_frame = ttk.LabelFrame(body, text="视频学习", padding=(10, 6))
+        # [common] 段：与答题无关的运行参数（并发 + 观看进度要求 + 视频状态日志）
+        self.run_frame = ttk.LabelFrame(body, text="视频学习 / 并发", padding=(10, 6))
         self.run_frame.pack(fill="x", pady=(10, 0))
         self._build_fields(self.run_frame, self.RUN_FIELDS)
         ttk.Label(
             self.run_frame,
-            text="观看进度要求 = 播到该百分比即判定任务点完成，不必看完；填 100 恢复「必须全部看完」；\n"
+            text="任务点并发 = 单个章节内同时刷几个任务点（界面「并发章节」管的是同时刷几章，两者相乘是总并发）；\n"
+                 "观看进度要求 = 播到该百分比即判定任务点完成，不必看完；填 100 恢复「必须全部看完」；\n"
                  "状态日志按间隔在日志输出：章节号 / 视频名 / 进度百分比 / 预计剩余。",
             style="Status.TLabel", justify="left",
         ).grid(row=len(self.RUN_FIELDS), column=0, columnspan=2, sticky="w", pady=(2, 0))
@@ -1019,6 +1028,10 @@ class SettingsDialog(tk.Toplevel):
         if percent and (not percent.isdigit() or not 90 <= int(percent) <= 100):
             self.save_var.set("观看进度要求请填 90~100 的整数百分比（100 = 必须全部看完）。")
             return
+        point_jobs = str(common_cfg.get("point_jobs", "")).strip()
+        if point_jobs and (not point_jobs.isdigit() or not 1 <= int(point_jobs) <= 8):
+            self.save_var.set("任务点并发请填 1~8 的整数（1 = 章内串行，最稳）。")
+            return
         if self._save({"tiku": cfg, "common": common_cfg, "ui": ui_cfg}):
             self.result = cfg
             self.common_result = common_cfg
@@ -1263,15 +1276,17 @@ class App:
         self.events: "queue.Queue[tuple]" = queue.Queue()
         self.courses: list[dict] = []
         self.current_course = None
-        self.checked: set[str] = set()       # 勾选的 courseId
+        # 课程列表是单选：同一时刻只有一门「选中课程」（= 下次开始刷课要跑的那门）
+        self.selected_cid: "str | None" = None
+        self._course_hint_job = None               # 「刷课中不能切换课程」提示的 after id
         self._chapter_rows: dict[str, str] = {}   # point_id -> tree iid
         self._log_sink_id = None
         self._loading_cid = None                  # 正在读取章节的课程（去重）
         self._read_gen = 0                        # 「读取进度」代数：切换课程/开始刷课时作废旧任务
         self._reading = False                     # 是否正在读取/探测进度
         self._chapter_order: list[str] = []       # 章节列表的行序（pid），用于按序号定位「进行中」
-        self._studying_pid = None                 # 当前课程正在处理的章节 pid（会话态，不落盘）
-        self._studying_index: dict[str, int] = {}  # courseId -> 正在处理的章节序号
+        # courseId -> 正在处理的章节 pid 集合（章节并发时同一门课可能同时有多章在跑）
+        self._studying_pids: dict[str, set[str]] = {}
         self._studying_cids: set[str] = set()     # 正在处理的课程（courseId），界面标「进行中」
         self._collect_gen = 0                     # 「采集题库」代数：递增即中止
         self._collecting = False                  # 是否正在采集题库
@@ -1305,6 +1320,18 @@ class App:
         self._pump_id = self.root.after(PUMP_MS, self._pump)
         # 启动后尝试用本机已保存的账号自动登录（自检/无账号时静默跳过）
         self._auto_login_id = self.root.after(300, self._auto_login)
+
+    # ---------------- 兼容旧接口（单选视图） ----------------
+    @property
+    def checked(self) -> "set[str]":
+        """兼容旧接口：单选下等价于「选中课程集合」（0 或 1 个元素）。"""
+        return {self.selected_cid} if self.selected_cid else set()
+
+    @property
+    def _studying_pid(self) -> "str | None":
+        """兼容旧接口：当前课程正在处理的章节 pid（并发时取任意一个）。"""
+        pids = self._studying_pids.get(self._current_cid() or "")
+        return next(iter(pids)) if pids else None
 
     # ---------------- 引擎事件 ----------------
     def _wire_engine(self) -> None:
@@ -1450,7 +1477,8 @@ class App:
         self.speed_var = tk.StringVar(value=fmt_speed(speed0))
         ttk.Spinbox(right, from_=SPEED_MIN, to=SPEED_MAX, increment=0.5, width=4,
                     textvariable=self.speed_var).pack(side="left", padx=(4, 10))
-        ttk.Label(right, text="并发").pack(side="left")
+        # 「并发章节」= 同一门课同时处理几个章节（任务点并发在「设置 → 视频学习」里）
+        ttk.Label(right, text="并发章节").pack(side="left")
         self.jobs_var = tk.StringVar(value=str(jobs0))
         ttk.Spinbox(right, from_=JOBS_MIN, to=JOBS_MAX, width=4,
                     textvariable=self.jobs_var).pack(side="left", padx=(4, 12))
@@ -1494,7 +1522,8 @@ class App:
         return right_edge <= bar_edge + 1 and bottom <= bar_bottom + 1
 
     def _build_course_pane(self, parent: tk.Misc) -> ttk.Widget:
-        box = ttk.Labelframe(parent, text="课程（点击切换勾选）", padding=6)
+        box = ttk.Labelframe(parent, text=COURSE_PANE_TITLE, padding=6)
+        self._course_box = box
         box.rowconfigure(0, weight=1)
         box.columnconfigure(0, weight=1)
 
@@ -1508,15 +1537,15 @@ class App:
         xbar = ttk.Scrollbar(box, orient="horizontal", command=self.course_tree.xview)
         xbar.grid(row=1, column=0, sticky="ew")
         self.course_tree.configure(yscrollcommand=bar.set, xscrollcommand=xbar.set)
-        self.course_tree.tag_configure("checked", foreground="#1565c0")
+        # 「选中」= 整行背景变蓝（单选唯一视觉）；「进行中」= 实际在刷的那门课
+        self.course_tree.tag_configure("selected", background="#1565c0", foreground="#ffffff")
         self.course_tree.tag_configure("studying", foreground="#ef6c00")
         self.course_tree.bind("<Button-1>", self._on_course_click)
         self.course_tree.bind("<<TreeviewSelect>>", self._on_course_select)
 
         tools = ttk.Frame(box)
         tools.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
-        ttk.Button(tools, text="全选", width=6, command=lambda: self._set_all_checked(True)).pack(side="left")
-        ttk.Button(tools, text="清空", width=6, command=lambda: self._set_all_checked(False)).pack(side="left", padx=4)
+        ttk.Label(tools, text="单选：选中即展示该课程章节", style="Status.TLabel").pack(side="left")
         ttk.Button(tools, text="刷新列表", width=10, command=self.on_refresh_courses).pack(side="right")
         return box
 
@@ -1647,7 +1676,9 @@ class App:
         for state, colors in theme.chapter_colors(name).items():
             if state in CHAPTER_STYLE:
                 self.chapter_tree.tag_configure(state, foreground=colors)
-        self.course_tree.tag_configure("checked", foreground=p["accent"])
+        # 选中课程：整行用系统选择色（深浅两套主题各自不同），与原生选中态一致
+        self.course_tree.tag_configure("selected", background=p["select"],
+                                       foreground=p["select_text"])
         self.course_tree.tag_configure("studying", foreground=theme.chapter_colors(name)["studying"])
         self.log_text.configure(
             bg=p["field"], fg=p["text"], insertbackground=p["text"],
@@ -1889,7 +1920,8 @@ class App:
                 self.log("【设置】题库/AI 答题配置已即时生效")
             except Exception as exc:  # noqa: BLE001
                 self.log(f"【设置】配置应用失败（将在下次登录生效）: {exc}")
-        # 视频配置（进度要求 + 状态日志间隔）：重读 [common] 并推给当前后端（刷课中也能立即生效）
+        # 视频/并发配置（进度要求 + 状态日志间隔 + 章内任务点并发）：重读 [common]
+        # 并推给当前后端（刷课中也能立即生效）
         try:
             percent = self.engine.apply_video_config()
             interval = self.engine.video_log_interval
@@ -1897,7 +1929,8 @@ class App:
                         else f"视频状态日志：每 {interval:g} 秒一条")
             require = ("观看进度要求 100%（必须看完）" if percent >= 100
                        else f"观看进度要求 {percent:g}%（达标即判定完成）")
-            self.log(f"【设置】{require}；{log_mode}")
+            self.log(f"【设置】{require}；{log_mode}；"
+                     f"任务点并发 {self.engine.point_jobs}（章节内）")
         except Exception as exc:  # noqa: BLE001
             self.log(f"【设置】视频配置应用失败: {exc}")
         self.log(f"【设置】已保存（{USER_NAME}）")
@@ -1941,55 +1974,64 @@ class App:
 
     def _save_selection(self) -> None:
         uid = self.engine.current_uid
-        if not uid:
+        if not uid or not self.selected_cid:
             return
         data = self._load_selection()
-        data[uid] = sorted(self.checked)
+        data[uid] = [self.selected_cid]       # 单选：只记一门
         try:
             with open(self._selection_path(), "w", encoding="utf8") as fp:
                 json.dump(data, fp, ensure_ascii=False, indent=2)
         except Exception:  # noqa: BLE001
-            logger.debug("保存课程勾选状态失败")
+            logger.debug("保存课程选中状态失败")
 
-    def _apply_saved_selection(self) -> None:
+    def _saved_selected_cid(self) -> "str | None":
+        """上次选中的课程（旧版本存的是勾选列表，取第一个可用项）。"""
         uid = self.engine.current_uid
         if not uid:
-            return
-        saved = set(self._load_selection().get(uid, []))
+            return None
+        saved = self._load_selection().get(uid) or []
+        if isinstance(saved, str):
+            saved = [saved]
         available = {str(c["courseId"]) for c in self.courses}
-        for cid in saved & available:
-            self.checked.add(cid)
-            self._refresh_course_row(cid)
+        for cid in saved:
+            if str(cid) in available:
+                return str(cid)
+        return None
 
     def _ev_courses(self, courses: list) -> None:
         self.courses = courses
         self.course_tree.delete(*self.course_tree.get_children())
-        self.checked.clear()
         for course in courses:
             cid = str(course["courseId"])
             self.course_tree.insert("", "end", iid=cid, text=self._course_label(cid, course["title"]))
-        self._apply_saved_selection()
+        # 保持单选：当前选中 > 上次保存 > 第一门
+        available = [str(c["courseId"]) for c in courses]
+        keep = self.selected_cid if self.selected_cid in available else self._saved_selected_cid()
+        if keep is None and available:
+            keep = available[0]
+        if keep:
+            self.course_tree.selection_set(keep)
+            self._set_selected_course(keep)
+            self._select_course(keep)
+        else:
+            self.selected_cid = None
         for cid in list(self._studying_cids):   # 刷课中刷新列表：保留「进行中」标记
             self._refresh_course_row(cid)
-        if courses:
-            first = str(courses[0]["courseId"])
-            self.course_tree.selection_set(first)
-            self._select_course(first)
         self.set_status("ok", f"共 {len(courses)} 门课程")
 
     def _course_label(self, cid: str, title: str) -> str:
-        text = f"{'[√]' if cid in self.checked else '[  ]'} {title}"
-        if cid in self._studying_cids:
-            text += " · 进行中"
-        return text
+        return f"{title} · 进行中" if cid in self._studying_cids else title
 
     def _course_tags(self, cid: str) -> tuple:
+        """选中 = 整行蓝底；进行中 = 橙色文字（互斥，选中优先）。"""
+        if cid == self.selected_cid:
+            return ("selected",)
         if cid in self._studying_cids:
             return ("studying",)
-        return ("checked",) if cid in self.checked else ()
+        return ()
 
     def _refresh_course_row(self, cid: str) -> None:
-        """按当前勾选/进行中状态重绘课程行（文本 + 颜色标签）。"""
+        """按当前选中/进行中状态重绘课程行（文本 + 颜色标签）。"""
         course = next((c for c in self.courses if str(c["courseId"]) == cid), None)
         if not course:
             return
@@ -1999,13 +2041,55 @@ class App:
         except tk.TclError:          # 行已被刷新列表清掉
             pass
 
+    def _set_selected_course(self, cid: str) -> None:
+        """单选：把选中态切到 cid，并重绘受影响的行（旧的蓝底要擦掉）。"""
+        if self.selected_cid == cid:
+            self._refresh_course_row(cid)
+            return
+        old = self.selected_cid
+        self.selected_cid = cid
+        for row in (old, cid):
+            if row:
+                self._refresh_course_row(row)
+
+    def select_first_course(self) -> None:
+        """选中第一门课程（自检/测试用，等价于点击第一行）。"""
+        rows = self.course_tree.get_children()
+        if rows:
+            self.course_tree.selection_set(rows[0])
+            self._set_selected_course(rows[0])
+            self._select_course(rows[0])
+
+    def _flash_course_hint(self, text: str, ms: int = 1800) -> None:
+        """在「课程（点击切换课程）」标题右侧短暂提示（不弹窗、不动其它控件）。"""
+        job = self._course_hint_job
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except Exception:  # noqa: BLE001 - 定时器已触发/窗口已销毁
+                pass
+            self._course_hint_job = None
+        try:
+            self._course_box.configure(text=f"{COURSE_PANE_TITLE}　◀ {text}")
+        except (tk.TclError, AttributeError):
+            return
+
+        def restore() -> None:
+            self._course_hint_job = None
+            try:
+                self._course_box.configure(text=COURSE_PANE_TITLE)
+            except tk.TclError:
+                pass
+
+        self._course_hint_job = self.root.after(ms, restore)
+
     def _set_course_studying(self, cid: str) -> None:
-        """左侧课程列表把正在处理的课程标为「进行中」（并行处理时多门同时标）。"""
+        """左侧课程列表把正在处理的课程标为「进行中」。"""
         self._studying_cids.add(cid)
         self._refresh_course_row(cid)
 
     def _clear_course_studying(self, cid: str) -> None:
-        """去掉「进行中」标记，恢复勾选态。"""
+        """去掉「进行中」标记，恢复选中态。"""
         self._studying_cids.discard(cid)
         self._refresh_course_row(cid)
 
@@ -2014,37 +2098,40 @@ class App:
         for cid in list(self._studying_cids):
             self._clear_course_studying(cid)
 
-    def _on_course_click(self, event) -> None:
+    def _on_course_click(self, event):
+        """单选：点一行 = 选中并展示该课程章节；刷课中不允许切走。"""
         iid = self.course_tree.identify_row(event.y)
         if not iid:
-            return
-        title = self._course_title(iid)
-        if iid in self.checked:
-            self.checked.discard(iid)
-        else:
-            self.checked.add(iid)
-        self.course_tree.item(iid, text=self._course_label(iid, title),
-                              tags=self._course_tags(iid))
+            return None
+        if self.engine.is_running and self.selected_cid and iid != self.selected_cid:
+            # 刷课中切课：视觉上「点了没反应」，只在标题右侧短暂提示原因
+            self._flash_course_hint(COURSE_SWITCH_BLOCKED)
+            return "break"
+        self.course_tree.selection_set(iid)
+        self._set_selected_course(iid)
         self._select_course(iid)
         self._save_selection()
+        return "break"
 
     def _on_course_select(self, _event=None) -> None:
         sel = self.course_tree.selection()
-        if sel:
-            self._select_course(sel[0])
+        if not sel:
+            return
+        cid = sel[0]
+        if self.engine.is_running and self.selected_cid and cid != self.selected_cid:
+            # 键盘上下键也会改选中：拨回原课程并提示，保持「刷课中不能切课」
+            self._flash_course_hint(COURSE_SWITCH_BLOCKED)
+            if self.course_tree.exists(self.selected_cid):
+                self.course_tree.selection_set(self.selected_cid)
+            return
+        self._set_selected_course(cid)
+        if cid == self._current_cid():
+            return                  # 章节已经展示了，不必重复拉取
+        self._select_course(cid)
 
     def _course_title(self, cid: str) -> str:
         course = next((c for c in self.courses if str(c["courseId"]) == cid), None)
         return course["title"] if course else cid
-
-    def _set_all_checked(self, value: bool) -> None:
-        self.checked = {str(c["courseId"]) for c in self.courses} if value else set()
-        for cid in self.course_tree.get_children():
-            self.course_tree.item(
-                cid, text=self._course_label(cid, self._course_title(cid)),
-                tags=self._course_tags(cid),
-            )
-        self._save_selection()
 
     def on_refresh_courses(self) -> None:
         if self.engine.chaoxing is None:
@@ -2082,7 +2169,7 @@ class App:
         self.chapter_tree.delete(*self.chapter_tree.get_children())
         self._chapter_rows.clear()
         self._chapter_order = []
-        self._studying_pid = None        # 行全部重建，旧的「进行中」行标记随即失效
+        self._studying_pids.pop(cid, None)   # 行全部重建，旧的「进行中」标记随即失效
         for point in points:
             pid = str(point["id"])
             # 章节状态以服务端为准：平台判定「未完成/需重新作答」时不能显示为已完成
@@ -2126,30 +2213,35 @@ class App:
         return str(self.current_course["courseId"]) if self.current_course else None
 
     def _set_chapter_row_state(self, pid: str, state: str) -> None:
-        """把单行章节状态改掉，并同步「进行中」行指针。"""
+        """把单行章节状态改掉，并同步「进行中」集合。"""
         if pid not in self._chapter_rows:
             return
         title = self.chapter_tree.set(pid, "title")
         self.chapter_tree.item(pid, values=self._chapter_values(state, title), tags=(state,))
+        cid = self._current_cid()
+        if not cid:
+            return
+        pids = self._studying_pids.setdefault(cid, set())
         if state == "studying":
-            self._studying_pid = pid
-        elif pid == self._studying_pid:
-            self._studying_pid = None
+            pids.add(pid)
+        else:
+            pids.discard(pid)
 
     def _apply_studying_chapter(self, cid: str) -> None:
-        """把该课程正在处理的章节行标为「进行中」（仅当这门前台正显示时）。"""
+        """把该课程正在处理的章节行全部标为「进行中」（仅当这门前台正显示时）。"""
         if cid != self._current_cid():
             return
-        idx = self._studying_index.get(cid)
-        if idx is None or not (0 <= idx < len(self._chapter_order)):
-            return
-        self._set_chapter_row_state(self._chapter_order[idx], "studying")
+        for pid in list(self._studying_pids.get(cid, ())):
+            self._set_chapter_row_state(pid, "studying")
 
     def _clear_studying_chapter(self) -> None:
-        """把当前「进行中」的章节行复位为「待学」。"""
-        if self._studying_pid:
-            self._set_chapter_row_state(self._studying_pid, "pending")
-        self._studying_pid = None
+        """把当前课程所有「进行中」的章节行复位为「待学」。"""
+        cid = self._current_cid()
+        if not cid:
+            return
+        for pid in list(self._studying_pids.get(cid, ())):
+            self._set_chapter_row_state(pid, "pending")
+        self._studying_pids[cid] = set()
 
     @staticmethod
     def _chapter_values(state: str, title: str) -> tuple:
@@ -2221,11 +2313,9 @@ class App:
             return self._tips("正在采集题库，请稍候（可点「停止」中断）")
         if self.engine.is_running:
             return self._tips("刷课进行中，请先停止再采集题库")
-        selected = [c for c in self.courses if str(c["courseId"]) in self.checked]
-        if not selected and self.current_course:
-            selected = [self.current_course]
-        if not selected:
-            return self._tips("请在左侧勾选课程（或先选中一门课程）")
+        if not self.current_course:
+            return self._tips("请先在左侧选择一门课程")
+        selected = [self.current_course]        # 单选：只采集当前选中的这门课
         names = "、".join(str(c.get("title") or "") for c in selected[:3])
         if len(selected) > 3:
             names += " 等"
@@ -2383,9 +2473,11 @@ class App:
     def on_start(self) -> None:
         if self.engine.chaoxing is None:
             return self._tips("请先登录（或点击「演示」）")
-        selected = [c for c in self.courses if str(c["courseId"]) in self.checked]
-        if not selected:
-            return self._tips("请至少勾选一门课程")
+        # 单选：只跑「当前选中 + 正展示章节」的那一门课
+        course = self.current_course
+        if not course:
+            return self._tips("请先在左侧选择一门课程")
+        selected = [course]
         speed = parse_speed(self.speed_var.get())
         jobs = parse_jobs(self.jobs_var.get())
         if speed is None or jobs is None:
@@ -2396,9 +2488,9 @@ class App:
         self._save_run_params()
         self._cancel_reading()       # 刷课期间不再后台探测进度，避免抢请求/抢状态
         self._stopping = False
-        # 清理上一次可能残留的「进行中」标记（课程 / 章节 / 序号）
+        # 清理上一次可能残留的「进行中」标记（课程 / 章节）
         self._clear_studying_chapter()
-        self._studying_index.clear()
+        self._studying_pids.clear()
         self._clear_all_studying_courses()
         self.engine.start_study(selected, speed=speed, jobs=jobs)
         self._refresh_action()
@@ -2461,19 +2553,30 @@ class App:
             self._set_course_studying(cid)
         else:
             self._clear_course_studying(cid)
-            self._studying_index.pop(cid, None)
+            self._studying_pids.pop(cid, None)
             if cid == self._current_cid():
                 self._clear_studying_chapter()
 
     def _ev_chapter(self, cid: str, index: int, total: int, title: str) -> None:
-        self._set_status_text(f"学习中 {index + 1}/{total} · {title}")
-        # 正在刷的课程在左侧列表标「进行中」（并行处理时多门同时标）
+        """某章开始处理：状态栏 + 行标记。
+
+        章节并发时同一门课会连续收到多条（不同 index），因此这里**不清理**上一章的
+        「进行中」，而是把每一条都记进 ``_studying_pids[cid]``，一起渲染。
+        """
+        prefix = ""
+        pids = self._studying_pids.get(cid) or set()
+        concurrent = len(pids) + 1
+        if concurrent > 1:
+            prefix = f"并行 {concurrent} 章 · "
+        self._set_status_text(f"学习中 {prefix}{index + 1}/{total} · {title}")
         self._set_course_studying(cid)
-        self._studying_index[cid] = index
-        if cid != self._current_cid():
+        pid = (self._chapter_order[index]
+               if 0 <= index < len(self._chapter_order) else None)
+        if pid:
+            self._studying_pids.setdefault(cid, set()).add(pid)
+        if cid != self._current_cid() or not pid:
             return
-        self._clear_studying_chapter()        # 上一章若还挂着「进行中」先复位
-        self._apply_studying_chapter(cid)
+        self._set_chapter_row_state(pid, "studying")
 
     def _ev_progress(self, cid: str, pid: str, status: str) -> None:
         if status == "not_open":              # 兼容旧引擎：未开放不再单列，等同待学
@@ -2484,8 +2587,8 @@ class App:
             title = self.chapter_tree.set(pid, "title")
             self.chapter_tree.item(pid, values=self._chapter_values(status, title), tags=(status,))
             # 该章有结论了就不再是「进行中」；未开放/重试期间（pending）继续保持
-            if status in ("done", "error") and pid == self._studying_pid:
-                self._studying_pid = None
+            if status in ("done", "error"):
+                self._studying_pids.get(cid, set()).discard(pid)
         self._update_chapter_hint()
 
     def _update_chapter_hint(self) -> None:
@@ -2497,7 +2600,7 @@ class App:
     def _ev_finished(self) -> None:
         self._stopping = False
         self._clear_studying_chapter()
-        self._studying_index.clear()
+        self._studying_pids.clear()
         self._clear_all_studying_courses()
         self._refresh_action()
         if getattr(self.engine, "last_stopped", False):

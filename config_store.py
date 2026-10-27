@@ -39,14 +39,16 @@ USER_HEADER = [
 
 # 取值校验规则（对 [tiku] / [common] / [ui] 生效；空值一律视为合法）
 TIKU_FLOAT_KEYS = ("cover_rate", "delay", "min_interval_seconds")
-TIKU_INT_KEYS = ("work_retry", "likeapi_retry_times")
+TIKU_INT_KEYS = ("work_retry", "reanswer_rounds", "likeapi_retry_times")
 TIKU_BOOL_KEYS = ("submit", "ignore_api_key", "likeapi_search", "likeapi_vision", "likeapi_retry",
                   "local_bank", "local_bank_verify")
 TIKU_PROVIDERS = ("", "TikuYanxi", "TikuLike", "TikuAdapter", "AI", "DeepSeek", "SiliconFlow")
-COMMON_INT_KEYS = ("video_log_interval", "jobs")
+COMMON_INT_KEYS = ("video_log_interval", "jobs", "point_jobs", "video_finish_percent")
 COMMON_FLOAT_KEYS = ("speed",)
 # 有取值范围的键：超出范围视为非法（回落默认值），避免手改成界面之外的值
-COMMON_RANGES = {"jobs": (1, 8), "speed": (1.0, 2.0)}
+# jobs = 同时进行的章节数（界面「并发章节」）；point_jobs = 单章内任务点并发（设置在「视频学习」里）
+COMMON_RANGES = {"jobs": (1, 8), "point_jobs": (1, 8), "speed": (1.0, 2.0),
+                 "video_finish_percent": (90, 100)}
 # [ui] 段：主题只能是这三种（写错就回落默认的「跟随系统」）
 UI_THEME_VALUES = ("system", "light", "dark")
 # 窗口几何：宽x高+x+y（偏移量可带负号）
