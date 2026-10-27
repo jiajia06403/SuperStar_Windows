@@ -16,9 +16,10 @@ SuperStar Windows 引擎
          （默认 3）、整份作业一题答案都没搜到、判分连续两轮没有进展（判对题数不涨且
          拿不到正确答案）、提交的答案与上一轮完全相同 —— 任一命中即判定「再答也没用」；
        - 上一章已完成（或本就首章）则每 15 秒检查当前章节状态，直到开放或软件关闭；
-       - **例外**：平台阻断提交（图形验证码 / 作业重做次数用尽，``StudyResult.REFUSED`` ->
-         ``ChapterResult.NO_RETRY``）时，本章永远完不成、后续章节也永远不会解锁，
-         此时不再重答也不再轮询，直接结束该课程并提示用户手动过验证
+       - 自动重答判定「过不了」之后（轮数到顶 / 一题没搜到 / 判分无进展 / 答案没变 /
+         平台阻断提交 ``ChapterResult.NO_RETRY``，例如弹图形验证码），**不再立刻结束**：
+         留出 manual_wait 秒（默认 300）让用户去浏览器手动完成这一章，期间每
+         poll_interval 秒回读一次进度；做完了就自动接着刷，到点仍无变化才结束本课程
          （否则就是每 15 秒空转的死循环）。
 
   4. **异常隔离**：任务点 / 章节 / 课程三层各自兜底，单点网络或解析异常只会让
@@ -71,6 +72,12 @@ DEFAULT_WORK_RETRY = 3
 # 不设上限就会出现日志里那种「继续重答(第 49 轮)」的空转：平台一直判不合格、
 # 题库又换不出正确答案，每轮都在白白消耗平台的作业重做次数。
 DEFAULT_REANSWER_ROUNDS = 3
+
+# 自动重答判定「过不了」（轮数到顶 / 平台弹验证码 / 一题没搜到 / 判分无进展）之后，
+# 留出用户手动在浏览器完成本章的窗口期（秒，[tiku] manual_wait）。
+# 期间每 poll_interval 秒回读一次服务端进度：用户真做完了就自动接着刷，
+# 到点仍没变化才判无解、结束本课程。0 = 不等（立刻结束）。
+DEFAULT_MANUAL_WAIT = 300
 
 # 连续多少轮「判对题数没涨、也没拿到正确答案」就判定重答毫无进展（停止重答）
 MAX_NO_PROGRESS_ROUNDS = 2
@@ -681,6 +688,8 @@ class StudyEngine:
         self.work_retry = DEFAULT_WORK_RETRY   # 单次刷课内章节检测不合格的重新作答次数
         # 回退重做上一章的最大轮数（0/非法按默认值）：防止「题库换不出答案」时无限重答
         self.reanswer_rounds = DEFAULT_REANSWER_ROUNDS
+        # 自动重答放弃后，等待用户手动完成本章的秒数（[tiku] manual_wait）
+        self.manual_wait = DEFAULT_MANUAL_WAIT
         # 视频状态日志间隔（秒，0=关闭）：观看视频时每 N 秒输出章节号/进度百分比等
         self.video_log_interval = video_log_interval_from_config()
         # 观看进度要求（90~100）：播到该比例后每 5 秒复查一次，未通过就继续看
@@ -720,6 +729,7 @@ class StudyEngine:
         rounds = _int_from_config(tiku_config, "reanswer_rounds", DEFAULT_REANSWER_ROUNDS)
         # 至少 1 轮：允许 0 就等于「一题不做」，会让整门课直接放弃
         self.reanswer_rounds = max(1, rounds)
+        self.manual_wait = _int_from_config(tiku_config, "manual_wait", DEFAULT_MANUAL_WAIT)
 
     def _build_chaoxing(self, username: str, password: str, use_cookies: bool,
                         tiku_config: Optional[dict] = None) -> Chaoxing:
@@ -1381,7 +1391,7 @@ class StudyEngine:
 
           * ``True``  —— 章节已开放（外层保持在 i 重新处理本章）；
           * ``False`` —— 用户停止 / 软件关闭（外层结束本课程）；
-          * ``None``  —— **无解**：前面某一章已被平台拒绝重答（重做次数用尽），
+          * ``None``  —— **无解**：自动重答过不了，且 manual_wait 秒内用户也没手动做完，
             本章永远不会解锁。外层必须结束本课程，绝不能再 15 秒一轮地空转。
 
         分支：
@@ -1423,9 +1433,10 @@ class StudyEngine:
             轮：再答一百轮也是同一个结果，直接停；
           * **轮数上限** ``reanswer_rounds``：无论如何不超过这么多轮（平台的重做次数有限）。
 
-        以上「停」一律**不再转轮询**：本章就是当前章节没开放的原因，重答都过不了，
-        等下去等于每 15 秒空转一次直到天亮。返回 ``None`` 让外层结束本课程。
-        平台明确拒绝重答（``ChapterResult.NO_RETRY``）同理。
+        以上「停」都不再继续自动重答，改走 ``_wait_manual``：给用户 ``manual_wait`` 秒
+        （默认 300）手动在浏览器里做完这一章，期间每 ``poll_interval`` 秒回读服务端进度；
+        真做完了就自动继续刷（返回 True / 转轮询），到点仍无变化才判无解（返回 None，
+        外层结束本课程）。平台明确拒绝重答（``ChapterResult.NO_RETRY``）同理。
 
         只有一种情况值得轮询：上一章已经重做通过、但老师还没开放下一章 —— 那是
         「等时间」，不是「等自己」。
@@ -1449,8 +1460,8 @@ class StudyEngine:
         while not self._stop:
             attempt += 1
             if attempt > max_rounds:
-                return self._stop_blocked(
-                    prev, title, cur_title,
+                return self._wait_manual(
+                    course, points, i, prev, title, cur_title,
                     f"已重答 {max_rounds} 轮仍未通过平台校验（上限 reanswer_rounds={max_rounds}）",
                 )
             if attempt == 1:
@@ -1466,17 +1477,14 @@ class StudyEngine:
                 return False
 
             if r == ChapterResult.NO_RETRY:
-                # 平台阻断提交（图形验证码 / 重做次数用尽）：上一章过不了，本章（及后续）
-                # 永久锁死。直接判死，不轮询 —— 轮询在这里就是「每 15 秒空转」的死循环。
-                prev["work_refused"] = True
+                # 平台阻断提交（图形验证码 / 重做次数用尽）：自动重答已经走不通了。
+                # 但用户在浏览器里过掉验证码、手动做完这一章完全可行 —— 因此不立刻判死，
+                # 先等 manual_wait 秒（每 poll_interval 秒回读一次进度），仍无变化才结束本课程。
                 reason = getattr(self.chaoxing, "work_refused_reason", "") or "平台阻断提交"
                 self._emit(self.STATUS, "blocked", f"平台阻断提交，已停止重做: {title}")
-                logger.error(
-                    f"上一章节提交被平台阻断（{reason}），当前章节无法解锁，"
-                    f"结束该课程的等待: {cur_title}"
-                )
+                logger.error(f"上一章节提交被平台阻断（{reason}），自动重答无法继续: {title}")
                 logger.error(CAPTCHA_HINT)
-                return None
+                return self._wait_manual(course, points, i, prev, title, cur_title, reason)
 
             if r == ChapterResult.SUCCESS:
                 prev["has_finished"] = True
@@ -1519,8 +1527,8 @@ class StudyEngine:
 
                 # 1) 整份作业一题答案都没搜到（全靠随机兜底）：换不出正确答案
                 if _no_answer_found(self.chaoxing):
-                    return self._stop_blocked(
-                        prev, title, cur_title,
+                    return self._wait_manual(
+                        course, points, i, prev, title, cur_title,
                         "上一章节作业一题答案都没搜到（全靠随机作答），重答不会通过",
                     )
 
@@ -1532,8 +1540,8 @@ class StudyEngine:
                         no_progress = 0
                     best_right = max(best_right, right)
                     if no_progress >= MAX_NO_PROGRESS_ROUNDS:
-                        return self._stop_blocked(
-                            prev, title, cur_title,
+                        return self._wait_manual(
+                            course, points, i, prev, title, cur_title,
                             f"上一章节连续 {no_progress} 轮判分没有进展（判对 {right} 题、"
                             f"没拿到正确答案），再重答也是同一个结果",
                         )
@@ -1542,8 +1550,8 @@ class StudyEngine:
                 if digest and digest == last_digest:
                     repeats += 1
                     if repeats > MAX_SAME_ANSWER_ROUNDS:
-                        return self._stop_blocked(
-                            prev, title, cur_title,
+                        return self._wait_manual(
+                            course, points, i, prev, title, cur_title,
                             f"上一章节连续 {repeats} 轮提交的答案完全一样（题库/AI 换不出"
                             f"新答案），再重答不会改变结果",
                         )
@@ -1582,11 +1590,103 @@ class StudyEngine:
 
         return self._poll_until_open(course, points, i)
 
+    def _wait_manual(self, course: dict, points: list[dict], i: int, prev: dict,
+                     title: str, cur_title: str, reason: str) -> Optional[bool]:
+        """自动重答判定「过不了」后，留出用户手动完成本章的窗口期（默认 5 分钟）。
+
+        平台弹图形验证码 / 重做次数用尽 / 题库换不出答案时，自动重答此后怎么试都不会过，
+        但**用户自己在浏览器里做完这一章**是完全可行的（尤其验证码只能人工过）。
+        所以不立刻判死，而是每 ``poll_interval`` 秒回读一次服务端进度：
+
+          * 上一章被手动做完了 -> 检查当前章节是否解锁：已解锁返回 True（继续刷课），
+            仍锁着（老师还没放行）则转 ``_poll_until_open``；
+          * 超过 ``manual_wait`` 秒仍无变化 -> 判无解（None），结束本课程。
+
+        ``manual_wait <= 0`` 表示不等，直接判定无解（旧行为，测试/CLI 用）。
+        """
+        seconds = max(0, int(self.manual_wait or 0))
+        if seconds <= 0:
+            return self._stop_blocked(prev, title, cur_title, reason)
+
+        logger.warning(
+            f"{reason}；已停止自动重答，请到浏览器里手动完成本章《{title}》。"
+            f"程序每 {self.poll_interval} 秒检查一次进度，{seconds} 秒内仍无变化将结束本课程"
+        )
+        # 章节行标成红色「需手动」（界面 tag=manual），提示用户去浏览器处理
+        cid = str(course.get("courseId", ""))
+        pid = str(prev.get("id", ""))
+        self._emit(self.PROGRESS, cid, pid, "manual")
+        self._emit(self.STATUS, "manual_wait",
+                   f"等待手动完成（最多 {seconds}s）: {title}")
+        deadline = time.monotonic() + seconds
+        while not self._stop:
+            remain = deadline - time.monotonic()
+            if remain <= 0:
+                break
+            if cancel.wait(min(self.poll_interval, remain)):
+                return False
+            if not self._refresh_points_inplace(course, points):
+                continue
+            if not prev.get("has_finished"):
+                logger.info(f"等待手动完成中（剩余 {remain:.0f}s）: {title}")
+                continue
+            # 用户手动做完了：同步缓存/界面，再看本章是否已解锁
+            self.cache.mark_done(self.current_uid, cid, pid)
+            self._emit(self.PROGRESS, cid, pid, "done")
+            logger.info(f"检测到章节已被手动完成: {title}")
+            if self._chapter_open(course, points[i]):
+                logger.info(f"当前章节已解锁，继续刷课: {cur_title}")
+                self._emit(self.STATUS, "polling", f"章节已开放: {cur_title}")
+                return True
+            logger.info(f"章节已完成但当前章节仍被锁，转为轮询: {cur_title}")
+            return self._poll_until_open(course, points, i)
+
+        if self._stop:
+            return False
+        return self._stop_blocked(
+            prev, title, cur_title,
+            f"{reason}；已等待用户手动完成 {seconds} 秒仍无进展",
+        )
+
+    def _refresh_points_inplace(self, course: dict, points: list[dict]) -> bool:
+        """从服务端回读章节完成状态并写回 ``points``（成功返回 True）。"""
+        try:
+            point_list = self.chaoxing.get_course_point(
+                course["courseId"], course["clazzId"], course["cpi"])
+        except Exception as exc:  # noqa: BLE001 - 回读失败不该中断等待
+            logger.warning(f"回读章节进度失败（{type(exc).__name__}: {exc}），稍后重试")
+            return False
+        fresh = point_list.get("points", []) if isinstance(point_list, dict) else []
+        if not fresh:
+            logger.warning("回读章节进度失败（返回空列表），稍后重试")
+            return False
+        by_id = {str(p.get("id")): p for p in fresh}
+        for p in points:
+            got = by_id.get(str(p.get("id")))
+            if got is not None:
+                p["has_finished"] = bool(got.get("has_finished"))
+        self.cache.sync_with_points(self.current_uid, str(course.get("courseId", "")), fresh)
+        return True
+
+    def _chapter_open(self, course: dict, point: dict) -> bool:
+        """当前章节是否已开放（只查第一张卡片；读不到任务点按「未开放」处理）。"""
+        try:
+            _, job_info = self.chaoxing.get_job_list(
+                course, point, nums=Chaoxing.CARD_NUMS_FIRST)
+        except Exception:  # noqa: BLE001
+            logger.warning("检查章节开放状态失败，视为未开放")
+            return False
+        if _job_unreadable(job_info):
+            logger.warning("检查章节开放状态失败（读不到任务点），视为未开放")
+            return False
+        return not job_info.get("notOpen", False)
+
     def _stop_blocked(self, prev: dict, title: str, cur_title: str, reason: str) -> None:
         """停止重答并结束本课程（返回值恒为 None）。
 
-        重答已经证明过不去，而当前章节正是因为上一章没过才锁着 —— 再每 15 秒查一次
-        开放状态就是纯空转（日志里那种停不下来的「章节仍未开放，继续等待」）。
+        走到这里说明「自动重答过不了」且「手动窗口期也没等来进展」——本章注定未完成，
+        当前章节正是因为上一章没过才锁着，再每 15 秒查一次开放状态就是纯空转
+        （日志里那种停不下来的「章节仍未开放，继续等待」）。
         标记 ``work_refused`` 让后续章节也立刻短路，不再重做也不再轮询。
         """
         prev["work_refused"] = True

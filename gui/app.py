@@ -38,7 +38,7 @@ STATE_TEXT = {
     "logged_in": "已登录", "switched": "已切换账号", "logging": "登录中",
     "running": "刷课中", "stopping": "停止中", "idle": "空闲",
     "backtrack": "回退重做", "polling": "等待章节开放", "reanswer": "答题不合格重答",
-    "blocked": "已被平台阻断",
+    "blocked": "已被平台阻断", "manual_wait": "等待手动完成",
     "read_progress": "已读取进度", "reading": "读取进度", "ok": "就绪", "error": "错误", "warn": "提示",
     "degraded": "已降为串行",
 }
@@ -51,6 +51,7 @@ CHAPTER_STYLE = {
     "done": ("完成", "#2e7d32"),
     "pending": ("待学", "#424242"),
     "studying": ("进行中", "#ef6c00"),
+    "manual": ("需手动", "#c62828"),   # 自动重答走不通，等用户去浏览器手动完成本章
     "error": ("失败", "#c62828"),
 }
 
@@ -2587,8 +2588,8 @@ class App:
         if pid in self._chapter_rows:
             title = self.chapter_tree.set(pid, "title")
             self.chapter_tree.item(pid, values=self._chapter_values(status, title), tags=(status,))
-            # 该章有结论了就不再是「进行中」；未开放/重试期间（pending）继续保持
-            if status in ("done", "error"):
+            # 该章有结论了就不再是「进行中」；未开放/重试/等手动期间继续保持
+            if status in ("done", "error", "manual"):
                 self._studying_pids.get(cid, set()).discard(pid)
         self._update_chapter_hint()
 

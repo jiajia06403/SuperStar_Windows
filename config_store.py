@@ -39,7 +39,7 @@ USER_HEADER = [
 
 # 取值校验规则（对 [tiku] / [common] / [ui] 生效；空值一律视为合法）
 TIKU_FLOAT_KEYS = ("cover_rate", "delay", "min_interval_seconds")
-TIKU_INT_KEYS = ("work_retry", "reanswer_rounds", "likeapi_retry_times")
+TIKU_INT_KEYS = ("work_retry", "reanswer_rounds", "manual_wait", "likeapi_retry_times")
 TIKU_BOOL_KEYS = ("submit", "ignore_api_key", "likeapi_search", "likeapi_vision", "likeapi_retry",
                   "local_bank", "local_bank_verify")
 TIKU_PROVIDERS = ("", "TikuYanxi", "TikuLike", "TikuAdapter", "AI", "DeepSeek", "SiliconFlow")

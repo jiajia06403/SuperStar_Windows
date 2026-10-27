@@ -190,6 +190,7 @@ def test_reanswer_stops_after_max_rounds():
     eng.current_uid = "779"
     eng.work_retry = 1
     eng.reanswer_rounds = 3
+    eng.manual_wait = 0          # 本用例验证「停手」，不等手动窗口
     fake = FakeChaoxing("779")
     fake.job_info_seq = [{"notOpen": True}] * 100
     eng.chaoxing = fake
@@ -221,6 +222,7 @@ def test_reanswer_stops_when_no_progress():
     eng.current_uid = "77a"
     eng.work_retry = 1
     eng.reanswer_rounds = 9          # 只靠「无进展」早停
+    eng.manual_wait = 0
     fake = FakeChaoxing("77a")
     fake.last_verdict_stats = {}
     fake.job_info_seq = [{"notOpen": True}] * 100
@@ -255,6 +257,7 @@ def test_reanswer_stops_when_no_answer_found():
     eng.current_uid = "77b"
     eng.work_retry = 1
     eng.reanswer_rounds = 9
+    eng.manual_wait = 0
     fake = FakeChaoxing("77b")
     fake.job_info_seq = [{"notOpen": True}] * 100
     eng.chaoxing = fake
@@ -1081,6 +1084,7 @@ def test_refused_prev_stops_polling():
     eng = StudyEngine(cache_dir=str(tmp_path), poll_interval=0.01, reanswer_interval=0.01)
     eng.current_uid = "781"
     eng.work_retry = 1
+    eng.manual_wait = 0          # 不等手动窗口，验证「拒绝后不轮询」
     fake = FakeChaoxing("781")
     fake.job_info_seq = [{"notOpen": True}] * 100     # 怎么问都是未开放
     eng.chaoxing = fake
@@ -1136,6 +1140,7 @@ def test_study_course_refused_does_not_hang():
     eng = StudyEngine(cache_dir=str(tmp_path), poll_interval=0.01, reanswer_interval=0.01)
     eng.current_uid = "783"
     eng.work_retry = 1
+    eng.manual_wait = 0          # 不等手动窗口，验证端到端不挂死
     fake = FakeChaoxing("783")
     fake.job_info_seq = [{"notOpen": True}] * 1000
     eng.chaoxing = fake
@@ -1216,6 +1221,107 @@ def test_study_work_refused_returns_refused():
 
     assert r == StudyResult.REFUSED, r
     assert "重做次数" in c.work_refused_reason, c.work_refused_reason
+
+
+class _ManualFake(FakeChaoxing):
+    """可模拟「用户手动在浏览器里做完了上一章」：第 N 次回读进度起报告已完成。"""
+
+    def __init__(self, uid, finish_after=None):
+        super().__init__(uid)
+        self.finish_after = finish_after   # None = 永远不做完
+        self.reads = 0
+
+    def get_course_point(self, *a, **k):
+        self.reads += 1
+        if self.finish_after is not None and self.reads >= self.finish_after:
+            for p in self.points:
+                p["has_finished"] = True
+        return {"points": self.points}
+
+
+def test_manual_wait_continues_after_user_finishes_chapter():
+    """重答轮数到上限后不立刻结束：用户手动做完上一章 -> 自动继续刷课。"""
+    tmp_path = tempfile.mkdtemp()
+    eng = StudyEngine(cache_dir=str(tmp_path), poll_interval=0.01, reanswer_interval=0.01)
+    eng.current_uid = "78a"
+    eng.work_retry = 1
+    eng.reanswer_rounds = 1
+    eng.manual_wait = 2                    # 2 秒窗口，回读 2 次后用户做完
+    fake = _ManualFake("78a", finish_after=2)
+    fake.points = [{"id": "p0", "title": "上一章", "has_finished": False},
+                   {"id": "p1", "title": "当前章", "has_finished": False}]
+    fake.job_info_seq = [{"notOpen": False}]   # 做完后本章已解锁
+    eng.chaoxing = fake
+    points = [{"id": "p0", "title": "上一章"}, {"id": "p1", "title": "当前章"}]
+
+    engine.process_chapter = lambda ch, c, p, s, work_retry=1, **kw: ChapterResult.UNVERIFIED
+    try:
+        opened = eng._handle_not_open({"courseId": "C", "clazzId": "cz", "cpi": "cp",
+                                       "title": "课"}, points, i=1, cid="C", uid="78a")
+    finally:
+        engine.process_chapter = _ORIG_PROCESS_CHAPTER
+
+    assert opened is True, "用户手动完成后必须自动继续，而不是结束课程"
+    assert not points[0].get("work_refused"), "手动做完了不能标成「被拒绝」"
+    assert points[0].get("has_finished") is True
+    assert eng.cache.is_done("78a", "C", "p0") is True
+
+
+def test_manual_wait_timeout_stops_course():
+    """重答到顶 + 手动窗口内毫无变化 -> 判无解结束课程，且不去查开放状态。"""
+    tmp_path = tempfile.mkdtemp()
+    eng = StudyEngine(cache_dir=str(tmp_path), poll_interval=0.02, reanswer_interval=0.01)
+    eng.current_uid = "78b"
+    eng.work_retry = 1
+    eng.reanswer_rounds = 1
+    eng.manual_wait = 1
+    fake = _ManualFake("78b", finish_after=None)    # 用户始终没动
+    fake.points = [{"id": "p0", "title": "上一章", "has_finished": False},
+                   {"id": "p1", "title": "当前章", "has_finished": False}]
+    eng.chaoxing = fake
+    points = [{"id": "p0", "title": "上一章"}, {"id": "p1", "title": "当前章"}]
+    prog = []
+    eng.on(eng.PROGRESS, lambda c, p, st: prog.append((p, st)))
+
+    engine.process_chapter = lambda ch, c, p, s, work_retry=1, **kw: ChapterResult.UNVERIFIED
+    try:
+        opened = eng._handle_not_open({"courseId": "C", "clazzId": "cz", "cpi": "cp",
+                                       "title": "课"}, points, i=1, cid="C", uid="78b")
+    finally:
+        engine.process_chapter = _ORIG_PROCESS_CHAPTER
+
+    assert opened is None, opened
+    assert fake.reads >= 2, f"窗口期内应多次回读进度，实际 {fake.reads} 次"
+    assert ("p0", "manual") in prog, f"等待手动处理时章节行应标「需手动」: {prog}"
+    assert fake.job_info_seq == [], "上一章没做完时不应去查开放状态"
+    assert points[0]["work_refused"] is True
+    assert not eng.cache.is_done("78b", "C", "p0")
+
+
+def test_manual_wait_after_captcha_block():
+    """平台弹验证码（NO_RETRY）后同样走手动窗口：用户过完验证码做完本章 -> 继续。"""
+    tmp_path = tempfile.mkdtemp()
+    eng = StudyEngine(cache_dir=str(tmp_path), poll_interval=0.01, reanswer_interval=0.01)
+    eng.current_uid = "78c"
+    eng.work_retry = 1
+    eng.manual_wait = 2
+    fake = _ManualFake("78c", finish_after=1)
+    fake.points = [{"id": "p0", "title": "上一章", "has_finished": False},
+                   {"id": "p1", "title": "当前章", "has_finished": False}]
+    fake.job_info_seq = [{"notOpen": False}]
+    fake.work_refused_reason = "请输入验证码"
+    eng.chaoxing = fake
+    points = [{"id": "p0", "title": "上一章"}, {"id": "p1", "title": "当前章"}]
+
+    engine.process_chapter = lambda ch, c, p, s, work_retry=1, **kw: ChapterResult.NO_RETRY
+    try:
+        opened = eng._handle_not_open({"courseId": "C", "clazzId": "cz", "cpi": "cp",
+                                       "title": "课"}, points, i=1, cid="C", uid="78c")
+    finally:
+        engine.process_chapter = _ORIG_PROCESS_CHAPTER
+
+    assert opened is True, "手动过完验证码做完本章后应继续刷课"
+    assert not points[0].get("work_refused")
 
 
 # --------------------------------------------------------------------------- #

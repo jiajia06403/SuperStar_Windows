@@ -76,12 +76,14 @@ PALETTES = {
 # 章节状态字体色（键与 gui.app.CHAPTER_STYLE 一致）
 CHAPTER_COLORS = {
     "light": {
-        "done": "#2e7d32", "pending": "#424242", "not_open": "#6a1b9a",
+        "done": "#2e7d32", "pending": "#424242",
         "studying": "#ef6c00", "error": "#c62828",
+        "manual": "#c62828",
     },
     "dark": {
-        "done": "#6ccb5f", "pending": "#d0d0d0", "not_open": "#c39aef",
+        "done": "#6ccb5f", "pending": "#d0d0d0",
         "studying": "#ffb74d", "error": "#ff8a80",
+        "manual": "#ff8a80",
     },
 }
 
