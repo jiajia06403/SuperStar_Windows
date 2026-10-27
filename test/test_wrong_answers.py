@@ -193,6 +193,117 @@ def test_alternative_for_gives_up_when_everything_rejected():
 
 
 # --------------------------------------------------------------------------- #
+# 3b. 提交形态（字母 / true-false）：study_work 填表单直接用，重做时排除错答
+# --------------------------------------------------------------------------- #
+def test_pick_submit_answer_avoids_rejected_single():
+    known = {lb.answer_key("single", "B", OPTS)}
+    for _ in range(30):
+        got = wa.pick_submit_answer("single", OPTS, known)
+        assert got in ("A", "C"), got
+
+
+def test_pick_submit_answer_prefers_a_different_option():
+    """给出了当前答案（上一轮被判错的那个）时，必须换成别的，不能原样返回。"""
+    known = {lb.answer_key("single", "B", OPTS)}
+    for _ in range(30):
+        assert wa.pick_submit_answer("single", OPTS, known, "B") in ("A", "C")
+
+
+def test_pick_submit_answer_flips_judgement():
+    assert wa.pick_submit_answer("judgement", "", {"T"}) == "false"
+    assert wa.pick_submit_answer("judgement", "", {"F"}) == "true"
+    assert wa.pick_submit_answer("judgement", "", {"T"}, "true") == "false"
+    # 两个判断都判错过 -> 换不出来（不能瞎猜）
+    assert wa.pick_submit_answer("judgement", "", {"T", "F"}) is None
+
+
+def test_pick_submit_answer_multiple_never_returns_rejected_combo():
+    known = {lb.answer_key("multiple", "AC", OPTS)}
+    for _ in range(30):
+        got = wa.pick_submit_answer("multiple", OPTS, known, "AC")
+        assert got and lb.answer_key("multiple", got, OPTS) not in known, got
+        assert got != "AC", "应尽量换一组新的组合"
+
+
+def test_pick_submit_answer_multiple_respects_size():
+    """多选题「选几个」由调用方决定（随机作答按原加权策略抽样），排除法只换组合。"""
+    known = {lb.answer_key("multiple", "AB", OPTS)}
+    got = wa.pick_submit_answer("multiple", OPTS, known, "", size=3)
+    assert got == "ABC", got
+    # 不指定个数时保持原来的「跟当前答案一样多」的行为
+    assert len(wa.pick_submit_answer("multiple", OPTS, known, "AB")) == 2
+
+
+def test_pick_submit_answer_gives_up_when_every_option_rejected():
+    known = {lb.answer_key("single", c, OPTS) for c in "ABC"}
+    assert wa.pick_submit_answer("single", OPTS, known) is None
+    assert wa.pick_submit_answer("completion", "", {"某答案"}) is None
+
+
+def test_pick_submit_answer_multiple_explores_other_sizes():
+    """多选题正确答案要选 3 个，但当前错答案只选了 2 个（且 2 个的所有组合都判错过）。
+
+    排除法必须能换到「3 个选项」的组合，不能卡死在 2 个选项的组合上——
+    否则永远交不出正确答案，陷入重答死循环（模拟 avoid_judged_wrong 不传 size 的场景）。
+    """
+    opts = "A. 甲\nB. 乙\nC. 丙\nD. 丁"
+    known = {lb.answer_key("multiple", c, opts)
+             for c in ("AB", "AC", "AD", "BC", "BD", "CD")}
+    for _ in range(30):
+        got = wa.pick_submit_answer("multiple", opts, known, "AB")
+        assert got, "应当换出一组尚未被判错的组合"
+        assert lb.answer_key("multiple", got, opts) not in known
+        assert len(got) == 3, f"正确答案需要选 3 个，实际换出 {got}"
+
+
+def test_pick_submit_answer_multiple_still_prefers_same_size():
+    """当前错答案是 2 个、且还有没试过的 2 个组合时，优先换同尺寸（不改变选几个）。"""
+    opts = "A. 甲\nB. 乙\nC. 丙\nD. 丁"
+    known = {lb.answer_key("multiple", c, opts) for c in ("AB", "AC")}
+    for _ in range(30):
+        got = wa.pick_submit_answer("multiple", opts, known, "AB")
+        assert got and len(got) == 2, got
+        assert lb.answer_key("multiple", got, opts) not in known
+
+
+def test_alternative_for_multiple_explores_other_sizes():
+    """alternative_for 同样要在同尺寸换不出时尝试其它尺寸（题库/AI 层）。
+
+    4 个选项、所有 2 个组合都判错过 -> 必须能换出 3/4 个选项的组合。
+    """
+    opts = "A. 甲\nB. 乙\nC. 丙\nD. 丁"
+    known = {lb.answer_key("multiple", c, opts)
+             for c in ("AB", "AC", "AD", "BC", "BD", "CD")}
+    for _ in range(30):
+        alt = wa.alternative_for("multiple", opts, known, "AB")
+        assert alt and "\n" in alt, alt
+        key = lb.answer_key("multiple", alt, opts)
+        assert key not in known
+        assert len(alt.split("\n")) == 3, f"应换出 3 个选项的组合，实际 {alt.splitlines()}"
+
+
+# --------------------------------------------------------------------------- #
+# 3c. 提交前最后一道闸：任何来源的答案撞到已知错答都要换掉
+# --------------------------------------------------------------------------- #
+def test_avoid_judged_wrong_swaps_rejected_answer():
+    with _env("gate"):
+        wa.record_wrong("题目一", "single", OPTS, "甲选项")
+        assert base.avoid_judged_wrong(_q(), "A") in ("B", "C")
+        # 没被判错过的答案原样保留（不能顺手把正确答案也改掉）
+        assert base.avoid_judged_wrong(_q(), "C") == "C"
+        # 没记录的题不受影响
+        assert base.avoid_judged_wrong(_q(title="题目二"), "A") == "A"
+
+
+def test_avoid_judged_wrong_flips_judgement():
+    with _env("gate_j"):
+        wa.record_wrong("判断题一", "judgement", "", "true")
+        q = {"title": "判断题一", "type": "judgement", "options": ""}
+        assert base.avoid_judged_wrong(q, "true") == "false"
+        assert base.avoid_judged_wrong(q, "false") == "false"
+
+
+# --------------------------------------------------------------------------- #
 # 4. Tiku.query：缓存/题库里的答案被判错 -> 作废并重新搜题
 # --------------------------------------------------------------------------- #
 def test_query_drops_cached_answer_that_was_judged_wrong():
