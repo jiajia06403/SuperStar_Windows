@@ -28,7 +28,9 @@
     book.clear(fp)                # 这道题答对了 -> 清掉它的错答记录
 """
 
+import itertools
 import json
+import math
 import os
 import random
 import tempfile
@@ -297,6 +299,65 @@ def hint_texts(qtype: str, options: str, known: Set[str]) -> List[str]:
     return []
 
 
+# --------------------------------------------------------------------------- #
+# 多选题：被判错的是「组合」，不是「某个选项」
+# --------------------------------------------------------------------------- #
+# 穷举上限：超过就退化为随机抽样，避免 20 个选项的组合数把 CPU 打满。
+_ENUM_LIMIT = 20000
+
+
+def option_letters(options: str) -> List[str]:
+    """选项字母（按出现顺序去重）。"""
+    out: List[str] = []
+    for line in local_bank.option_lines(options):
+        letter = local_bank.option_letter(line)
+        if letter and letter not in out:
+            out.append(letter)
+    return out
+
+
+def size_order(want: int, total: int) -> List[int]:
+    """多选题的「先试几个选项」顺序：先原尺寸，再按常见度 2/3/4…，1 个放最后。"""
+    if total < 1:
+        return []
+    want = max(1, min(int(want or 1), total))
+    order = [want] + [s for s in range(2, total + 1) if s != want]
+    if want != 1:
+        order.append(1)
+    return order
+
+
+def multiple_pool(letters: List[str], options: str, known: Set[str],
+                  size: int) -> List[str]:
+    """穷举「选 ``size`` 个」里**没被判错过**的字母串（``"AB"`` 形态，字母已排序）。
+
+    多选的判错是**组合级**的：``"甲|乙"`` 判错只说明「只选甲+乙」错，甲、乙本身
+    完全可能是正确答案的一部分。所以这里只按组合键排除，**绝不**因为「某个选项
+    单独提交过被判错」就把这个选项从所有组合里剔掉——那会把候选空间砍空，最后
+    误报「该题可选答案都已被平台判错」。
+    """
+    if size < 1 or size > len(letters):
+        return []
+    if math.comb(len(letters), size) <= _ENUM_LIMIT:
+        pool: List[str] = []
+        for combo in itertools.combinations(letters, size):
+            picked = "".join(combo)
+            if local_bank.answer_key("multiple", picked, options) not in known:
+                pool.append(picked)
+        return pool
+    pool = []
+    seen: Set[str] = set()
+    for _ in range(_ENUM_LIMIT):
+        picked = "".join(sorted(random.sample(letters, size)))
+        if picked in seen:
+            continue
+        if local_bank.answer_key("multiple", picked, options) in known:
+            continue
+        seen.add(picked)
+        pool.append(picked)
+    return pool
+
+
 def alternative_for(qtype: str, options: str, known: Set[str],
                     current: str = "") -> Optional[str]:
     """这道题刚提交的答案已被判错 -> 换一个（排除法）。
@@ -305,8 +366,8 @@ def alternative_for(qtype: str, options: str, known: Set[str],
     单选给选项正文、多选给多行正文、判断给 ``正确`` / ``错误``。
 
     * 单选：在**没被判错**的选项里随机挑一个；
-    * 多选：换一组**同样长度**、且没被判错过的组合；同一长度都试过后
-      放宽到**其它长度**（正确答案可能与当前错答案选的个数不同，否则会卡死）；
+    * 多选：换一组**没被判错**的组合——先保持「选几个」不变，同尺寸的组合都判错过
+      了再放宽到其它尺寸；尺寸内**穷举**，所以「换不出来」是真的无解，不是没抽到；
     * 判断：取反；
     * 填空 / 简答：换不了（返回 None）。
 
@@ -349,22 +410,14 @@ def alternative_for(qtype: str, options: str, known: Set[str],
         letters = list(texts)
         if not letters:
             return None
-        size = len(local_bank.pure_letters(current) or "") or min(2, len(letters))
-        size = min(size, len(letters))
-        for _ in range(20):
-            picked = sorted(random.sample(letters, size))
-            if local_bank.answer_key(qtype, "".join(picked), options) not in known:
-                return "\n".join(texts[c] for c in picked)
-        # 同样尺寸的组合都试过了，或正确答案本就不是这个尺寸 -> 放宽到其它尺寸，
-        # 否则「正确答案要选 3 个、错答案只选了 2 个」会卡死在 2 个选项的组合里。
-        # 优先级按多选题常见度 2/3/4，单选式的 1 个放最后。
-        preferred = [s for s in range(1, len(letters) + 1)
-                     if s != 1 and s != size] + ([1] if 1 != size else [])
-        for n in preferred:
-            for _ in range(16):
-                picked = sorted(random.sample(letters, n))
-                if local_bank.answer_key(qtype, "".join(picked), options) not in known:
-                    return "\n".join(texts[c] for c in picked)
+        cur = sorted(local_bank.pure_letters(current) or "")
+        want = len(cur) or min(2, len(letters))
+        for n in size_order(want, len(letters)):
+            pool = multiple_pool(letters, options, known, n)
+            if not pool:
+                continue        # 这个尺寸的组合全被判错过 -> 换下一个尺寸
+            others = [c for c in pool if list(c) != cur] or pool
+            return "\n".join(texts[c] for c in random.choice(others))
         return None
     return None
 
@@ -373,7 +426,12 @@ def alternative_for(qtype: str, options: str, known: Set[str],
 # 提交形态：study_work 直接填进表单的那种答案（字母 / true|false）
 # --------------------------------------------------------------------------- #
 def safe_letters(qtype: str, options: str, known: Set[str]) -> List[str]:
-    """没被判错过的选项字母（单选 / 多选）。"""
+    """没被判错过的选项字母。
+
+    **只对单选有意义**：多选的判错是组合级的（``"甲|乙"`` 判错不代表甲、乙本身
+    错），按单个字母筛会把正确答案的组成部分一起剔掉（多选请走
+    :func:`multiple_pool`）。
+    """
     out: List[str] = []
     for line in local_bank.option_lines(options):
         letter = local_bank.option_letter(line)
@@ -399,8 +457,11 @@ def pick_submit_answer(qtype: str, options: str, known: Set[str],
     （随机作答按原加权策略挑好个数再交进来，排除法优先保持「选几个」不变）。
     **多选题同一尺寸的组合都试过、或正确答案本就不是这个尺寸时，会自动放宽到
     其它尺寸**——否则「正确答案要选 3 个、当前错答案只选了 2 个」会卡死在 2 个
-    选项的组合里，永远交不出正确答案。返回 ``None`` 表示换不出来（所有尺寸的组合
-    都被判错过，或这个题型没有排除法可用）。
+    选项的组合里，永远交不出正确答案。
+
+    返回 ``None`` 表示**真的**换不出来：单选/判断是全部选项都判错过，多选是
+    「穷举后所有尺寸、所有组合都判错过」（不是随机抽样没抽到），填空/简答是这类
+    题型没有排除法可用。
     """
     qtype = str(qtype or "").strip().lower()
     if not known:
@@ -424,40 +485,16 @@ def pick_submit_answer(qtype: str, options: str, known: Set[str],
         others = [c for c in allowed if c != cur] or allowed
         return random.choice(others)
     if qtype == "multiple":
-        allowed = safe_letters("multiple", options, known)
-        if not allowed:
+        letters = option_letters(options)
+        if not letters:
             return None
-        cur = local_bank.pure_letters(current) or ""
-        want = int(size or 0) or len(cur) or min(2, len(allowed))
-        want = max(1, min(want, len(allowed)))
-
-        def _combo(n: int) -> str:
-            if n < 1 or n > len(allowed):
-                return ""
-            picked = "".join(sorted(random.sample(allowed, n)))
-            if local_bank.answer_key("multiple", picked, options) not in known:
-                return picked
-            return ""
-
-        # 1) 同样尺寸、且与上一轮不同的组合（不改变「选几个」的分布）
-        for _ in range(24):
-            picked = _combo(want)
-            if picked and picked != cur:
-                return picked
-        # 2) 同样尺寸的组合都试过 / 正确答案本就不是这个尺寸 -> 放宽到其它尺寸。
-        #    否则「正确答案要选 3 个、当前错答案只选了 2 个」会卡死在 2 个选项的组合里，
-        #    永远交不出正确答案，陷入重答死循环。优先级按多选题常见度 2/3/4，1 个放最后。
-        preferred = [s for s in range(1, len(allowed) + 1)
-                     if s != 1 and s != want] + ([1] if 1 != want else [])
-        for n in preferred:
-            for _ in range(16):
-                picked = _combo(n)
-                if picked:
-                    return picked
-        # 3) 退一步：同样尺寸里只要不是被判错过的组合就行（允许与上一轮相同）
-        for _ in range(24):
-            picked = _combo(want)
-            if picked:
-                return picked
+        cur = "".join(sorted(local_bank.pure_letters(current) or ""))
+        want = int(size or 0) or len(cur) or min(2, len(letters))
+        for n in size_order(want, len(letters)):
+            pool = multiple_pool(letters, options, known, n)
+            if not pool:
+                continue        # 这个尺寸的组合全被判错过 -> 换下一个尺寸
+            others = [c for c in pool if c != cur] or pool
+            return random.choice(others)
         return None
     return None

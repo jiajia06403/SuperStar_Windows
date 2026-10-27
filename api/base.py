@@ -113,7 +113,10 @@ def avoid_judged_wrong(q_info: dict, answer: str) -> str:
         logger.error(f"排除法换答案异常：{type(exc).__name__}: {exc}")
         alt = None
     if not alt:
-        logger.warning(f"该题可选答案都已被平台判错，无法再换答案：{title}")
+        if str(qtype or "").strip().lower() in ("single", "multiple", "judgement"):
+            logger.warning(f"该题所有可提交的答案都已被平台判错，无法再换答案：{title}")
+        else:
+            logger.info(f"该题型没有排除法可用，原样提交：{title}")
         return answer
     logger.warning(f"答案已被平台判错，改用排除法：{title} {answer} -> {alt}")
     return alt
@@ -1235,7 +1238,12 @@ class Chaoxing:
                 if picked:
                     logger.info(f"随机选择（已避开平台判错的答案）-> {picked}")
                     return picked
-                logger.warning("随机作答：这道题的可选答案都已被平台判错，只能照旧随机")
+                if str(q.get("type") or "").strip().lower() in ("single", "multiple",
+                                                                "judgement"):
+                    logger.warning("随机作答：这道题的所有答案组合都已被平台判错，"
+                                   "只能照旧随机")
+                else:
+                    logger.debug("随机作答：该题型没有排除法，按普通随机处理")
 
             if q["type"] == "multiple":
                 logger.debug(f"当前选项列表[cut前] -> {options}")

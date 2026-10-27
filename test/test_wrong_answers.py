@@ -15,6 +15,7 @@
      判对 -> 入库并清掉该题的错答记录。**只有平台确认正确的才进题库。**
 """
 import contextlib
+import itertools
 import json
 import os
 import shutil
@@ -280,6 +281,59 @@ def test_alternative_for_multiple_explores_other_sizes():
         key = lb.answer_key("multiple", alt, opts)
         assert key not in known
         assert len(alt.split("\n")) == 3, f"应换出 3 个选项的组合，实际 {alt.splitlines()}"
+
+
+def test_multiple_rejection_is_combo_level_not_option_level():
+    """多选题的判错是**组合级**的：只选 1 个的组合判错，不代表那个选项本身错。
+
+    用户报的现象：某题反复重答后，错题本里攒下了「甲」「乙」「丙」「丁」四条
+    「只选 1 个」的错答案；旧实现把这 4 个选项整体剔除，候选空间被砍空，于是报
+    「该题可选答案都已被平台判错」——可实际上 2/3/4 个选项的组合一个都没试过。
+
+    正确行为：只排除被判错的那**个组合**，组合里出现的选项照旧可用。
+    """
+    opts = "A. 甲\nB. 乙\nC. 丙\nD. 丁"
+    known = {lb.answer_key("multiple", c, opts) for c in "ABCD"}
+    for _ in range(30):
+        got = wa.pick_submit_answer("multiple", opts, known, "AB", size=2)
+        assert got, "只判错「单个选项」不能得出「无解」的结论"
+        assert len(got) == 2, got
+        assert lb.answer_key("multiple", got, opts) not in known
+        alt = wa.alternative_for("multiple", opts, known, "AB")
+        assert alt, "题库层同样不能把选项整体剔除"
+        assert lb.answer_key("multiple", alt, opts) not in known
+
+
+def test_pick_submit_answer_multiple_is_exhaustive_not_random():
+    """「都已被平台判错」必须是**穷举**结论，不能是随机抽样没抽到。
+
+    8 个选项、1/2/3 个的组合全判错、4 个的组合只剩 ``ABCD`` 没试过 —— 旧实现
+    每种尺寸只随机试 16 次，抽到 ABCD（1/70）几乎不可能，于是 100% 返回 None，
+    上层把「换不出来」当成「都判错了」，正确答案再也交不出去。
+    """
+    opts = "\n".join(f"{c}. {c}项" for c in "ABCDEFGH")
+    known = set()
+    for size in (1, 2, 3):
+        for combo in itertools.combinations("ABCDEFGH", size):
+            known.add(lb.answer_key("multiple", "".join(combo), opts))
+    for combo in itertools.combinations("ABCDEFGH", 4):
+        if "".join(combo) != "ABCD":
+            known.add(lb.answer_key("multiple", "".join(combo), opts))
+
+    for _ in range(30):
+        assert wa.pick_submit_answer("multiple", opts, known, "ABCD") == "ABCD"
+        alt = wa.alternative_for("multiple", opts, known, "ABCD")
+        assert alt and lb.answer_key("multiple", alt, opts) == \
+            lb.answer_key("multiple", "ABCD", opts)
+
+
+def test_pick_submit_answer_multiple_gives_up_only_when_all_combos_rejected():
+    """所有尺寸、所有组合都判错过时才算无解（3 个选项共 7 种组合）。"""
+    opts = "A. 甲\nB. 乙\nC. 丙"
+    known = {lb.answer_key("multiple", "".join(c), opts)
+             for n in (1, 2, 3) for c in itertools.combinations("ABC", n)}
+    assert wa.pick_submit_answer("multiple", opts, known, "AB") is None
+    assert wa.alternative_for("multiple", opts, known, "AB") is None
 
 
 # --------------------------------------------------------------------------- #

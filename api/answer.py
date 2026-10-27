@@ -430,7 +430,12 @@ class Tiku:
                 # 保证这一轮提交的答案和上一轮不同，平台才有机会判对。
                 alt = wrong_answers.alternative_for(qtype, options, known, answer)
                 if not alt:
-                    logger.warning(f"该题可选答案都已被平台判错，无法再换答案：{title}")
+                    if str(qtype or "").strip().lower() in ("single", "multiple",
+                                                            "judgement"):
+                        logger.warning(f"该题所有可提交的答案都已被平台判错，"
+                                       f"无法再换答案：{title}")
+                    else:
+                        logger.info(f"该题型没有排除法可用，放弃本题：{title}")
                     return None
                 logger.warning(f"{self.name}仍返回被判错的答案，改用排除法："
                                f"{title} {answer} -> {alt}")
