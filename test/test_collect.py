@@ -81,6 +81,18 @@ PAGE_NO_ANSWER = """
 """
 
 
+# 未提交的作业页：只有题目 + 提交入口，没有任何判分/我的答案
+PAGE_UNSUBMITTED = """
+<div class="singleQuesId" data="405717731">
+  <div class="TiMu" data="0">
+    <div class="Zy_TItle">1. 还没做的题（2.0分）</div>
+    <ul><li>A. 甲选项</li><li>B. 乙选项</li></ul>
+  </div>
+</div>
+<input type="button" class="btnSubmit" value="提交作业" />
+"""
+
+
 # --------------------------------------------------------------------------- #
 # 测试替身
 # --------------------------------------------------------------------------- #
@@ -121,7 +133,7 @@ class _Chaoxing:
         return {"points": [dict(p) for p in self.points]}
 
     def get_job_list(self, course, point, stop_early=False, **kwargs):
-        self.job_calls.append((point["id"], stop_early))
+        self.job_calls.append((point["id"], stop_early, dict(kwargs)))
         return [dict(j) for j in self.jobs.get(point["id"], [])], {
             "knowledgeid": "913820156", "ktoken": "ktoken-value", "cpi": "338350298"}
 
@@ -209,6 +221,41 @@ def test_request_params_match_work_page():
     assert params["clazzId"] == COURSE["clazzId"]
     assert params["courseid"] == COURSE["courseId"]
     assert chaos.job_calls[0][1] is True, "采集应走 stop_early 省请求"
+
+
+def test_collect_never_marks_empty_chapter():
+    """采集必须只读：要显式告诉 get_job_list「别上报空章节完成」。
+
+    否则每遇到一个空章节就 GET 一次 studentstudyAjax —— 那是写操作（改服务端
+    进度），还会刷一条「空页面任务完成」把界面日志窗口顶满，用户以为在刷课。
+    """
+    store = _store()
+    _stats, _session, chaos = _collect(store)
+    kwargs = chaos.job_calls[0][2]
+    assert kwargs.get("mark_empty") is False, chaos.job_calls
+
+
+def test_unsubmitted_jobs_are_summarized_per_chapter():
+    """未提交的作业按章节合并成一行日志（一门课几十份，逐份打会把日志刷满）。"""
+    store = _store()
+    jobs = {POINT["id"]: [dict(JOB, jobid="work-a"), dict(JOB, jobid="work-b"),
+                          dict(JOB, jobid="work-c")]}
+    session = _Session({"work-a": _Resp(PAGE_UNSUBMITTED),
+                        "work-b": _Resp(PAGE_UNSUBMITTED),
+                        "work-c": _Resp(PAGE_UNSUBMITTED)})
+    chaos = _Chaoxing(jobs=jobs)
+    logs = []
+    with _with_bank(store):
+        stats = collect.collect_course(
+            chaos, dict(COURSE), session=session,
+            on_event=lambda e: logs.append(str(e.get("message") or "")))
+    assert stats["unsubmitted"] == 3 and stats["read"] == 0, stats
+    lines = [m for m in logs if "份作业还没提交" in m]
+    assert len(lines) == 1, lines
+    assert "3 份" in lines[0], lines
+    summary = [m for m in logs if "完成" in m][-1]
+    assert "提交" in summary, summary          # 结论要讲清「为什么采不到」
+    assert store.stats()["total"] == 0
 
 
 # --------------------------------------------------------------------------- #

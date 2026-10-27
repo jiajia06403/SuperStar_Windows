@@ -413,25 +413,38 @@ class Account:
 
 
 class RateLimiter:
+    """按线程隔离的速率限制器。
+
+    旧实现用「一把全局锁 + 单个 last_call」把整个引擎的所有请求串行化，
+    导致「任务点并发 > 1」时 N 个 worker 全卡在同一把锁上、等价于串行，
+    并发完全失效。SuperStar 安卓版用 jobs=5 仍能提速，正是因为**每路各自
+    限速、彼此并行**。
+
+    现在 ``last_call`` 下沉到 ``threading.local``：每个 worker 线程按
+    ``call_interval`` 独立限速、互不阻塞。单路 pacing 语义不变（仍是「每条
+    请求间隔 ≥ call_interval」这一道反验证码闸），但 5 路任务点真正并行，
+    与安卓行为一致。
+    """
+
     def __init__(self, call_interval):
-        self.last_call = time.time()
-        self.lock = threading.Lock()
         self.call_interval = call_interval
+        self._local = threading.local()
 
     def limit_rate(self, random_time=False, random_min=0.0, random_max=1.0):
-        with self.lock:
-            if random_time:
-                wait_time = random.uniform(random_min, random_max)
-                time.sleep(wait_time)
-            now = time.time()
-            time_elapsed = now - self.last_call
-            if time_elapsed <= self.call_interval:
-                time.sleep(self.call_interval - time_elapsed)
-                self.last_call = time.time()
-                return
-
-            self.last_call = now
+        if random_time:
+            time.sleep(random.uniform(random_min, random_max))
+        now = time.time()
+        last = getattr(self._local, "last_call", None)
+        if last is None:
+            # 本线程首次调用：仅打点，不等待（避免首条请求被无谓延后）
+            self._local.last_call = now
             return
+        elapsed = now - last
+        if elapsed <= self.call_interval:
+            time.sleep(self.call_interval - elapsed)
+            self._local.last_call = time.time()
+            return
+        self._local.last_call = now
 
 
 class StudyResult(Enum):
@@ -502,6 +515,16 @@ class Chaoxing:
         # 引擎用它判断「这一轮重答到底有没有进展」，没有进展就不再重答。
         self.last_verdict_stats: dict = {}
 
+        # 章节检测的「答案来源 / 判分 / 拒绝原因」三类统计原本直接写在实例上。
+        # 任务点并发 > 1 时，同一章节若含多个 workid 任务点，它们会在不同 worker
+        # 线程里并发写这些实例字段，后写覆盖先写 -> 引擎读到错误结论（误判 REFUSED /
+        # 误判 found==0 而提前 UNVERIFIED）。安卓版 jobs=5 能稳定跑，靠的就是并发安全。
+        # 这里把它们改成**按 jobid 隔离**写入（见 set_work_stat），引擎在批次结束后
+        # 再 merge_work_stats 合并回上面的实例字段（合并发生在 worker 线程 join 之后、
+        # 章节线程上，无竞争）。字典本身用一把锁保护，防止多 worker 同时写入。
+        self._work_stats_lock = threading.Lock()
+        self._work_stats_by_job: dict = {}  # jobid -> {"answer": {...}, "verdict": {...}, "refused": str}
+
     # ---- 视频日志的章节上下文（线程隔离，章节并发时不串台） ----
     @property
     def video_context(self) -> dict:
@@ -513,6 +536,69 @@ class Chaoxing:
     def video_context(self, value) -> None:
         """只在**当前线程**写入上下文（并发章节各写各的）。"""
         self._video_context_local.ctx = dict(value or {})
+
+    # ---- 章节检测统计：按 jobid 隔离写入，避免任务点并发时互相覆盖 ----
+    def set_work_stat(self, jobid, *, answer: "dict | None" = None,
+                      verdict: "dict | None" = None,
+                      refused: "str | None" = None) -> None:
+        """把某个 workid 任务点的统计写到「按 jobid 隔离」的存储里。
+
+        在 worker 线程里并发调用也安全：每路写自己的 jobid，不互相覆盖。
+        引擎在批次结束后用 :meth:`merge_work_stats` 把本章各 workid 合并回实例字段。
+        """
+        if jobid is None:
+            return
+        with self._work_stats_lock:
+            d = self._work_stats_by_job.setdefault(str(jobid), {})
+            if answer is not None:
+                d["answer"] = dict(answer)
+            if verdict is not None:
+                d["verdict"] = dict(verdict)
+            if refused is not None:
+                d["refused"] = refused
+
+    def clear_work_stats(self, jobids: "list | None" = None) -> None:
+        """清空「按 jobid 隔离」的统计。
+
+        ``jobids`` 给定时只清这些 workid（并发章节各自清各自的任务点，互不干扰）；
+        ``None`` 时清全部（向后兼容）。
+        """
+        with self._work_stats_lock:
+            if jobids is None:
+                self._work_stats_by_job.clear()
+            else:
+                for j in jobids:
+                    self._work_stats_by_job.pop(str(j), None)
+
+    def merge_work_stats(self, jobids: list) -> None:
+        """把本章各 workid 的统计合并回实例级字段，供引擎在批次结束后读取。
+
+        合并发生在 worker 线程 join 之后、章节线程上，不存在并发竞争。
+        多个 workid 时：题数/判分求和；任一 workid 被平台拒绝则取它的原因。
+        """
+        answer_total = answer_found = 0
+        right = wrong = fixed = 0
+        refused = ""
+        with self._work_stats_lock:
+            for j in (jobids or []):
+                d = self._work_stats_by_job.get(str(j))
+                if not d:
+                    continue
+                a = d.get("answer")
+                if isinstance(a, dict):
+                    answer_total += int(a.get("total") or 0)
+                    answer_found += int(a.get("found") or 0)
+                v = d.get("verdict")
+                if isinstance(v, dict):
+                    right += int(v.get("right") or 0)
+                    wrong += int(v.get("wrong") or 0)
+                    fixed += int(v.get("fixed") or 0)
+                r = d.get("refused")
+                if r:
+                    refused = r
+        self.last_answer_stats = {"total": answer_total, "found": answer_found}
+        self.last_verdict_stats = {"right": right, "wrong": wrong, "fixed": fixed}
+        self.work_refused_reason = refused
 
     def login(self, login_with_cookies=False):
         if login_with_cookies:
@@ -632,7 +718,8 @@ class Chaoxing:
                      stop_early: bool = False,
                      nums: Optional[str] = None,
                      stop_when: Optional[Callable[[list, dict], bool]] = None,
-                     track_cards: bool = False) -> tuple[list[dict], dict]:
+                     track_cards: bool = False,
+                     mark_empty: bool = True) -> tuple[list[dict], dict]:
         """读取章节任务点。
 
         三个「少请求」开关（风控考虑：原来每章固定打满 7 张卡片，且一次调用只限流一次）：
@@ -648,6 +735,10 @@ class Chaoxing:
 
         ``stop_early``：一遇到空卡片就停（采集题库时用）。整章刷课不用它，改由
         ``CARD_MAX_EMPTY`` 容忍若干张空卡后再收手，避免漏掉多卡片章节的任务点。
+
+        ``mark_empty``：空章节是否上报``studentstudyAjax``把它标记成已完成。
+        **采集题库必须传 False**：那是写操作（会改服务端进度），且每章刷一条
+        「空页面任务完成」日志，把采集真正有用的信息挤出界面日志窗口。
 
         失败态（读不到任务点）在 ``job_info`` 里用 ``unreadable=True`` 标记，
         **不再返回空列表冒充成功**：非 200、掉登录/验证码/403 页、mArg 解析失败
@@ -749,7 +840,11 @@ class Chaoxing:
                 logger.debug(f"部分卡片读取(nums={card_nums})未取到任务点，跳过空章节判定")
                 return job_list, job_info
             # 确实是空章节（卡片全解析成功但没有任务点），按空页处理
-            self.study_emptypage(course, point)
+            if mark_empty:
+                self.study_emptypage(course, point)
+            else:
+                # 只读调用方（采集题库）：只标记「空」，不写服务端进度
+                logger.debug(f"只读模式：跳过空页面任务上报 -> {point.get('title')}")
             job_info["empty"] = True
         # logger.trace(f"原始任务点列表内容:\n{_resp.text}")
         logger.info("章节任务点读取成功...")
@@ -1482,7 +1577,9 @@ class Chaoxing:
         cover_rate = (found_answers / total_questions) * 100
         logger.info(f"章节检测题库覆盖率： {cover_rate:.0f}%")
         # 记下本轮答案的来源：found=0 表示整份作业全靠随机兜底，重答不会变出正确答案。
+        # 同时写到按 jobid 隔离的存储，任务点并发时不会被其它 workid 覆盖。
         self.last_answer_stats = {"total": total_questions, "found": found_answers}
+        self.set_work_stat(_job.get("jobid"), answer={"total": total_questions, "found": found_answers})
         # 提交模式  现在与题库绑定,留空直接提交, 1保存但不提交
         # need_reanswer: 因覆盖率不足而仅保存草稿、未真正提交，平台侧会要求「重新作答」
         need_reanswer = False
@@ -1554,6 +1651,7 @@ class Chaoxing:
             reason = work_block_reason(str(exc))
             if reason:
                 self.work_refused_reason = f"{reason}（{exc}）"
+                self.set_work_stat(_job.get("jobid"), refused=self.work_refused_reason)
                 logger.error(f'{action}答题被平台阻断：{reason}。{CAPTCHA_HINT}')
                 return StudyResult.REFUSED
             raise
@@ -1570,6 +1668,7 @@ class Chaoxing:
                 # 平台阻断提交（图形验证码 / 重做次数用尽）：这是**终局**，不是可重试的
                 # 失败。再提交既不会成功、还会把验证码/风控越惹越凶，必须交给引擎停手。
                 self.work_refused_reason = f"{reason}（平台返回：{msg}）"
+                self.set_work_stat(_job.get("jobid"), refused=self.work_refused_reason)
                 logger.error(
                     f'{action}答题被平台阻断：{reason}。'
                     f'{"平台提示：" + str(msg) + "；" if msg else ""}{CAPTCHA_HINT}'
@@ -1589,6 +1688,7 @@ class Chaoxing:
         if questions["pyFlag"] == "":
             self.rollback_times = 0
             self.work_refused_reason = ""     # 新的作业能正常提交，旧的拒绝记录作废
+            self.set_work_stat(_job.get("jobid"), refused="")
             # 记住这批答案：引擎回读发现平台仍要重新作答时，用它作废这批答案。
             # 没有这一步，重答会命中同一个缓存答案 -> 再判一次不合格 -> 无限循环。
             self.last_submitted = [dict(item) for item in submitted]
@@ -1733,9 +1833,11 @@ class Chaoxing:
         try:
             right, wrong, fixed = work_verify._counts(self.last_verdicts)
             self.last_verdict_stats = {"right": right, "wrong": wrong, "fixed": fixed}
+            self.set_work_stat(work_params.get("jobid"), verdict={"right": right, "wrong": wrong, "fixed": fixed})
         except Exception as exc:  # noqa: BLE001 - 统计失败不影响主流程
             logger.debug(f"判分统计失败: {type(exc).__name__}: {exc}")
             self.last_verdict_stats = {}
+            self.set_work_stat(work_params.get("jobid"), verdict={})
         try:
             self._record_rejected(submitted, verdicts)
         except Exception as exc:  # noqa: BLE001

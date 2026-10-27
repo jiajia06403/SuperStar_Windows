@@ -90,8 +90,15 @@ def _fetch_points(chaoxing: Any, course: Dict[str, Any]) -> List[dict]:
 
 def _collect_work(session, chaoxing, course: Dict[str, Any], job: dict,
                   job_info: dict, bank, course_title: str, stats: dict,
-                  emit: Callable) -> None:
-    """读一份已完成作业的成绩页，把能确认的正确答案补进本地题库。"""
+                  emit: Callable) -> str:
+    """读一份已完成作业的成绩页，把能确认的正确答案补进本地题库。
+
+    Returns:
+        结果键：``"read"``（读到了）/ ``"unsubmitted"`` / ``"ungraded"`` /
+        ``"closed"`` / ``"no_questions"`` / ``"no_verdicts"`` / ``"no_title"`` /
+        ``"request_error"`` / ``"bad_status"``。调用方据此做章节级汇总
+        （未提交是最常见的一种，逐份打日志会把界面日志刷满）。
+    """
     params = work_verify.build_work_params(course, job, job_info)
     course_id = str(course.get("courseId") or "")
     try:
@@ -100,13 +107,13 @@ def _collect_work(session, chaoxing, course: Dict[str, Any], job: dict,
     except Exception as exc:  # noqa: BLE001
         stats["errors"] += 1
         emit(kind="log", message=f"【采集】请求作业页失败：{type(exc).__name__}: {exc}")
-        return
+        return "request_error"
 
     if getattr(resp, "status_code", 0) != 200:
         stats["unreadable"] += 1
         stats["bad_status"] = int(stats.get("bad_status") or 0) + 1
         emit(kind="log", message=f"【采集】作业页返回 {getattr(resp, 'status_code', '?')}，已跳过")
-        return
+        return "bad_status"
 
     text = getattr(resp, "text", "") or ""
     questions = work_verify.parse_questions(text)
@@ -126,13 +133,17 @@ def _collect_work(session, chaoxing, course: Dict[str, Any], job: dict,
         else:
             key, reason = "no_verdicts", "页面里没有对错或正确答案"
         stats[key] = int(stats.get(key) or 0) + 1
-        # 结构不认识才需要留原始页面；未提交/未批阅/已关闭都是正常情况，不刷日志不写盘
-        dumped = "" if key in ("unsubmitted", "ungraded", "closed") \
+        # 未提交太常见（一门课可能几十份）：逐份打日志会把界面日志窗口刷满，
+        # 改成章节级汇总（见 collect_course），这里不再 emit。
+        if key == "unsubmitted":
+            return key
+        # 结构不认识才需要留原始页面；未批阅/已关闭都是正常情况，不刷日志不写盘
+        dumped = "" if key in ("ungraded", "closed") \
             else _dump_page(params, text, stats, reason)
         detail = f"，原始页面已存到 {dumped}" if dumped else ""
         emit(kind="log",
              message=f"【采集】作业 {job.get('jobid', '')}：{reason}，已跳过{detail}")
-        return
+        return key
 
     mine = work_verify.parse_my_answers(text)
     items = []
@@ -154,7 +165,7 @@ def _collect_work(session, chaoxing, course: Dict[str, Any], job: dict,
         detail = f"，原始页面已存到 {dumped}" if dumped else ""
         emit(kind="log",
              message=f"【采集】作业 {job.get('jobid', '')}：读到 {len(questions)} 题但题干全为空，已跳过{detail}")
-        return
+        return "no_title"
 
     # 全量交给 learn：与页面一致的不重写，不一致的覆写纠正（题库里答错的题会被修好）
     known = bank.known(items, course_title, course_id)
@@ -174,6 +185,7 @@ def _collect_work(session, chaoxing, course: Dict[str, Any], job: dict,
     emit(kind="log",
          message=f"【采集】作业 {job.get('jobid', '')}：读 {len(items)} 题{detail}")
     emit(kind="progress", message="", done=stats["works"], total=stats.get("works_total") or 0)
+    return "read"
 
 
 def collect_course(chaoxing: Any, course: Dict[str, Any],
@@ -232,7 +244,10 @@ def collect_course(chaoxing: Any, course: Dict[str, Any],
             stats["stopped"] = True
             break
         try:
-            jobs, job_info = chaoxing.get_job_list(course, point, stop_early=True)
+            # mark_empty=False：采集是只读的，绝不把空章节上报成「已完成」
+            # （那会改服务端进度，还会每章刷一条「空页面任务完成」把界面日志刷满）
+            jobs, job_info = chaoxing.get_job_list(course, point, stop_early=True,
+                                                   mark_empty=False)
         except Exception as exc:  # noqa: BLE001
             stats["errors"] += 1
             emit(kind="log",
@@ -256,6 +271,7 @@ def collect_course(chaoxing: Any, course: Dict[str, Any],
         stats["works_total"] += len(works)
         emit(kind="log",
              message=f"【采集】{point.get('title', '')}：发现 {len(works)} 份作业")
+        outcomes = []
         for job in works:
             if stop():
                 stats["stopped"] = True
@@ -265,8 +281,14 @@ def collect_course(chaoxing: Any, course: Dict[str, Any],
                 emit(kind="log", message=f"【采集】已达上限 {max_works} 份作业，提前收尾")
                 break
             stats["works"] += 1
-            _collect_work(session, chaoxing, course, job, job_info or {}, bank,
-                          course_title, stats, emit)
+            outcomes.append(_collect_work(session, chaoxing, course, job, job_info or {},
+                                          bank, course_title, stats, emit))
+        # 未提交的作业逐份打日志会把界面日志刷满（一门课几十份），这里按章节合并一条
+        unsubmitted = outcomes.count("unsubmitted")
+        if unsubmitted:
+            emit(kind="log",
+                 message=f"【采集】{point.get('title', '')}：{unsubmitted} 份作业还没提交"
+                         f"（作业提交后才有答案可采）")
         if stats["stopped"]:
             break
         emit(kind="progress", message=point.get("title", ""),
@@ -293,6 +315,8 @@ def collect_course(chaoxing: Any, course: Dict[str, Any],
             skips.append(f"{label} {count} 份")
     if skips:
         parts.append("跳过：" + "、".join(skips))
+    if not stats["read"] and int(stats.get("unsubmitted") or 0):
+        parts.append("这些作业都还没提交，提交后才有答案可采（可先刷课做完作业再来采集）")
     parts.append(f"题库共 {total} 题")
     emit(kind="log", message=f"【采集】{course_title} 完成：" + "，".join(parts))
     return stats
