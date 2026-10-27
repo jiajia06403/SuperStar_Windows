@@ -14,6 +14,7 @@
 import os
 import sys
 import tempfile
+import time
 import tkinter as tk
 from tkinter import ttk
 from unittest import mock
@@ -154,7 +155,8 @@ def test_apply_repaints_widgets():
             theme.chapter_colors("dark")["done"], "章节状态色没跟着换"
         # Text 的 tag_configure 返回的是 (选项名, v1..v4) 元组，取值在最后一格
         assert app.log_text.tag_configure("error")["foreground"][-1] == dark["error"]
-        assert app.course_tree.tag_configure("checked")["foreground"] == dark["accent"]
+        # 选中课程整行用系统选择色（深色下是蓝色底）
+        assert app.course_tree.tag_configure("selected")["background"] == dark["select"]
 
         # 标题栏（DWM）失败不影响功能：这里只要求调用不抛异常
         theme.apply_titlebar(app.root, "dark")
@@ -313,18 +315,33 @@ def test_theme_save_is_silent_no_popup():
 
 
 def test_toolbar_reflows_and_never_clipped():
-    """窄窗口：右侧操作组折到第二行；宽窗口：回到一行。两种情况下都完整可见。"""
+    """窄窗口：右侧操作组折到第二行；宽窗口：回到一行。两种情况下都完整可见。
+
+    注：拖拽期间内容区会被 resize 冻结（见 gui.app 的 resize 冻结），停止改变尺寸约
+    300ms 后才解除并重排 —— 与真实「松手后再填满」一致，这里轮询等待重排完成。
+    """
     app = _app()
     try:
+        def settle():
+            # 等 resize 冻结解除并重排（最后一次尺寸变化后 ~300ms）
+            deadline = time.monotonic() + 0.8
+            while time.monotonic() < deadline:
+                app.root.update()
+                if not getattr(app, "_resizing", False):
+                    break
+                time.sleep(0.02)
+
         app.root.geometry("840x560")
         app.root.update()
         app.root.update_idletasks()
+        settle()
         assert int(app._toolbar[2].grid_info().get("row", 0)) == 1, "窄窗口应折行"
         assert app.toolbar_fits(), "折行后仍应完整可见（不得越出工具栏边界）"
 
         app.root.geometry("1320x760")
         app.root.update()
         app.root.update_idletasks()
+        settle()
         assert int(app._toolbar[2].grid_info().get("row", 0)) == 0, "宽窗口应回到一行"
         assert app.toolbar_fits()
     finally:

@@ -27,7 +27,7 @@ from engine import StudyEngine
 from gui import layout, theme
 
 APP_TITLE = "SuperStar · 学习通刷课"
-MAX_LOG_LINES = 1500          # 日志面板最大行数，超出裁剪，避免长跑占内存
+MAX_LOG_LINES = 100           # 日志面板最大行数，超出裁剪（保留最新 100 条），避免长跑占内存且降低重绘开销
 PUMP_MS = 60                  # 主线程轮询队列间隔（毫秒）
 MAX_EVENTS_PER_TICK = 300     # 单次最多处理事件数，防止日志洪泛卡界面
 
@@ -1282,6 +1282,9 @@ class App:
         self.selected_cid: "str | None" = None
         self._course_hint_job = None               # 「刷课中不能切换课程」提示的 after id
         self._chapter_rows: dict[str, str] = {}   # point_id -> tree iid
+        # 章节标题 / 当前状态缓存：进度刷新时免去 tree.set 回读 + 无变化不重绘
+        self._chapter_titles: dict[str, str] = {}
+        self._chapter_states: dict[str, str] = {}
         self._log_sink_id = None
         self._loading_cid = None                  # 正在读取章节的课程（去重）
         self._read_gen = 0                        # 「读取进度」代数：切换课程/开始刷课时作废旧任务
@@ -2285,6 +2288,8 @@ class App:
         self._loading_cid = None
         self.chapter_tree.delete(*self.chapter_tree.get_children())
         self._chapter_rows.clear()
+        self._chapter_titles.clear()
+        self._chapter_states.clear()
         self._chapter_order = []
         self._studying_pids.pop(cid, None)   # 行全部重建，旧的「进行中」标记随即失效
         for point in points:
@@ -2294,6 +2299,8 @@ class App:
             self.chapter_tree.insert("", "end", iid=pid, values=self._chapter_values(state, point["title"]),
                                      tags=(state,))
             self._chapter_rows[pid] = pid
+            self._chapter_titles[pid] = point["title"]
+            self._chapter_states[pid] = state
             self._chapter_order.append(pid)
         self._apply_studying_chapter(cid)   # 刷课中刷新列表：补上正在处理的那一行
         self._set_hint(self._chapter_hint_text(course["title"]))
@@ -2333,8 +2340,12 @@ class App:
         """把单行章节状态改掉，并同步「进行中」集合。"""
         if pid not in self._chapter_rows:
             return
-        title = self.chapter_tree.set(pid, "title")
+        # 状态没变就跳过：进度刷新常重复上报同一状态，省一次 Treeview 行重绘
+        if self._chapter_states.get(pid) == state:
+            return
+        title = self._chapter_titles.get(pid, "")
         self.chapter_tree.item(pid, values=self._chapter_values(state, title), tags=(state,))
+        self._chapter_states[pid] = state
         cid = self._current_cid()
         if not cid:
             return
@@ -2701,12 +2712,18 @@ class App:
         if not self.current_course or cid != str(self.current_course["courseId"]):
             return
         if pid in self._chapter_rows:
-            title = self.chapter_tree.set(pid, "title")
-            self.chapter_tree.item(pid, values=self._chapter_values(status, title), tags=(status,))
+            prev = self._chapter_states.get(pid)
+            # 状态变化的章节才重绘；重复上报同一状态直接跳过（高频进度刷新的最大开销来源）
+            if prev != status:
+                title = self._chapter_titles.get(pid, "")
+                self.chapter_tree.item(pid, values=self._chapter_values(status, title), tags=(status,))
+                self._chapter_states[pid] = status
+                # 提示文本里的「已完成 X/Y」只在完成数真正变化时重算（避免每帧 O(n) 扫描）
+                if prev == "done" or status == "done":
+                    self._update_chapter_hint()
             # 该章有结论了就不再是「进行中」；未开放/重试/等手动期间继续保持
             if status in ("done", "error", "manual"):
                 self._studying_pids.get(cid, set()).discard(pid)
-        self._update_chapter_hint()
 
     def _update_chapter_hint(self) -> None:
         children = self.chapter_tree.get_children()
