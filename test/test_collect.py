@@ -235,8 +235,12 @@ def test_collect_never_marks_empty_chapter():
     assert kwargs.get("mark_empty") is False, chaos.job_calls
 
 
-def test_unsubmitted_jobs_are_summarized_per_chapter():
-    """未提交的作业按章节合并成一行日志（一门课几十份，逐份打会把日志刷满）。"""
+def test_fresh_pages_are_summarized_per_chapter():
+    """没有上次答案的作业按章节合并成一行日志（一门课几十份，逐份打会把日志刷满）。
+
+    注意口径：``fresh`` 只表示「平台给的是新的一次空白作答」，**不能写成「未提交」**——
+    作业允许重做时超星每次打开都新开作答记录，上次答案不会带过来（真机验证）。
+    """
     store = _store()
     jobs = {POINT["id"]: [dict(JOB, jobid="work-a"), dict(JOB, jobid="work-b"),
                           dict(JOB, jobid="work-c")]}
@@ -249,13 +253,40 @@ def test_unsubmitted_jobs_are_summarized_per_chapter():
         stats = collect.collect_course(
             chaos, dict(COURSE), session=session,
             on_event=lambda e: logs.append(str(e.get("message") or "")))
-    assert stats["unsubmitted"] == 3 and stats["read"] == 0, stats
-    lines = [m for m in logs if "份作业还没提交" in m]
+    assert stats["fresh"] == 3 and stats["read"] == 0, stats
+    assert "unsubmitted" not in stats, "不许再用「未提交」这个说法"
+    lines = [m for m in logs if "没有上次的答案" in m]
     assert len(lines) == 1, lines
     assert "3 份" in lines[0], lines
     summary = [m for m in logs if "完成" in m][-1]
-    assert "提交" in summary, summary          # 结论要讲清「为什么采不到」
+    assert "无上次答案" in summary, summary       # 结论要讲清「为什么采不到」
+    assert "没提交" not in summary and "还没提交" not in summary, summary
     assert store.stats()["total"] == 0
+
+
+def test_passed_jobs_are_counted_without_request():
+    """已通过（平台标已完成）的作业：只计数报出来，不浪费一次必然 403 的请求。"""
+    store = _store()
+    jobs = {POINT["id"]: [dict(JOB, jobid="work-done", passed=True)]}
+    session = _Session({})
+    chaos = _Chaoxing(jobs=jobs)
+    logs = []
+    with _with_bank(store):
+        stats = collect.collect_course(
+            chaos, dict(COURSE), session=session,
+            on_event=lambda e: logs.append(str(e.get("message") or "")))
+    assert stats["passed"] == 1 and stats["read"] == 0, stats
+    assert stats["works_total"] == 1 and stats["works"] == 0, stats
+    assert session.calls == [], "已通过的作业不该再发请求"
+    assert any("已通过" in m for m in logs), logs
+
+
+def test_collect_asks_for_passed_jobs():
+    """采集必须让 get_job_list 把「已通过」的作业也返回，否则统计永远是偏的。"""
+    store = _store()
+    _stats, _session, chaos = _collect(store)
+    kwargs = chaos.job_calls[0][2]
+    assert kwargs.get("include_passed") is True, chaos.job_calls
 
 
 # --------------------------------------------------------------------------- #

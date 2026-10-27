@@ -14,10 +14,16 @@
     给了「正确答案」                正确答案（最权威，判错也照收）
     平台判对、但没公布答案          页面上的「我的答案」（已被判对）
     判错且没有正确答案              跳过（不知道对的是什么）
+    新的一次空白作答                跳过（见下）
+    已通过（平台不再开放页面）        跳过并计数
     未批阅 / 作业已关闭 / 结构不认识  跳过并计数
     题库里已有答案且与页面一致        跳过（不重复写）
     题库里已有答案但与页面不一致      覆写纠正（页面上的答案为准）
     ==============================  ==============================
+
+**「新的一次空白作答」不等于「没做过」**：超星作业允许重做时，每次打开都新开一条
+作答记录（``workAnswerId`` 重新分配、状态写「待完成」），上次的答案不会带过来。
+所以本模块只能说「这一页没有上次答案」，绝不能替用户断言「没提交」。
 
 只发 GET：``mooc-ans/api/work`` 的同一组参数（见 ``api.work_verify.build_work_params``），
 不 POST、不保存草稿，随时可中断。
@@ -94,10 +100,10 @@ def _collect_work(session, chaoxing, course: Dict[str, Any], job: dict,
     """读一份已完成作业的成绩页，把能确认的正确答案补进本地题库。
 
     Returns:
-        结果键：``"read"``（读到了）/ ``"unsubmitted"`` / ``"ungraded"`` /
-        ``"closed"`` / ``"no_questions"`` / ``"no_verdicts"`` / ``"no_title"`` /
-        ``"request_error"`` / ``"bad_status"``。调用方据此做章节级汇总
-        （未提交是最常见的一种，逐份打日志会把界面日志刷满）。
+        结果键：``"read"``（读到了）/ ``"fresh"``（平台给的是新的一次作答，页面上没有
+        上次答案）/ ``"ungraded"`` / ``"passed"`` / ``"closed"`` / ``"no_questions"`` /
+        ``"no_verdicts"`` / ``"no_title"`` / ``"request_error"`` / ``"bad_status"``。
+        调用方据此做章节级汇总（「新的一次作答」最常见，逐份打日志会把界面日志刷满）。
     """
     params = work_verify.build_work_params(course, job, job_info)
     course_id = str(course.get("courseId") or "")
@@ -119,26 +125,31 @@ def _collect_work(session, chaoxing, course: Dict[str, Any], job: dict,
     questions = work_verify.parse_questions(text)
     verdicts = work_verify.parse_verdicts(text)
     if not questions or not verdicts:
-        # 没交过 / 交了没批阅 / 已关闭 / 结构不认识 —— 一律跳过，不猜
+        # 没答案可读 / 已关闭 / 结构不认识 —— 一律跳过，不猜
         stats["unreadable"] += 1
         state = work_verify.page_state(text, bool(questions), bool(verdicts))
+        status = work_verify.page_status(text)
         if state == work_verify.STATE_CLOSED:
             key, reason = "closed", "作业已结束（老师已关闭或已过期），没有答案可采"
         elif not questions:
             key, reason = "no_questions", "没读到题目"
+        elif state == work_verify.STATE_PASSED:
+            key, reason = "passed", f"平台标记已完成（页面不给答案），跳过{f'（{status}）' if status else ''}"
         elif state == work_verify.STATE_UNSUBMITTED:
-            key, reason = "unsubmitted", "作业还没提交，没有答案可采"
+            # 注意：这只说明「这一页是新的空白作答」，**不代表没交过** —— 作业允许重做时
+            # 超星每次打开都新开一条作答记录，上次答案不会带过来（见 work_verify 说明）。
+            key, reason = "fresh", "平台给的是新的一次作答，页面上没有上次的答案"
         elif state == work_verify.STATE_UNGRADED:
             key, reason = "ungraded", "已提交但平台还没批阅/没公布答案"
         else:
             key, reason = "no_verdicts", "页面里没有对错或正确答案"
         stats[key] = int(stats.get(key) or 0) + 1
-        # 未提交太常见（一门课可能几十份）：逐份打日志会把界面日志窗口刷满，
+        # 「新的一次作答」太常见（一门课可能几十份）：逐份打日志会把界面日志窗口刷满，
         # 改成章节级汇总（见 collect_course），这里不再 emit。
-        if key == "unsubmitted":
+        if key == "fresh":
             return key
-        # 结构不认识才需要留原始页面；未批阅/已关闭都是正常情况，不刷日志不写盘
-        dumped = "" if key in ("ungraded", "closed") \
+        # 结构不认识才需要留原始页面；已通过/未批阅/已关闭都是正常情况，不刷日志不写盘
+        dumped = "" if key in ("ungraded", "closed", "passed") \
             else _dump_page(params, text, stats, reason)
         detail = f"，原始页面已存到 {dumped}" if dumped else ""
         emit(kind="log",
@@ -204,14 +215,20 @@ def collect_course(chaoxing: Any, course: Dict[str, Any],
 
     Returns:
         ``{"course","course_id","points","works","read","questions","learned",
-           "unreadable","skipped","errors","stopped"}``，本地题库未启用时额外带 ``error``。
+           "fresh","passed","unreadable","skipped","errors","stopped"}``，
+        本地题库未启用时额外带 ``error``。
+
+    Note:
+        ``fresh`` 是「平台给了一次新的空白作答」，**不等于「用户没做过」**：
+        作业允许重做时超星每次打开都新开作答记录，上次答案不带过来。
+        ``passed`` 是「平台标已完成，但不再开放页面查看答案」。
     """
     stats: Dict[str, Any] = {
         "course": str(course.get("title") or ""),
         "course_id": str(course.get("courseId") or ""),
         "points": 0, "works": 0, "works_total": 0, "read": 0,
         "questions": 0, "learned": 0, "unreadable": 0, "skipped": 0,
-        "known": 0, "undecided": 0,
+        "known": 0, "undecided": 0, "fresh": 0, "passed": 0,
         "errors": 0, "stopped": False,
     }
     bank = local_bank.get_bank()
@@ -246,8 +263,10 @@ def collect_course(chaoxing: Any, course: Dict[str, Any],
         try:
             # mark_empty=False：采集是只读的，绝不把空章节上报成「已完成」
             # （那会改服务端进度，还会每章刷一条「空页面任务完成」把界面日志刷满）
+            # include_passed=True：把已通过的作业也读出来（否则它们连统计都进不来）
             jobs, job_info = chaoxing.get_job_list(course, point, stop_early=True,
-                                                   mark_empty=False)
+                                                   mark_empty=False,
+                                                   include_passed=True)
         except Exception as exc:  # noqa: BLE001
             stats["errors"] += 1
             emit(kind="log",
@@ -268,11 +287,19 @@ def collect_course(chaoxing: Any, course: Dict[str, Any],
                  done=index, total=len(points))
             continue
 
+        # 已通过（平台标「已完成」）的作业：答案在平台侧、页面不开放（实测直连 403，
+        # 去掉 jobid 只会拿到全新空白作答页），所以不再发请求，只计数报出来。
+        passed = [job for job in works if job.get("passed")]
+        pending = [job for job in works if not job.get("passed")]
         stats["works_total"] += len(works)
+        if passed:
+            stats["passed"] = int(stats.get("passed") or 0) + len(passed)
         emit(kind="log",
-             message=f"【采集】{point.get('title', '')}：发现 {len(works)} 份作业")
+             message=f"【采集】{point.get('title', '')}：发现 {len(works)} 份作业"
+                     + (f"（其中 {len(passed)} 份已通过，平台不开放查看答案）"
+                        if passed else ""))
         outcomes = []
-        for job in works:
+        for job in pending:
             if stop():
                 stats["stopped"] = True
                 break
@@ -283,12 +310,12 @@ def collect_course(chaoxing: Any, course: Dict[str, Any],
             stats["works"] += 1
             outcomes.append(_collect_work(session, chaoxing, course, job, job_info or {},
                                           bank, course_title, stats, emit))
-        # 未提交的作业逐份打日志会把界面日志刷满（一门课几十份），这里按章节合并一条
-        unsubmitted = outcomes.count("unsubmitted")
-        if unsubmitted:
+        # 「新的一次作答」逐份打日志会把界面日志刷满（一门课几十份），这里按章节合并一条
+        fresh = outcomes.count("fresh")
+        if fresh:
             emit(kind="log",
-                 message=f"【采集】{point.get('title', '')}：{unsubmitted} 份作业还没提交"
-                         f"（作业提交后才有答案可采）")
+                 message=f"【采集】{point.get('title', '')}：{fresh} 份作业没有上次的答案"
+                         f"（平台给的是新的一次作答；做过但要重做过的才有答案可读）")
         if stats["stopped"]:
             break
         emit(kind="progress", message=point.get("title", ""),
@@ -303,7 +330,8 @@ def collect_course(chaoxing: Any, course: Dict[str, Any],
     if int(stats.get("undecided") or 0):
         parts.append(f"平台未给答案 {stats['undecided']} 题")
     skips = []
-    for key, label in (("unsubmitted", "未提交"),
+    for key, label in (("fresh", "无上次答案"),
+                       ("passed", "已通过(平台不开放)"),
                        ("ungraded", "未批阅/未公布答案"),
                        ("closed", "已结束"),
                        ("no_questions", "没读到题目"),
@@ -315,8 +343,10 @@ def collect_course(chaoxing: Any, course: Dict[str, Any],
             skips.append(f"{label} {count} 份")
     if skips:
         parts.append("跳过：" + "、".join(skips))
-    if not stats["read"] and int(stats.get("unsubmitted") or 0):
-        parts.append("这些作业都还没提交，提交后才有答案可采（可先刷课做完作业再来采集）")
+    if not stats["read"] and (int(stats.get("fresh") or 0)
+                              or int(stats.get("passed") or 0)):
+        parts.append("没读到答案：平台对这些作业要么给的是新的空白作答，"
+                     "要么已通过但不再开放查看（要在网页端「查看详情」才看得到历史答案）")
     parts.append(f"题库共 {total} 题")
     emit(kind="log", message=f"【采集】{course_title} 完成：" + "，".join(parts))
     return stats

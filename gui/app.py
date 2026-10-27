@@ -2726,7 +2726,7 @@ class App:
             return gen != self._collect_gen
 
         summary = {"learned": 0, "read": 0, "unreadable": 0, "courses": 0, "stopped": False,
-                   "unsubmitted": 0, "ungraded": 0, "known": 0, "undecided": 0,
+                   "fresh": 0, "passed": 0, "ungraded": 0, "known": 0, "undecided": 0,
                    "closed": 0}
 
         def on_event(event: dict) -> None:
@@ -2760,7 +2760,8 @@ class App:
                 summary["learned"] += int(stats.get("learned") or 0)
                 summary["read"] += int(stats.get("read") or 0)
                 summary["unreadable"] += int(stats.get("unreadable") or 0)
-                summary["unsubmitted"] += int(stats.get("unsubmitted") or 0)
+                summary["fresh"] += int(stats.get("fresh") or 0)
+                summary["passed"] += int(stats.get("passed") or 0)
                 summary["ungraded"] += int(stats.get("ungraded") or 0)
                 summary["known"] += int(stats.get("known") or 0)
                 summary["undecided"] += int(stats.get("undecided") or 0)
@@ -2788,8 +2789,10 @@ class App:
         if extra:
             text += "（" + "、".join(extra) + "）"
         reasons = []
-        if summary.get("unsubmitted"):
-            reasons.append(f"{summary['unsubmitted']} 份未提交")
+        if summary.get("fresh"):
+            reasons.append(f"{summary['fresh']} 份没有上次答案")
+        if summary.get("passed"):
+            reasons.append(f"{summary['passed']} 份已通过(平台不开放查看)")
         if summary.get("ungraded"):
             reasons.append(f"{summary['ungraded']} 份未批阅/未公布答案")
         if summary.get("closed"):
@@ -2804,10 +2807,14 @@ class App:
         if not self.silent:
             hint = ""
             if not summary.get("read"):
-                if summary.get("unsubmitted"):
-                    hint = ("\n\n这些作业一份都没提交过 —— 平台只有在作业**提交之后**"
-                            "才记录答案和判分，所以现在没有任何答案可采。\n"
-                            "请先在浏览器或网页端把作业做完并提交，再点「采集题库」。")
+                if summary.get("fresh") or summary.get("passed"):
+                    hint = ("\n\n这些作业的页面上没有上次的答案：\n"
+                            "· 「没有上次答案」= 平台打开的是**新的一次空白作答**。"
+                            "作业允许重做时，超星每打开一次就新开一条作答记录，"
+                            "上次答过的内容不会带过来 —— 所以不能据此说「没做过」。\n"
+                            "· 「已通过」= 平台标了已完成，但不再开放作业页查看答案。\n\n"
+                            "想采到答案，只能在网页端逐个点开「查看详情/作答记录」；"
+                            "如果这门课的作业都还能重做且已通过，本功能帮不上忙。")
                 elif summary.get("closed"):
                     hint = "\n\n作业都已被老师关闭/过期，平台不再提供答案。"
                 else:

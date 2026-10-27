@@ -65,6 +65,48 @@ def test_decode_normal_card_readable():
     assert info.get("ktoken") == "k"
 
 
+# 真实卡片：已通过的作业**没有 job / jobid 字段**，作业 id 只剩在 property._jobid 里
+# （实测：章节测验通过后超星就是这么给的）。未通过的那份带 job:true + jobid。
+_PASSED_WORK_CARD = (
+    '<script>mArg={"defaults":{"ktoken":"k","knowledgeid":"1207354597","cpi":"573913559"},'
+    '"attachments":[{"type":"workid","enc":"e1","mid":"m1","aid":1,'
+    '"otherInfo":"nodeId_1-cpi_2",'
+    '"property":{"module":"work","worktype":"workA","title":"1.6.5.4",'
+    '"workid":"a72c79e8","_jobid":"work-a72c79e8"}}]};</script>')
+_OPEN_WORK_CARD = (
+    '<script>mArg={"defaults":{"ktoken":"k"},"attachments":[{"type":"workid",'
+    '"jobid":"work-bb08","job":true,"enc":"e2","mid":"m2","aid":2,'
+    '"otherInfo":"nodeId_2-cpi_2","property":{"module":"work","workid":"bb08",'
+    '"_jobid":"work-bb08"}}]};</script>')
+
+
+def test_decode_passed_work_is_dropped_by_default():
+    """刷课默认行为不变：已通过的作业不进任务点列表（不该被重做）。"""
+    jobs, _info = decode.decode_course_card(_PASSED_WORK_CARD)
+    assert jobs == [], jobs
+
+
+def test_decode_passed_work_kept_when_requested():
+    """采集要 include_passed：否则「已通过」的作业整份丢失，统计永远偏。
+
+    真机：244 章里 119 章已通过，采集却只看得到未通过的 101 份，于是满屏「还没提交」。
+    """
+    jobs, _info = decode.decode_course_card(_PASSED_WORK_CARD, include_passed=True)
+    assert len(jobs) == 1, jobs
+    job = jobs[0]
+    assert job["type"] == "workid"
+    assert job["jobid"] == "work-a72c79e8", "jobid 要从 property._jobid 兜回来"
+    assert job["passed"] is True
+    assert job["enc"] == "e1"
+
+
+def test_decode_open_work_not_marked_passed():
+    jobs, _info = decode.decode_course_card(_OPEN_WORK_CARD, include_passed=True)
+    assert len(jobs) == 1 and jobs[0]["jobid"] == "work-bb08", jobs
+    assert not jobs[0].get("passed"), jobs
+
+
+
 # 服务端「本章没有更多卡片」时返回的真实页面片段：模板照常渲染，只是脚本里的兜底
 # 赋值生效（mArg = $mArg），页面里没有任何 mArg={...} 数据。
 _EMPTY_CARD_PAGE = """<!DOCTYPE html><html><head><title></title></head><body>

@@ -154,7 +154,8 @@ def _extract_points_from_chapter(chapter_unit) -> List[Dict[str, Any]]:
     return point_list
 
 
-def decode_course_card(html_text: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+def decode_course_card(html_text: str,
+                       include_passed: bool = False) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
     解析任务点列表页面，提取任务点信息
     
@@ -204,7 +205,7 @@ def decode_course_card(html_text: str) -> Tuple[List[Dict[str, Any]], Dict[str, 
 
     # 处理所有附件任务
     cards = cards_data.get("attachments", [])
-    job_list = _process_attachment_cards(cards)
+    job_list = _process_attachment_cards(cards, include_passed=include_passed)
 
     return job_list, job_info
 
@@ -235,21 +236,45 @@ def _extract_job_info(cards_data: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _process_attachment_cards(cards: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _is_work_card(card: Dict[str, Any]) -> bool:
+    """卡片是不是作业（含章节测验）。"""
+    if str(card.get("type", "")).lower() in ("workid", "work"):
+        return True
+    property_data = card.get("property") or {}
+    if str(property_data.get("module", "")).lower() == "work":
+        return True
+    job = card.get("job")
+    return isinstance(job, dict) and str(job.get("type", "")).lower() in ("workid", "work")
+
+
+def _process_attachment_cards(cards: List[Dict[str, Any]],
+                              include_passed: bool = False) -> List[Dict[str, Any]]:
     """
     处理所有附件任务卡片，强化直播任务识别逻辑
-    
+
     Args:
         cards: 附件任务卡片列表
-        
+        include_passed: 是否保留**已通过**的作业卡片（采集题库要，刷课不要）。
+
     Returns:
-        处理后的任务列表
+        处理后的任务列表。``include_passed=True`` 时保留下来的作业带 ``passed=True``。
+
+    Note:
+        超星对「已通过」有**两种**写法，两种都要认：
+        1. ``isPassed: true``（部分卡片）；
+        2. **整个 `job` / `jobid` 字段消失**，作业 id 只剩在 ``property._jobid`` 里
+           （实测章节测验通过后就是这种）。原来 ``card.get("job") is None`` 直接
+           ``continue``，导致采集把「已通过」的作业整份丢掉 —— 244 章里 119 章已通过，
+           采集却只看得到未通过的 101 份，于是满屏「还没提交」。
     """
     job_list = []
-    
+
     for index, card in enumerate(cards):
-        # 跳过已通过的任务
-        if card.get("isPassed", False):
+        card_type = str(card.get("type", "")).lower()
+        is_work = _is_work_card(card)
+
+        # 跳过已通过的任务（采集题库时作业例外，见 include_passed）
+        if card.get("isPassed", False) and not (include_passed and is_work):
             continue
 
         # 处理无job字段的特殊任务
@@ -258,6 +283,11 @@ def _process_attachment_cards(cards: List[Dict[str, Any]]) -> List[Dict[str, Any
             read_job = _process_read_task(card)
             if read_job:
                 job_list.append(read_job)
+                continue
+            if include_passed and is_work:
+                passed_job = _process_work_task(card, passed=True)
+                if passed_job.get("jobid"):
+                    job_list.append(passed_job)
             continue
 
         # 一开始就把超星api的屎山处理掉，不要用一个屎山行为掩盖另一个屎山 (指根据otherInfo中是否有courseId决定url拼接方式😂)
@@ -268,7 +298,6 @@ def _process_attachment_cards(cards: List[Dict[str, Any]]) -> List[Dict[str, Any
             logger.trace(f"New info: {card['otherInfo']}")
 
         # 多维度判断是否为直播任务
-        card_type = card.get("type", "").lower()
         property_data = card.get("property", {})
         prop_type = property_data.get("type", "").lower()
         resource_type = property_data.get("resourceType", "").lower()
@@ -298,8 +327,9 @@ def _process_attachment_cards(cards: List[Dict[str, Any]]) -> List[Dict[str, Any
             doc_job = _process_document_task(card)
             if doc_job:
                 job_list.append(doc_job)
-        elif card_type == "workid":
-            work_job = _process_work_task(card)
+        elif is_work:
+            work_job = _process_work_task(
+                card, passed=include_passed and bool(card.get("isPassed")))
             if work_job:
                 job_list.append(work_job)
         else:
@@ -383,16 +413,25 @@ def _process_document_task(card: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _process_work_task(card: Dict[str, Any]) -> Dict[str, Any]:
-    """处理作业类型任务"""
-    return {
+def _process_work_task(card: Dict[str, Any], passed: bool = False) -> Dict[str, Any]:
+    """处理作业类型任务。
+
+    ``passed=True`` 表示这份作业**已通过**（超星这类卡片不带 ``job``/``jobid``，
+    作业 id 只剩在 ``property._jobid`` 里），此时打上标记，调用方据此决定怎么处理。
+    """
+    property_data = card.get("property") or {}
+    job = {
         "type": "workid",
-        "jobid": card.get("jobid", ""),
+        "jobid": card.get("jobid") or property_data.get("_jobid")
+        or property_data.get("jobid") or "",
         "otherinfo": card.get("otherInfo", ""),
         "mid": card.get("mid", ""),
         "enc": card.get("enc", ""),
         "aid": card.get("aid", "")
     }
+    if passed:
+        job["passed"] = True
+    return job
 
 
 def decode_questions_info(html_content: str) -> Dict[str, Any]:

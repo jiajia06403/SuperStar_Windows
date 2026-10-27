@@ -719,7 +719,8 @@ class Chaoxing:
                      nums: Optional[str] = None,
                      stop_when: Optional[Callable[[list, dict], bool]] = None,
                      track_cards: bool = False,
-                     mark_empty: bool = True) -> tuple[list[dict], dict]:
+                     mark_empty: bool = True,
+                     include_passed: bool = False) -> tuple[list[dict], dict]:
         """读取章节任务点。
 
         三个「少请求」开关（风控考虑：原来每章固定打满 7 张卡片，且一次调用只限流一次）：
@@ -739,6 +740,11 @@ class Chaoxing:
         ``mark_empty``：空章节是否上报``studentstudyAjax``把它标记成已完成。
         **采集题库必须传 False**：那是写操作（会改服务端进度），且每章刷一条
         「空页面任务完成」日志，把采集真正有用的信息挤出界面日志窗口。
+
+        ``include_passed``：是否返回**已通过**的作业（``passed=True``）。刷课必须保持
+        False（已通过的不该重做）。采集要传 True，否则「已通过」的作业卡片（超星不给
+        ``job``/``jobid``，只留 ``property._jobid``）会被整份丢掉——一门课 244 章里
+        119 章已通过，采集却只看得到未通过的 101 份，于是满屏「还没提交」。
 
         失败态（读不到任务点）在 ``job_info`` 里用 ``unreadable=True`` 标记，
         **不再返回空列表冒充成功**：非 200、掉登录/验证码/403 页、mArg 解析失败
@@ -785,7 +791,8 @@ class Chaoxing:
                 logger.error(_resp.text)
                 return [], {"unreadable": True}
 
-            _job_list, _job_info = decode_course_card(_resp.text)
+            _job_list, _job_info = decode_course_card(_resp.text,
+                                                      include_passed=include_passed)
             if _job_info.get("notOpen", False):
                 # 直接返回, 节省一次请求
                 logger.info("该章节未开放")

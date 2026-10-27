@@ -681,6 +681,45 @@ def test_real_page_state_is_classified():
     assert wv.page_state("<html>参数验证不通过</html>", False, False) == wv.STATE_UNKNOWN
 
 
+def test_status_block_decides_not_submit_button():
+    """页头 ``.testTit_status`` 才是权威判据；提交按钮两边都有，不能当证据。
+
+    真机实测：已交过、可重做的章节测验页同样有 ``<a class="btnSubmit">提交</a>``，
+    按旧逻辑（btnSubmit 算「未提交」）会把交过的作业误报成「还没提交」。
+    """
+    todo = ('<div class="fr testTit_status"><i></i>待完成</div>'
+            '<a class="btnSubmit" href="javascript:;">提交</a>')
+    redo = ('<div class="fr testTit_status"><i></i>未达到及格线，请重做</div>'
+            '<a class="btnSubmit" href="javascript:;">提交</a>')
+    done = ('<div class="fr testTit_status"><i></i>已完成</div>'
+            '<a class="btnSubmit" href="javascript:;">提交</a>')
+    assert wv.page_status(todo) == "待完成"
+    assert wv.is_unsubmitted_page(todo) is True
+    assert wv.page_state(todo, True, False) == wv.STATE_UNSUBMITTED
+    # 交过、没过、可重做：不是「没交过」，但也没答案（没有判分痕迹）
+    assert wv.is_unsubmitted_page(redo) is False
+    assert wv.page_state(redo, True, False) == wv.STATE_UNGRADED
+    # 平台标已完成但页面不给答案：单独归类，别混进 ungraded
+    assert wv.page_state(done, True, False) == wv.STATE_PASSED
+
+
+def test_new_attempt_page_is_not_proof_of_never_submitted():
+    """「待完成」只说明这一页是新的空白作答，不能断言用户没做过。
+
+    超星作业允许重做时，每次打开都新开一条作答记录（workAnswerId 重新分配），
+    上次答案不会带过来 —— 真机上已及格章节点进去也是这个页面。
+    """
+    page = PAGE_REAL_UNSUBMITTED
+    assert wv.page_status(page) == ""          # 老页面没有状态区
+    assert wv.is_unsubmitted_page(page) is True  # 只能说「这一页没有上次答案」
+    # 同一份作业带着平台状态时，语义完全一致
+    page_with_status = page.replace(
+        '<div class="workTitle">章节测验（待完成）</div>',
+        '<div class="fr testTit_status"><i></i>待完成</div>')
+    assert wv.page_state(page_with_status, True, False) == wv.STATE_UNSUBMITTED
+
+
+
 def test_submitted_but_no_answer_is_ungraded():
     """已交过但老师不公布答案的页，不能误报成未提交。
 
