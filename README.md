@@ -89,8 +89,8 @@
 | `runtime/` | 程序运行时文件（Python 运行时 / 依赖库 / 内嵌资源，**exe 启动必需，勿删**） |
 | `config_win.ini` | 默认配置（随包自带，升级时被覆盖，用户不要改） |
 | `config_user.ini` | 用户配置（首次启动自动生成，升级不覆盖） |
-| `chaoxing.log` | 运行日志（空文件，追加写入） |
-| `progress_cache/` | 进度缓存 / 账号 / cookies / 题库答案缓存 / **本地题库**（`local_bank/<课程ID>.json`） |
+| `chaoxing.log` | 运行日志（首次启动自动创建，追加写入；不随包，不会在升级时清空旧日志） |
+| `progress_cache/` | 进度缓存 / 账号 / cookies / 题库答案缓存 / **本地题库**（`local_bank/<课程ID>.json`），首次启动自动创建 |
 | `使用说明.txt` | 随包说明 |
 | `LICENSE` | GPL-3.0 许可文本（二进制分发必须随附） |
 

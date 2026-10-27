@@ -11,8 +11,11 @@ SuperStar Windows 引擎
      默认 3），重答后仍不通过则保留为未完成（ChapterResult.UNVERIFIED），绝不标记完成。
   3. 切换章节时若发现章节未开放：
        - 回过头检查上一章节是否已经完成，若未完成则重新完成；
-       - **若上一章因答题不合格一直未通过（因此本章永远解不了锁），重答不设上限**，
+       - **若上一章因答题不合格一直未通过（因此本章永远解不了锁），重答不设次数上限**，
          每 reanswer_interval 秒再来一轮，直到平台判通过或用户停止；
+         每次重答前都会作废上轮答案的缓存（并在错题本里避开被判错的选项），
+         保证提交的答案真的换了；一旦某轮答案与上轮完全相同（换不出新答案），
+         说明再重答也不会有不同结果，此时停止重答转轮询；
        - 上一章已完成（或本就首章）则每 15 秒检查当前章节状态，直到开放或软件关闭。
 
   4. **异常隔离**：任务点 / 章节 / 课程三层各自兜底，单点网络或解析异常只会让
@@ -51,6 +54,11 @@ DEFAULT_VIDEO_LOG_INTERVAL = 10
 
 # 章节检测「不合格重答」默认次数（[tiku] work_retry 缺省时使用）
 DEFAULT_WORK_RETRY = 3
+
+# 重答时允许「提交的答案与上一轮完全相同」的连续轮数。
+# 第 1 次重复：先整批作废这批答案（记错题本 + 清缓存 + 删题库同款条目）再重答；
+# 超过这个次数还换不出新答案，说明题库/AI 都已经没有别的可选答案，停止重答转轮询。
+MAX_SAME_ANSWER_ROUNDS = 1
 
 # 单章内任务点并发数默认/上限（界面 1~8，config_store.COMMON_RANGES 与之对齐）
 DEFAULT_JOBS = 4
@@ -353,6 +361,14 @@ def process_chapter(chaoxing: Chaoxing, course: dict, point: dict, speed: float,
             logger.warning(
                 f"章节检测提交后平台仍显示未通过，重新作答({reanswer}/{work_retry}): {point['title']}"
             )
+            # 平台已经明确否掉这批答案：作废它们的缓存，逼下一轮重新搜题/请求 AI。
+            # 不做这一步就会一直提交同一批答案（AI 答错题后无限循环的根因）。
+            discard = getattr(chaoxing, "discard_last_submission", None)
+            if callable(discard):
+                try:
+                    discard()
+                except Exception as exc:  # noqa: BLE001 - 作废失败不能中断重答
+                    logger.warning(f"作废上轮答案缓存失败（继续重答）：{type(exc).__name__}: {exc}")
             if cancel.wait(min(3.0, 1.0 * reanswer)):
                 raise Cancelled()
     except Cancelled:
@@ -1026,8 +1042,11 @@ class StudyEngine:
                               cid: str, uid: str) -> bool:
         """重做上一章节，直到当前章节解锁 / 只能轮询 / 用户停止。
 
-        **答题不合格没有上限**：上一章被平台判「需重新作答」时，本章永远不会解锁，
-        重答是唯一出路 —— 因此每 ``reanswer_interval`` 秒再来一轮，不设次数上限。
+        **答题不合格没有次数上限**：上一章被平台判「需重新作答」时，本章永远不会解锁，
+        重答是唯一出路 —— 因此每 ``reanswer_interval`` 秒再来一轮。
+        但**答案必须变化**才算有效重答：平台否掉这批答案后缓存已被作废、错题本会避开
+        被判错的选项，所以每轮都会搜出新答案；若某一轮提交的答案与上一轮完全相同
+        （题库/AI 都换不出来），那就再重答一万次也是同一个结果，此处会停止重答转轮询。
         其它原因（上一章也锁着、网络报错）不值得无限重试，退回轮询。
         """
         prev = points[i - 1]
@@ -1036,6 +1055,12 @@ class StudyEngine:
         error_tries = max(1, int(self.work_retry or 1))    # 非答题类报错的重试上限
         errors = 0
         attempt = 0
+        # 上一轮提交的答案指纹：两轮答案完全一样说明重答没有产生任何新信息，
+        # 再问平台一万次也还是同一个结果 —— 必须停下来，不能真的「无限重答」。
+        last_digest = ""
+        # 连续「提交的答案一模一样」的轮数：第 1 次先作废这批答案再重答，
+        # 超过 MAX_SAME_ANSWER_ROUNDS 仍换不出新答案就停止重答转轮询。
+        repeats = 0
         while not self._stop:
             attempt += 1
             if attempt == 1:
@@ -1079,9 +1104,37 @@ class StudyEngine:
                 break
 
             if r == ChapterResult.UNVERIFIED:
-                # 答题不合格：本章永远解不了锁，只能继续重答 —— 不设上限
+                # 答题不合格：本章永远解不了锁，只能继续重答 —— 但只在「这一轮的答案
+                # 跟上一轮不一样」时才有意义。答案没变就不可能换个结果。
+                digest = str(getattr(self.chaoxing, "last_submitted_digest", "") or "")
+                if digest and digest == last_digest:
+                    repeats += 1
+                    if repeats > MAX_SAME_ANSWER_ROUNDS:
+                        logger.error(
+                            f"上一章节连续 {repeats} 轮提交的答案完全一样（平台没给出可用的"
+                            f"判分信息，题库/AI 也换不出新答案），再重答不会改变结果，"
+                            f"停止重答并转为轮询: {title}"
+                        )
+                        self._emit(self.STATUS, "reanswer",
+                                   f"重答答案无变化，停止重答: {title}")
+                        break
+                    # 这批答案「原样交了两轮还是不过」= 已经被证明无效：
+                    # 整批作废（记错题本 + 清缓存 + 删题库同款条目），逼下一轮换答案。
+                    purge = getattr(self.chaoxing, "quarantine_last_submission", None)
+                    if callable(purge):
+                        try:
+                            purge()
+                        except Exception as exc:  # noqa: BLE001 - 作废失败不能中断重答
+                            logger.warning(f"作废无效答案失败（继续重答）："
+                                           f"{type(exc).__name__}: {exc}")
+                    self._emit(self.STATUS, "reanswer", f"作废无效答案后重答: {title}")
+                    if cancel.wait(self.reanswer_interval):
+                        return False
+                    continue
+                repeats = 0
+                last_digest = digest or last_digest
                 logger.warning(
-                    f"上一章节答题未通过平台校验（本章因而未开放），无限重答(第 {attempt} 轮): {title}"
+                    f"上一章节答题未通过平台校验（本章因而未开放），继续重答(第 {attempt} 轮): {title}"
                 )
                 self._emit(self.STATUS, "reanswer", f"答题不合格重答: {title}")
                 if cancel.wait(self.reanswer_interval):

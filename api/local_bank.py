@@ -205,8 +205,9 @@ def answer_key(qtype: str, answer: Any, options: str = "") -> str:
         if letters:
             picked = [_text_by_letter(char, lines) for char in letters]
             return "|".join(sorted(picked))
-        # 多选：AI 常常一次返回多个选项正文（换行分隔），逐行映射再合并
-        parts = [p.strip() for p in re.split(r"[\r\n]+", text) if p.strip()]
+        # 多选：AI 常常一次返回多个选项正文（换行分隔），逐行映射再合并；
+        # 库里/采集来的答案也可能已经是「甲选项|乙选项」这种合并形态
+        parts = [p.strip() for p in re.split(r"[|\r\n]+", text) if p.strip()]
         if len(parts) > 1:
             texts = []
             for part in parts:
@@ -410,6 +411,8 @@ class LocalBank:
         self.false_word = false_word or "错误"
         self._data: dict = {"v": SCHEMA_VERSION, "updated": 0, "entries": {}}
         self._mtime = None
+        # 最近一次 learn() 的逐项统计（只用于日志诊断：为什么 0 题入库）
+        self.last_stats: dict = {}
         self.reload()
 
     # ---------------- 配置 / 状态 ----------------
@@ -601,13 +604,22 @@ class LocalBank:
         返回实际写入的条目数（新增 + 纠正）。
         """
         if not self.enabled or not verdicts:
+            self.last_stats = {"written": 0, "skipped": 0, "judged_wrong": 0,
+                               "unmatched": 0, "empty_answer": 0, "invalid": 0,
+                               "right": 0, "fixed": 0, "corrected": 0,
+                               "reason": "题库关闭" if not self.enabled else "没有判分信息"}
             return 0
         items = [it for it in (items or []) if str(it.get("answer") or "").strip()
                  or isinstance(_verdict_of(verdicts, it.get("qid")), (dict, str))]
         if not items:
+            self.last_stats = {"written": 0, "skipped": 0, "judged_wrong": 0,
+                               "unmatched": 0, "empty_answer": 0, "invalid": 0,
+                               "right": 0, "fixed": 0, "corrected": 0,
+                               "reason": "作答明细为空"}
             return 0
 
         learned = right = fixed = corrected = skipped = 0
+        judged_wrong = unmatched = empty_answer = invalid = 0
         with _LOCK:
             self._refresh_if_changed()
             entries = self._data.setdefault("entries", {})
@@ -615,15 +627,18 @@ class LocalBank:
                 qid = item.get("qid")
                 verdict = _verdict_of(verdicts, qid)   # 页面 qid 是字符串，提交时可能是数字
                 if verdict is None:
+                    unmatched += 1                     # 判分和题目对不上（qid 不同源）
                     continue
 
                 answer, options, kind = self._decide(item, verdict)
                 if not answer:
+                    judged_wrong += 1                  # 判错且平台没给正确答案 -> 不猜
                     continue
                 qtype = str(item.get("type") or "")
                 item_options = str(item.get("options") or "")
                 # 判断题字母得先换成「对/错」文字，换不出来说明无从判断对错 -> 跳过
                 if not self._normalize_answer(answer, qtype, options or item_options):
+                    invalid += 1
                     continue
                 key = fingerprint(item.get("title", ""), qtype, item_options)
                 existed = False
@@ -642,11 +657,18 @@ class LocalBank:
                     right += 1 if kind == "right" else 0
                     fixed += 1 if kind == "fixed" else 0
                     corrected += 1 if existed else 0
+            self.last_stats = {
+                "written": learned, "right": right, "fixed": fixed,
+                "corrected": corrected, "skipped": skipped,
+                "judged_wrong": judged_wrong, "unmatched": unmatched,
+                "empty_answer": empty_answer, "invalid": invalid,
+            }
             if learned:
                 try:
                     self._write()
                 except Exception as exc:  # noqa: BLE001
                     logger.error(f"本地题库写入失败：{exc}")
+                    self.last_stats["written"] = 0
                     return 0
 
         if learned:
@@ -862,6 +884,8 @@ class BankStore:
         self._files: List[dict] = []
         self._scan_ts = 0.0
         self._scope = {"course": "", "course_id": ""}
+        # 最近一次 learn() 的统计（含「别的课程文件已有一致答案」的丢弃数）
+        self.last_stats: dict = {}
 
     # ---------------- 配置 ----------------
     @classmethod
@@ -1040,6 +1064,41 @@ class BankStore:
             logger.error(f"本地题库查询异常：{type(exc).__name__}: {exc}")
             return None
 
+    def drop_answer(self, title: str, qtype: str, options: str = "",
+                    answer: Any = "") -> int:
+        """平台判错时用：删掉题库里**存的就是这个错答案**的条目。
+
+        题库只存平台确认过的正确答案，所以只删「答案与本次被判错的那一条完全相同」
+        的条目；库里存着别的答案时不动它（那个答案没被这次判定否定）。
+
+        返回删除的条目数。题库关闭时不做事。
+        """
+        if not self.enabled or not title:
+            return 0
+        try:
+            wrong = answer_key(qtype, answer, options)
+            if not wrong:
+                return 0
+            key = fingerprint(title, qtype, options)
+            removed = 0
+            for info in self._scan():
+                bank = self._bank(info["path"])
+                entry = bank.entry(key)
+                if not entry:
+                    continue
+                if entry_key(entry, qtype) != wrong:
+                    continue          # 库里是另一个答案：没被这次判定否定，别删
+                if bank.remove_entry(key):
+                    removed += 1
+                    logger.warning(f"题库条目已被平台判错，已删除（{info['file']}）："
+                                   f"{normalize_text(title)}")
+            if removed:
+                self._invalidate()
+            return removed
+        except Exception as exc:  # noqa: BLE001 - 清理失败不能影响刷课
+            logger.error(f"本地题库条目清理异常：{type(exc).__name__}: {exc}")
+            return 0
+
     def known(self, items: Iterable[dict], course: str = "",
               course_id: str = "") -> int:
         """统计这批题里「题库已有正确答案」的数量（用于日志与是否需要核验）。"""
@@ -1127,18 +1186,27 @@ class BankStore:
         ``account`` 已废弃（题库共享），保留仅为兼容。
         """
         if not self.enabled:
+            self.last_stats = {"written": 0, "skipped": 0, "judged_wrong": 0,
+                               "unmatched": 0, "empty_answer": 0, "invalid": 0,
+                               "right": 0, "fixed": 0, "corrected": 0,
+                               "known_elsewhere": 0, "reason": "题库关闭"}
             return 0
         crs, cid = self._resolve(course, course_id)
         path = self.path_for(crs, cid)
         bank = self._bank(path)
         bank.set_meta(course=crs or UNKNOWN_COURSE, course_id=cid)
         batch = list(items or [])
+        known_elsewhere = 0
         if only_missing and verdicts and batch:
             # 同一道题在别的课程文件里已有一致答案 -> 不重复存（避免一份作业写多份文件）
+            before = len(batch)
             batch = self._drop_known_elsewhere(batch, verdicts, path)
+            known_elsewhere = before - len(batch)
         learned = bank.learn(batch, verdicts, course=crs,
                              allow_unverified=allow_unverified,
                              only_missing=only_missing)
+        self.last_stats = dict(getattr(bank, "last_stats", None) or {})
+        self.last_stats["known_elsewhere"] = known_elsewhere
         if learned:
             self._invalidate()
         return learned

@@ -162,8 +162,9 @@ def decode_course_card(html_text: str) -> Tuple[List[Dict[str, Any]], Dict[str, 
         html_text: 任务点列表页面的HTML内容
         
     Returns:
-        任务点列表和任务信息的元组。读取失败（页面无 mArg / JSON 解析失败）时返回
-        ``([], {"unreadable": True})``，未开放时返回 ``([], {"notOpen": True})``。
+        任务点列表和任务信息的元组。读取失败（掉登录/验证码/非卡片页、JSON 解析失败）
+        时返回 ``([], {"unreadable": True})``；页面正常渲染但没有任务点（空卡片 /
+        ``num`` 超出本章卡片数）返回 ``([], {})``；未开放时返回 ``([], {"notOpen": True})``。
     """
     logger.trace("开始解码任务点列表...")
 
@@ -172,10 +173,18 @@ def decode_course_card(html_text: str) -> Tuple[List[Dict[str, Any]], Dict[str, 
         return [], {"notOpen": True}
 
     # 提取mArg参数
-    temp = re.findall(r"mArg=\{(.*?)\};", html_text.replace(" ", ""))
+    flat = html_text.replace(" ", "")
+    temp = re.findall(r"mArg=\{(.*?)\};", flat)
     if not temp:
-        # 掉登录跳转页 / 验证码页 / 403 页等都不含 mArg：这是「读不到任务点」，
-        # 必须和「本章没有任务点」区分开，否则会被上层误判为章节已完成。
+        # 服务端对「没有内容的卡片」照样返回完整卡片页，只是脚本里的兜底赋值生效：
+        #     mArg = "";  try{ mArg = $mArg; }catch(e){}   ← 没有 mArg={...} 数据
+        # 这是**空卡片**（本章只有这么多卡片 / 纯文本卡），不是读取失败：判成失败会让
+        # 空卡片永远累计不到 empty_run，每章都白打满 7 张卡片并刷一堆假告警。
+        # 至于掉登录跳转页 / 验证码页 / 403 页，连卡片模板都不带（无 $mArg）——那才是
+        # 读不到任务点，必须和「本章没有任务点」区分开，否则会被上层误判为已完成。
+        if "$mArg" in flat:
+            logger.debug("任务点卡片为空（页面正常渲染但没有 mArg 数据）")
+            return [], {}
         logger.warning("任务点页面未包含 mArg 数据，按读取失败处理")
         return [], {"unreadable": True}
 
@@ -187,7 +196,8 @@ def decode_course_card(html_text: str) -> Tuple[List[Dict[str, Any]], Dict[str, 
         return [], {"unreadable": True}
 
     if not cards_data:
-        return [], {"unreadable": True}
+        # ``mArg={};``：页面渲染成功但没有任何卡片数据，同样按空卡片处理
+        return [], {}
 
     # 提取任务信息
     job_info = _extract_job_info(cards_data)

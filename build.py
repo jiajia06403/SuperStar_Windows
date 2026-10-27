@@ -14,8 +14,8 @@
     runtime\\            运行时目录（Python 运行时 / 依赖库 / 资源 —— exe 启动必需）
     config_win.ini      默认配置（随包自带，升级时覆盖 —— 用户不要改）
                         用户配置 config_user.ini 由程序首次启动生成，不随包分发（防覆盖）
-    chaoxing.log        运行日志（随包自带的空文件，追加写入）
-    progress_cache\\     进度缓存 / 账号 / cookies（随包自带的空目录）
+    （chaoxing.log 与 progress_cache\\ 不随包：运行期由程序自己创建，
+      包里不预置空文件/空目录 —— 覆盖升级时不会出现「空日志盖掉旧日志」）
     使用说明.txt
     LICENSE             GPL-3.0 许可文本（二进制分发须随附）
 
@@ -51,10 +51,15 @@ VERSION_RE = re.compile(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?")
 TEST_ONLY_MODULES = ("demo_chaoxing", "gui.selftest")
 
 CONFIG_NAME = "config_win.ini"
-LOG_NAME = "chaoxing.log"
-DATA_DIRNAME = "progress_cache"
 README_NAME = "使用说明.txt"
 LICENSE_NAME = "LICENSE"
+# 运行期产物（日志 / 数据目录 / 用户配置）：不预置空文件或空目录，也不进 zip。
+# 名字与 paths.py 保持单一来源 —— 打包目录被跑过一次后就带着本机数据，不能打进去。
+try:
+    import paths as _paths
+    RUNTIME_ARTIFACTS = (_paths.LOG_NAME, _paths.DATA_DIRNAME, _paths.USER_CONFIG_NAME)
+except Exception:  # noqa: BLE001  独立运行/裁剪环境下退回字面量
+    RUNTIME_ARTIFACTS = ("chaoxing.log", "progress_cache", "config_user.ini")
 # onedir 的运行时目录名（PyInstaller 6 默认叫 _internal，这里换成更易懂的 runtime）
 # 目录里是 Python 运行时、依赖库与内嵌资源 —— exe 启动时按「exe 同级」找它，
 # 缺了就会报 "Failed to load Python DLL"，因此它必须与 exe 一起分发。
@@ -115,6 +120,31 @@ ZIP_NAME = zip_name(VERSION)
 # 分发文档直接取自项目主目录的静态文件，构建脚本不再生成内容
 
 
+def _retire_previous_install(root: str) -> "str | None":
+    """把上一次的 ``dist/SuperStar/`` 整目录改名挪开，返回挪到哪了（无旧产物返回 None）。
+
+    PyInstaller 的 COLLECT 在落盘前会**先清空**产物目录，一次删掉上千个文件；
+    这类批量删除会被宿主/安全软件的「批量删除防护」拦下，构建随后静默失败
+    （日志里有 ``Removing dir ...`` 却没有 ``COLLECT completed``，zip 也不更新）。
+    目录改名是同盘瞬时操作、不算删除，PyInstaller 见目录不存在直接从零新建。
+    """
+    import time
+
+    app_dir = os.path.join(root, "dist", INSTALL_DIRNAME)
+    if not os.path.isdir(app_dir):
+        return None
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    trash = os.path.join(root, "dist", f"_prev_{INSTALL_DIRNAME}_{stamp}")
+    try:
+        os.replace(app_dir, trash)   # 同盘 rename：不复制、不删除
+        print(f"PREV_INSTALL_MOVED={trash}")
+        print("  （旧产物已挪开留档，确认新版可用后可自行删除该目录）")
+        return trash
+    except OSError as exc:  # noqa: BLE001  挪不动就让 PyInstaller 自己处理
+        print(f"PREV_INSTALL_KEEP={app_dir} ({exc})")
+        return None
+
+
 def build_exe(root: str, clean: bool = False) -> str:
     """构建 onedir 产物，返回安装目录（含 ``SuperStar.exe`` 与 ``runtime/``）。
 
@@ -173,8 +203,8 @@ def build_exe(root: str, clean: bool = False) -> str:
     for module in excludes:
         args += ["--exclude-module", module]
 
-    # 产物目录的清理由 PyInstaller 自己完成（COLLECT 前会 _make_clean_directory，
-    # --noconfirm 表示直接删不询问），因此这里不再重复删除，避免多一次批量删除。
+    # 产物目录已在 main() 里由 _retire_previous_install() 整目录改名挪开，
+    # PyInstaller 到这里见目录不存在，直接从零新建（不走 _make_clean_directory 的批量删除）。
     install_dir = os.path.join(root, "dist", APP_NAME)
     _pyinstaller.run(args)
 
@@ -219,10 +249,6 @@ def stage_install(root: str, target_dir: str, app_dir: str) -> "list[str]":
         shutil.copytree(src_runtime, dst_runtime, dirs_exist_ok=True)
 
     shutil.copy2(os.path.join(root, CONFIG_NAME), os.path.join(target_dir, CONFIG_NAME))
-    # 空日志文件：程序追加写入，用户不会看到「运行后突然多出一个文件」
-    with open(os.path.join(target_dir, LOG_NAME), "w", encoding="utf-8"):
-        pass
-    os.makedirs(os.path.join(target_dir, DATA_DIRNAME), exist_ok=True)
     # 使用说明为主目录的静态文件，直接随包复制，不在构建时生成
     doc_src = os.path.join(root, README_NAME)
     if not os.path.exists(doc_src):
@@ -234,8 +260,8 @@ def stage_install(root: str, target_dir: str, app_dir: str) -> "list[str]":
         raise SystemExit(f"缺少开源协议文件：{license_src}")
     shutil.copy2(license_src, os.path.join(target_dir, LICENSE_NAME))
 
-    return sorted([EXE_NAME, RUNTIME_DIRNAME + os.sep, CONFIG_NAME, LOG_NAME,
-                   DATA_DIRNAME + os.sep, README_NAME, LICENSE_NAME])
+    return sorted([EXE_NAME, RUNTIME_DIRNAME + os.sep, CONFIG_NAME,
+                   README_NAME, LICENSE_NAME])
 
 
 def make_zip(root: str, install_dir: str) -> str:
@@ -249,11 +275,12 @@ def make_zip(root: str, install_dir: str) -> str:
     os.makedirs(os.path.dirname(zip_path), exist_ok=True)
 
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
-        # 空目录不会被自动收录，必须显式写目录条目
-        info = zipfile.ZipInfo(DATA_DIRNAME + "/")
-        info.external_attr = (0o40755 << 16) | 0x10
-        zf.writestr(info, b"")
         for name in sorted(os.listdir(install_dir)):
+            # 运行期才产生的产物（日志 / 数据目录 / 用户配置）绝不进包：
+            # 产物目录被跑过一次后这些可能带着本机的日志、账号、题库，
+            # 打进去会让「解压升级」覆盖掉用户自己的数据。
+            if name in RUNTIME_ARTIFACTS:
+                continue
             full = os.path.join(install_dir, name)
             if os.path.isfile(full):
                 zf.write(full, arcname=name)
@@ -316,6 +343,9 @@ def main() -> None:
     _ensure_tkinter()
     print(f"VERSION={VERSION} (from {VERSION_FILE})")
     print(f"PRERELEASE={str(is_prerelease(VERSION)).lower()}")
+    # 先把上一次的产物目录整目录改名挪开：PyInstaller 落盘前会批量删除它，
+    # 大批量删除会触发宿主/安全软件的防护，导致构建静默失败。
+    _retire_previous_install(root)
     app_dir = build_exe(root, clean="--clean" in sys.argv)
     print(f"BUILD_DONE={app_dir}  size={_dir_size(app_dir):.1f}MB")
 

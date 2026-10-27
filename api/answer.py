@@ -36,7 +36,7 @@ def _get_openai():
             _openai_import = False
     return _openai_import or (None, None)
 
-from api import local_bank
+from api import local_bank, wrong_answers
 from api.answer_check import *
 from api.logger import logger
 
@@ -372,18 +372,35 @@ class Tiku:
         if self.DISABLE:
             return None
 
+        title = str(q_info.get('title') or '')
+        qtype = str(q_info.get('type') or '')
+        options = str(q_info.get('options') or '')
+        # 这道题被平台判错过的答案（按选项正文记录：换账号 / 选项乱序都对得上）。
+        # 判错过的答案绝不能再原样提交，否则平台必然再判一次不合格（死循环根因）。
+        known = wrong_answers.known_keys(title, qtype, options)
+
         # 本地题库优先：只存平台判过对的答案，命中即用，不消耗任何远程额度
         # course / course_id 由调用方显式传入（并发安全，不读进程级作用域）
         local_answer = self._query_local_bank(q_info, course, course_id)
         if local_answer:
-            return local_answer
+            if not self._is_rejected(known, qtype, options, local_answer):
+                return local_answer
+            # 题库这条答案已被平台判错 -> 删掉它（题库只留确认正确的），继续往下找
+            logger.warning(f"本地题库答案已被平台判错，已删除该条目并重新搜题：{title}")
+            self._drop_local_bank(title, qtype, options, local_answer)
 
         # 先过缓存（本地缓存不消耗任何远程额度，大模型不可用时也应继续命中）
         cache_dao = CacheDAO()
-        answer = cache_dao.get_cache(q_info['title'])
+        answer = cache_dao.get_cache(title)
         if answer:
-            logger.info(f"从缓存中获取答案：{q_info['title']} -> {answer}")
-            return answer.strip()
+            if self._is_rejected(known, qtype, options, answer):
+                # 缓存里存的就是被判错的答案：作废，改走远程重新请求。
+                # 不删的话每次重答都命中同一批错答案，永远跳不出循环。
+                logger.warning(f"缓存答案已被平台判错，已作废并重新搜题：{title}")
+                cache_dao.remove_cache(title)
+            else:
+                logger.info(f"从缓存中获取答案：{title} -> {answer}")
+                return answer.strip()
 
         # 大模型不可用（未配置 Key / 连接检查失败 / 连续失败）：不再发起任何请求，
         # 直接返回 None，由上层随机作答。
@@ -391,27 +408,62 @@ class Tiku:
             logger.debug(f"{self.name}不可用，跳过远程查询：{self._unavailable_reason}")
             return None
 
+        # 把「已判错的选项」告诉大模型（搜题类题库会忽略这个键，靠下面的排除法兜底）
+        hints = wrong_answers.hint_texts(qtype, options, known)
+        if hints:
+            q_info['_exclude'] = hints
         try:
             answer = self._query(q_info)
         except Exception as e:  # noqa: BLE001 - 任何异常都不能中断刷课，交给随机作答兜底
             logger.error(f"{self.name}查询异常：{type(e).__name__}: {e}")
             self._record_failure()
             return None
+        finally:
+            q_info.pop('_exclude', None)
 
         if answer:
             self._failure_count = 0
             answer = answer.strip()
-            logger.info(f"从{self.name}获取答案：{q_info['title']} -> {answer}")
-            if check_answer(answer, q_info['type'], self):
-                cache_dao.add_cache(q_info['title'], answer)
+            logger.info(f"从{self.name}获取答案：{title} -> {answer}")
+            if self._is_rejected(known, qtype, options, answer):
+                # 大模型无视排除提示、又给了同一个错答案 -> 直接用排除法换一个，
+                # 保证这一轮提交的答案和上一轮不同，平台才有机会判对。
+                alt = wrong_answers.alternative_for(qtype, options, known, answer)
+                if not alt:
+                    logger.warning(f"该题可选答案都已被平台判错，无法再换答案：{title}")
+                    return None
+                logger.warning(f"{self.name}仍返回被判错的答案，改用排除法："
+                               f"{title} {answer} -> {alt}")
+                answer = alt
+            if check_answer(answer, qtype, self):
+                cache_dao.add_cache(title, answer)
                 return answer
             else:
                 logger.info(f"从{self.name}获取到的答案类型与题目类型不符，已舍弃")
                 return None
 
-        logger.error(f"从{self.name}获取答案失败：{q_info['title']}")
+        logger.error(f"从{self.name}获取答案失败：{title}")
         self._record_failure()
         return None
+
+    @staticmethod
+    def _is_rejected(known, qtype: str, options: str, answer) -> bool:
+        """这个答案是否已被平台判错过（``known`` 为空时恒为 False）。"""
+        if not known or not answer:
+            return False
+        try:
+            return local_bank.answer_key(qtype, answer, options) in known
+        except Exception as exc:  # noqa: BLE001 - 比对失败按「没判错过」处理
+            logger.error(f"错题本比对异常：{type(exc).__name__}: {exc}")
+            return False
+
+    @staticmethod
+    def _drop_local_bank(title: str, qtype: str, options: str, answer: str) -> None:
+        """删掉题库里「就是这个被判错的答案」的条目（题库只留确认正确的）。"""
+        try:
+            local_bank.get_bank().drop_answer(title, qtype, options, answer)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"本地题库条目清理异常：{type(exc).__name__}: {exc}")
 
     def _query_local_bank(self, q_info: dict, course: str = "",
                           course_id: str = "") -> Optional[str]:
@@ -1148,6 +1200,9 @@ class AI(Tiku):
             options_list = q_info['options'].split('\n')
             cleaned_options = [re.sub(r"^[A-Z]\s*", "", option) for option in options_list]
             user_content += f"\n选项：{'\n'.join(cleaned_options)}"
+        # 已提交过并被平台判错的答案：明确让大模型避开，否则它很可能重复同一个错答案
+        for hint in (q_info.get('_exclude') or []):
+            user_content += f"\n注意：{hint}"
 
         self._wait_interval()
         try:
@@ -1262,6 +1317,10 @@ class SiliconFlow(Tiku):
             system_prompt = "本题为判断题，请回答'正确'或'错误'，以JSON格式输出：示例回答：{\"Answer\": [\"正确\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料"
 
         # 构造请求体
+        user_content = f"题目：{q_info['title']}\n选项：{q_info['options']}"
+        # 已提交过并被平台判错的答案：明确让大模型避开，否则它很可能重复同一个错答案
+        for hint in (q_info.get('_exclude') or []):
+            user_content += f"\n注意：{hint}"
         payload = {
             "model": self.model_name,
             "messages": [
@@ -1271,7 +1330,7 @@ class SiliconFlow(Tiku):
                 },
                 {
                     "role": "user",
-                    "content": f"题目：{q_info['title']}\n选项：{q_info['options']}"
+                    "content": user_content
                 }
             ],
             "stream": False,

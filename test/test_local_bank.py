@@ -1017,6 +1017,81 @@ def test_study_work_passes_course_to_tiku():
     assert bank.scope == {"course": "", "course_id": ""}, "不应再写全局作用域"
 
 
+# --------------------------------------------------------------------------- #
+# 11. 判分与作答明细的 qid 不同源 -> 按题干对齐（否则「对 4」也一题都入库不了）
+# --------------------------------------------------------------------------- #
+PAGE_TITLE = "1. 题目一（2.0分）"
+PAGE_TWO_OPTS = "A. 甲选项\nB. 乙选项"
+
+
+def test_align_verdicts_by_title_when_qid_differs():
+    """作答页的 id 与成绩页的 qid 不一定同源，按题干对齐后仍能入库。"""
+    page = ('<div class="singleQuesId" data="999900001"><i class="dui"></i>'
+            f'<div class="Zy_TItle">{PAGE_TITLE}</div></div>')
+    verdicts = wv.parse_verdicts(page)
+    assert verdicts == {"999900001": True}, verdicts
+    items = [_item(qid="111", title=PAGE_TITLE)]
+    aligned = wv.align_verdicts(verdicts, items, page)
+    assert aligned.get("111") is True, aligned
+    assert aligned.get("999900001") is True, "原判分条目要保留，不影响别的调用方"
+
+
+def test_align_verdicts_no_page_or_already_matched():
+    verdicts = {"999900001": True}
+    items = [_item(qid="111", title=PAGE_TITLE)]
+    # 没有页面可对齐：原样返回（绝不猜）
+    assert wv.align_verdicts(verdicts, items, "") == verdicts
+    # qid 本来就能对上：不做任何改动
+    assert wv.align_verdicts(verdicts, [_item(qid="999900001", title=PAGE_TITLE)],
+                             "<html/>") == verdicts
+
+
+def test_align_verdicts_skips_ambiguous_titles():
+    """同一份作业里题干重复时不猜（宁可这题不入库，也不能张冠李戴）。"""
+    page = ""
+    for qid in ("999900001", "999900002"):
+        page += (f'<div class="singleQuesId" data="{qid}"><i class="dui"></i>'
+                 f'<div class="Zy_TItle">{PAGE_TITLE}</div></div>')
+    verdicts = wv.parse_verdicts(page)
+    aligned = wv.align_verdicts(verdicts, [_item(qid="111", title=PAGE_TITLE)], page)
+    assert "111" not in aligned, aligned
+
+
+def test_study_work_learns_when_page_qid_differs():
+    """端到端：成绩页 qid 与作答页 id 不同源，判对也要写进本地题库。"""
+    import api.base as base
+    bank = _bank()
+    old = lb._BANK
+    lb._BANK = bank
+    try:
+        html = ('<div class="mark_item" data="question999900001">'
+                '<i class="marking_dui"></i>'
+                f'<div class="mark_name">{PAGE_TITLE}</div>'
+                '<ul><li>A. 甲选项</li><li>B. 乙选项</li></ul></div>')
+        result, _session = _run_study_work(html, bank)
+        assert result == base.StudyResult.SUCCESS, result
+        assert bank.lookup("题目一", "single", PAGE_TWO_OPTS) == "B", \
+            "qid 不同源也要按题干对齐后入库（否则下次重做又把已答对的题重搜一遍）"
+    finally:
+        lb._BANK = old
+
+
+def test_learn_reports_why_nothing_written():
+    """0 题入库时必须能说清原因（跳过 / 对不上），而不是笼统一句「没有可写入」。"""
+    store = _store()
+    assert store.learn([_item(qid="1")], {"1": True}, course="课", course_id="1") == 1
+    # 同样的答案再学一次 -> 跳过
+    assert store.learn([_item(qid="1")], {"1": True}, course="课", course_id="1") == 0
+    assert store.last_stats.get("skipped") == 1, store.last_stats
+    # qid 对不上 -> unmatched
+    store.learn([_item(qid="zz")], {"other": True}, course="课", course_id="1")
+    assert store.last_stats.get("unmatched") == 1, store.last_stats
+    # 判错且没有正确答案 -> judged_wrong
+    store.learn([_item(qid="2", title="2. 题目二")], {"2": False},
+                course="课", course_id="1")
+    assert store.last_stats.get("judged_wrong") == 1, store.last_stats
+
+
 def _main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0

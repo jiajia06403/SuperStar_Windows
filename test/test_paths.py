@@ -5,7 +5,8 @@
 校验三件事：
   1. 运行期文件都固定在「程序目录」下（打包态 = exe 所在目录）；
   2. 打包态路径解析不创建目录、不校验（没有启动告警，注意事项写在随包使用说明里）；
-  3. 构建产物（解压后的文件夹 / zip）自带 config_win.ini、chaoxing.log、progress_cache/；
+  3. 构建产物（解压后的文件夹 / zip）只带 config_win.ini 与说明/协议，
+     不预置 chaoxing.log、progress_cache/ 这类运行期产物（首次运行时由程序自建）；
   4. 版本号唯一来源是 version.txt（exe / zip / release tag 均由它推导）。
 """
 import os
@@ -96,12 +97,13 @@ def test_stage_install_contents():
         assert build.EXE_NAME == f"{build.APP_NAME}.exe", "exe 文件名不得带版本号"
         assert os.path.isfile(os.path.join(target, build.EXE_NAME))
         assert build.CONFIG_NAME in entries
-        assert build.LOG_NAME in entries
-        assert build.DATA_DIRNAME + os.sep in entries
         assert build.README_NAME in entries
         assert build.LICENSE_NAME in entries
-        assert os.path.isdir(os.path.join(target, build.DATA_DIRNAME))
-        assert os.path.getsize(os.path.join(target, build.LOG_NAME)) == 0
+        # 运行期产物不预置：首次运行时由程序自己创建。
+        # （预置空 chaoxing.log 会在覆盖升级时把用户已有日志清成 0 字节）
+        assert paths.LOG_NAME not in entries, entries
+        assert not os.path.exists(os.path.join(target, paths.LOG_NAME))
+        assert not os.path.exists(os.path.join(target, paths.DATA_DIRNAME))
         # 运行时目录必须与 exe 平铺同级：bootloader 只在 exe 同级找它
         assert build.RUNTIME_DIRNAME + os.sep in entries, entries
         runtime = os.path.join(target, build.RUNTIME_DIRNAME)
@@ -188,22 +190,55 @@ def test_zip_layout():
         with zipfile.ZipFile(zip_path) as zf:
             names = zf.namelist()
         # zip 内不得再套一层顶层目录：解压即得主目录
-        for expect in (build.EXE_NAME, build.CONFIG_NAME, build.LOG_NAME,
-                       build.DATA_DIRNAME + "/", build.README_NAME,
+        for expect in (build.EXE_NAME, build.CONFIG_NAME, build.README_NAME,
                        build.LICENSE_NAME):
             assert expect in names, f"zip 缺少 {expect}: {names}"
         assert not any(n.startswith("dist_stage") for n in names), names
         # 顶层只能是这几个条目（runtime/ 是唯一的子目录）
-        # progress_cache/ 是 zip 里的空目录条目（rstrip 后也在顶层集合里）
         top = {n.rstrip("/") for n in names if "/" not in n.rstrip("/")}
-        assert top == {build.EXE_NAME, build.CONFIG_NAME, build.LOG_NAME,
-                       build.DATA_DIRNAME, build.README_NAME,
+        assert top == {build.EXE_NAME, build.CONFIG_NAME, build.README_NAME,
                        build.LICENSE_NAME}, top
         # 运行时目录整棵子树都要进 zip（缺文件 exe 起不来）
         runtime = build.RUNTIME_DIRNAME + "/"
         assert any(n.startswith(runtime) for n in names), names
         assert f"{runtime}python312.dll" in names, names
         assert f"{runtime}sub/data.bin" in names, names
+
+
+def test_zip_excludes_runtime_artifacts():
+    """打包目录被跑过一次后留下的日志/数据/用户配置，绝不能进 zip。
+
+    否则「解压覆盖升级」会拿本机跑测试时的旧日志、旧账号、旧题库盖掉用户自己的数据。
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root = os.path.join(tmp, "proj")
+        os.makedirs(root)
+        with open(os.path.join(root, build.CONFIG_NAME), "w", encoding="utf8") as fp:
+            fp.write("[tiku]\nprovider=\n")
+        shutil.copy2(os.path.join(ROOT, build.README_NAME),
+                     os.path.join(root, build.README_NAME))
+        shutil.copy2(os.path.join(ROOT, build.LICENSE_NAME),
+                     os.path.join(root, build.LICENSE_NAME))
+        install = _fake_app_dir(tmp)
+        build.stage_install(root, install, install)
+        # 模拟「产物目录被运行过」：产生日志、数据目录（含账号）、用户配置
+        with open(os.path.join(install, paths.LOG_NAME), "w", encoding="utf8") as fp:
+            fp.write("本机跑过留下的日志\n")
+        data_dir = os.path.join(install, paths.DATA_DIRNAME)
+        os.makedirs(os.path.join(data_dir, "local_bank"), exist_ok=True)
+        with open(os.path.join(data_dir, "accounts.json"), "w", encoding="utf8") as fp:
+            fp.write("{}")
+        with open(os.path.join(install, paths.USER_CONFIG_NAME), "w", encoding="utf8") as fp:
+            fp.write("[tiku]\nprovider=ai\n")
+
+        with zipfile.ZipFile(build.make_zip(root, install)) as zf:
+            names = zf.namelist()
+        leaked = [n for n in names
+                  if n.split("/")[0] in (paths.LOG_NAME, paths.DATA_DIRNAME,
+                                         paths.USER_CONFIG_NAME)]
+        assert not leaked, f"运行期产物被打进 zip 了: {leaked}"
+        # 正常内容仍在
+        assert build.EXE_NAME in names and build.CONFIG_NAME in names, names
 
 
 def _main() -> int:

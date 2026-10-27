@@ -65,6 +65,42 @@ def test_decode_normal_card_readable():
     assert info.get("ktoken") == "k"
 
 
+# 服务端「本章没有更多卡片」时返回的真实页面片段：模板照常渲染，只是脚本里的兜底
+# 赋值生效（mArg = $mArg），页面里没有任何 mArg={...} 数据。
+_EMPTY_CARD_PAGE = """<!DOCTYPE html><html><head><title></title></head><body>
+<div class="ans-cc"></div>
+<script>
+(function(){
+  mArg = "";
+  try{
+    mArg = $mArg;
+  }catch(e){
+  }
+  uParse(".ans-cc",null,mArg);
+  delete window.uParse;
+  window.isVideoVisibleName = 'false';
+})();
+</script>
+</body></html>"""
+
+
+def test_decode_empty_card_page_is_not_unreadable():
+    """空卡片页（模板正常、mArg=$mArg 兜底）：是「没有任务点」，不是读取失败。
+
+    回归背景：rc5 把这种页面判成 unreadable，导致每章都刷「卡片 N 读取失败」，
+    并且空卡片不再累计 empty_run —— 每章白打满 7 张卡片。
+    """
+    jobs, info = decode.decode_course_card(_EMPTY_CARD_PAGE)
+    assert jobs == [] and not info.get("unreadable"), info
+    assert not info.get("notOpen")
+
+
+def test_decode_truly_empty_marg_is_not_unreadable():
+    """mArg={};（渲染成功但无数据）同样按空卡片处理。"""
+    jobs, info = decode.decode_course_card("<script>mArg={};</script>")
+    assert jobs == [] and not info.get("unreadable"), info
+
+
 # --------------------------------------------------------------------------- #
 # 2. get_job_list
 # --------------------------------------------------------------------------- #
@@ -137,6 +173,28 @@ def test_get_job_list_not_open_unchanged():
     finally:
         base.SessionManager.get_session = old
     assert jobs == [] and info.get("notOpen") is True and not info.get("unreadable")
+
+
+def test_get_job_list_stops_on_trailing_empty_card_pages():
+    """真实场景：卡片 0 有任务点，后面几张是服务端的空卡片页。
+
+    必须做到：任务点照常读出、不报 unreadable、连续空卡片后提前收手（不再打满 7 张）。
+    """
+    video_card = (
+        '<script>mArg="";try{mArg={"defaults":{"ktoken":"k"},"attachments":[{"type":"video",'
+        '"job":"1","jobid":"v1","mid":"m1","objectId":"o1","otherInfo":"x",'
+        '"property":{"name":"1.1"}}]};}catch(e){}</script>'
+    )
+    c, calls, sess, old = _chaoxing([(200, video_card), (200, _EMPTY_CARD_PAGE)])
+    try:
+        jobs, info = c.get_job_list(COURSE, POINT)
+    finally:
+        base.SessionManager.get_session = old
+    assert [j["jobid"] for j in jobs] == ["v1"], jobs
+    assert not info.get("unreadable") and not info.get("empty"), info
+    assert calls["emptypage"] == 0
+    # 1 张有任务点 + CARD_MAX_EMPTY 张空卡片后收手
+    assert len(sess.nums) == 1 + base.Chaoxing.CARD_MAX_EMPTY, sess.nums
 
 
 # --------------------------------------------------------------------------- #

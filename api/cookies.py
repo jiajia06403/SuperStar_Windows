@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import os
 import os.path
 
 import requests
@@ -8,6 +9,10 @@ from api.config import GlobalConst as gc
 
 def save_cookies(session: requests.Session):
     buffer=""
+    # 数据目录不再随包预置（首次运行才创建），写之前自己兜底建目录
+    parent = os.path.dirname(os.path.abspath(gc.COOKIES_PATH))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     with open(gc.COOKIES_PATH, "w") as f:
         for k, v in session.cookies.items():
             buffer += f"{k}={v};"

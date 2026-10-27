@@ -301,6 +301,9 @@ def alternative_for(qtype: str, options: str, known: Set[str],
                     current: str = "") -> Optional[str]:
     """这道题刚提交的答案已被判错 -> 换一个（排除法）。
 
+    返回的是**可以直接交给 ``study_work`` 的答案形态**（与题库/大模型返回的一致）：
+    单选给选项正文、多选给多行正文、判断给 ``正确`` / ``错误``。
+
     * 单选：在**没被判错**的选项里随机挑一个；
     * 多选：换一组**同样长度**、且没被判错过的组合；
     * 判断：取反；
@@ -314,32 +317,42 @@ def alternative_for(qtype: str, options: str, known: Set[str],
     if qtype == "judgement":
         current_key = local_bank.judgement_key(current)
         if current_key == "T":
-            return "false"
+            return "错误"
         if current_key == "F":
-            return "true"
+            return "正确"
+        # 认不出当前答案：给出没被判错的那个
+        if "T" in known and "F" not in known:
+            return "错误"
+        if "F" in known and "T" not in known:
+            return "正确"
         return None
     if qtype == "single":
-        allowed = []
+        allowed: List[str] = []
         for line in local_bank.option_lines(options):
             letter = local_bank.option_letter(line)
             if not letter:
                 continue
             if local_bank.answer_key(qtype, letter, options) in known:
                 continue
-            allowed.append(letter)
+            text = local_bank.option_text(line) or letter
+            allowed.append(text)
         if not allowed:
             return None
         return random.choice(allowed)
     if qtype == "multiple":
-        letters = [local_bank.option_letter(line) for line in local_bank.option_lines(options)]
-        letters = [x for x in letters if x]
+        texts: Dict[str, str] = {}
+        for line in local_bank.option_lines(options):
+            letter = local_bank.option_letter(line)
+            if letter:
+                texts[letter] = local_bank.option_text(line) or letter
+        letters = list(texts)
         if not letters:
             return None
         size = len(local_bank.pure_letters(current) or "") or min(2, len(letters))
         size = min(size, len(letters))
         for _ in range(20):
-            picked = "".join(sorted(random.sample(letters, size)))
-            if local_bank.answer_key(qtype, picked, options) not in known:
-                return picked
+            picked = sorted(random.sample(letters, size))
+            if local_bank.answer_key(qtype, "".join(picked), options) not in known:
+                return "\n".join(texts[c] for c in picked)
         return None
     return None

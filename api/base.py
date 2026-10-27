@@ -30,7 +30,7 @@ from api.decode import (
     decode_questions_info,
 )
 from api.exceptions import MaxRetryExceeded, StudyRequestError
-from api import cancel, local_bank, work_verify
+from api import cancel, local_bank, work_verify, wrong_answers
 
 
 def _progress_stream():
@@ -329,6 +329,14 @@ class Chaoxing:
         self.video_log_interval: float = 0
         # 当前章节上下文（引擎在进入章节前写入）：章节序号/总数/名称，供视频日志显示。
         self.video_context: dict = {}
+        # 最近一次**真正提交**的作答明细（引擎回读发现平台要求重新作答时，用它作废这批答案）
+        self.last_submitted: list[dict] = []
+        # 这批答案的指纹（标题+答案）：两轮完全一样时说明重答不会带来任何新信息，
+        # 引擎据此停止「无限重答」（见 engine._redo_prev_until_open）
+        self.last_submitted_digest: str = ""
+        # 这批答案的**逐题判分**（{qid: True/False/{ok, answer}}，已对齐到提交明细的 qid）：
+        # 作废/隔离答案时据此保留「平台已判对」的题，避免下次重做把做对的题再搜一遍。
+        self.last_verdicts: dict = {}
 
     def login(self, login_with_cookies=False):
         if login_with_cookies:
@@ -1306,12 +1314,244 @@ class Chaoxing:
         # 真正提交成功后重置回退计数，使后续章节仍按覆盖率阈值判断
         if questions["pyFlag"] == "":
             self.rollback_times = 0
-            # 提交成功后只补「题库里还没有正确答案」的题：判对存本次答案、
-            # 判错但拿得到正确答案的存正确答案（写进 <课程ID>.json，重做/换账号直接用）
-            self._learn_work_answers(_course, submitted, work_params)
+            # 记住这批答案：引擎回读发现平台仍要重新作答时，用它作废这批答案。
+            # 没有这一步，重答会命中同一个缓存答案 -> 再判一次不合格 -> 无限循环。
+            self.last_submitted = [dict(item) for item in submitted]
+            self.last_submitted_digest = self._digest_of(submitted)
+            self.last_verdicts = {}         # 上一批判分不能留给这一批用
+            # 按平台判分同步：判错的答案作废（错题本 + 清缓存 + 删题库条目），
+            # 只有确认正确的才写进题库（见 _sync_after_submit 的口径）
+            self._sync_after_submit(_course, submitted, work_params)
         return StudyResult.SUCCESS
 
-    def _learn_work_answers(self, course, submitted: list, work_params: dict) -> None:
+    @staticmethod
+    def _digest_of(submitted: list) -> str:
+        """作答明细的指纹（标题 + 答案），用于判断两轮重答有没有变化。"""
+        try:
+            raw = "\x1f".join(f"{it.get('title')}={it.get('answer')}" for it in (submitted or []))
+            return md5(raw.encode("utf8")).hexdigest()
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _judged_right_qids_of(self, items: list) -> set:
+        """给定一批作答明细，返回其中**平台已判对**的 qid 集合（没有判分则空集）。"""
+        verdicts = getattr(self, "last_verdicts", None) or {}
+        if not verdicts:
+            return set()
+        right = set()
+        for item in items or []:
+            if self._judged(item, local_bank.verdict_of(verdicts, item.get("qid"))) is True:
+                right.add(str(item.get("qid")))
+        return right
+
+    def discard_last_submission(self) -> int:
+        """平台判定「需要重新作答」-> 作废这批答案的缓存，下一轮强制重新搜题/请求 AI。
+
+        逐题的判分信息拿不到时（平台未批阅 / 页面结构不认识）这是唯一的破环手段：
+        不清理缓存的话，重答会原样命中同一批答案，平台只会再判一次不合格。
+
+        **平台已判对的题不动**：那些答案已经是确定正确的，作废只会让下一轮白白
+        重新请求题库提供方（甚至换成一个更差的答案），把正确率越刷越低。
+        """
+        items = list(getattr(self, "last_submitted", None) or [])
+        right = self._judged_right_qids_of(items)   # 必须在清空判分之前取
+        self.last_submitted = []
+        self.last_submitted_digest = ""
+        self.last_verdicts = {}
+        if not items:
+            return 0
+        cache_dao = CacheDAO()
+        dropped = kept = 0
+        for item in items:
+            if str(item.get("qid")) in right:
+                kept += 1
+                continue
+            title = str(item.get("title") or "")
+            if title and cache_dao.remove_cache(title):
+                dropped += 1
+        if dropped or kept:
+            suffix = f"，{kept} 题平台已判对、保留原答案" if kept else ""
+            logger.warning(f"平台要求重新作答：已作废 {dropped} 题的缓存答案"
+                           f"{suffix}，下一轮只重搜未通过的题")
+        return dropped
+
+    def quarantine_last_submission(self) -> int:
+        """这批答案**原样再交一次仍被判不通过** -> 整批作废（记错题本 + 清缓存 + 删题库同款条目）。
+
+        与 :meth:`discard_last_submission` 的区别：
+          * ``discard_last_submission``：平台刚否掉，只清缓存，让下一轮重新搜题；
+          * 本方法：连题库里的答案也一并作废 —— 因为「同一批答案交了两轮还是不过」
+            已经证明这批答案无效，留着只会让下一次刷课再原样提交一遍（用户反馈的
+            「存在错误的作业虽然放弃了但答案还保留着」）。
+
+        **平台已判对的题同样不动**：作业按正确率判及格时（例如 5 题需 ≥90%），
+        一道题错了整份就过不了，但另外几道是对的 —— 把它们一起作废，下次重做只能
+        全部重新搜题，正确率反而更难回到及格线。
+
+        返回记入错题本的条数。
+        """
+        items = list(getattr(self, "last_submitted", None) or [])
+        right = self._judged_right_qids_of(items)   # 必须在清空判分之前取
+        self.last_submitted = []
+        self.last_submitted_digest = ""
+        self.last_verdicts = {}
+        if not items:
+            return 0
+        bank = None
+        try:
+            bank = local_bank.get_bank()
+        except Exception:  # noqa: BLE001
+            bank = None
+        cache_dao = CacheDAO()
+        marked = kept = 0
+        for item in items:
+            if str(item.get("qid")) in right:
+                kept += 1
+                continue
+            title = str(item.get("title") or "")
+            qtype = str(item.get("type") or "")
+            options = str(item.get("options") or "")
+            answer = str(item.get("answer") or "")
+            if wrong_answers.record_wrong(title, qtype, options, answer):
+                marked += 1
+            if title:
+                cache_dao.remove_cache(title)
+            if bank is not None and answer:
+                bank.drop_answer(title, qtype, options, answer)
+        if items:
+            suffix = f"，{kept} 题平台已判对、保留原答案" if kept else ""
+            logger.warning(
+                f"这批答案原样提交仍被判未通过，已作废（{len(items)} 题中 {marked} 题记入错题本、"
+                f"清缓存并删除题库中的同款答案{suffix}），下一轮重新搜题"
+            )
+        return marked
+
+    def _judged_right_qids_of(self, items: list) -> set:
+        """给定一批作答明细，返回其中**平台已判对**的 qid 集合（没有判分则空集）。"""
+        verdicts = getattr(self, "last_verdicts", None) or {}
+        if not verdicts:
+            return set()
+        right = set()
+        for item in items or []:
+            if self._judged(item, local_bank.verdict_of(verdicts, item.get("qid"))) is True:
+                right.add(str(item.get("qid")))
+        return right
+
+    def _sync_after_submit(self, course, submitted: list, work_params: dict) -> None:
+        """提交后按平台判分结果同步错题本与本地题库。
+
+        一次核验、两处用途（避免重复请求作业页）：
+          * 判错 -> 记错题本（重答时避开该答案）+ 清 cache.json + 删题库里那条错答案；
+          * 判对 -> 收录本次答案；判错但平台公布了正确答案 -> 收录正确答案。
+        拿不到判分信息时**什么都不做**（不猜），由引擎侧的「作废缓存」兜底。
+        """
+        if not submitted:
+            return
+        page: dict = {}
+        try:
+            verdicts = work_verify.verify_work(SessionManager.get_session(), work_params,
+                                               page_out=page) or {}
+        except Exception as exc:  # noqa: BLE001 - 核验失败不能中断刷课
+            logger.warning(f"作业判分核验异常：{type(exc).__name__}: {exc}")
+            return
+        if not verdicts:
+            logger.info("未取到判分信息，本次不记录错题也不更新题库（不猜答案）")
+            return
+        # 作答页与成绩页的题目 id 不一定同源：按题干把判分对齐到**提交明细的 qid**，
+        # 否则明明「对 4 / 错 1」，本地题库却一题都匹配不上（下次重做全部重搜）。
+        try:
+            verdicts = work_verify.align_verdicts(verdicts, submitted, page.get("html") or "")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"判分结果对齐异常（按原样使用）：{type(exc).__name__}: {exc}")
+        self.last_verdicts = dict(verdicts or {})
+        try:
+            self._record_rejected(submitted, verdicts)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"错题记录异常：{type(exc).__name__}: {exc}")
+        try:
+            self._learn_work_answers(course, submitted, work_params, verdicts=verdicts)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"本地题库入库异常：{type(exc).__name__}: {exc}")
+
+    # ---------------- 判分结果 -> 错题本 ----------------
+    @staticmethod
+    def _judged(item: dict, verdict) -> Optional[bool]:
+        """这道题被判对（True）/ 判错（False）/ 说不清（None）。"""
+        if verdict is None:
+            return None
+        if isinstance(verdict, bool):
+            return verdict
+        qtype = str(item.get("type") or "")
+        options = str(item.get("options") or "")
+        if isinstance(verdict, str):
+            correct = verdict.strip()
+            if not correct:
+                return None
+            same = local_bank.answer_key(qtype, item.get("answer"), options) == \
+                local_bank.answer_key(qtype, correct, options)
+            return same
+        if isinstance(verdict, dict):
+            ok = verdict.get("ok")
+            if ok is True:
+                return True
+            if ok is False:
+                return False
+            correct = str(verdict.get("answer") or "").strip()
+            if correct:
+                # 页面只给了正确答案：和我提交的一致就算对
+                mine = local_bank.answer_key(qtype, item.get("answer"), options)
+                right = local_bank.answer_key(qtype, correct,
+                                              str(verdict.get("options") or "").strip() or options)
+                return bool(mine) and mine == right
+        return None
+
+    def _record_rejected(self, submitted: list, verdicts: dict) -> None:
+        """把被判错/未通过的答案记进错题本，并清掉缓存与题库里的错答案。
+
+        错题本记录的是平台**判过对**的答案（答对时清掉该题记录），重答时：
+        题库/缓存里被判错的答案会被跳过，AI 提示词里也会排除这些选项。
+        """
+        bank = None
+        try:
+            bank = local_bank.get_bank()
+        except Exception:  # noqa: BLE001
+            bank = None
+        cache_dao = CacheDAO()
+        wrong = cleared = 0
+        for item in submitted:
+            verdict = local_bank.verdict_of(verdicts, item.get("qid"))
+            judged = self._judged(item, verdict)
+            title = str(item.get("title") or "")
+            qtype = str(item.get("type") or "")
+            options = str(item.get("options") or "")
+            answer = str(item.get("answer") or "")
+            if judged is False:
+                # 被判错：记住这个答案（重答时避开）+ 作废缓存 + 删题库错条目。
+                # 「包含错误答案的作答不要入库，只有确认正确的再入库」就靠这三步。
+                if wrong_answers.record_wrong(title, qtype, options, answer):
+                    logger.warning(f"平台判错，已记入错题本：{title} -> {answer}")
+                wrong += 1
+                if title:
+                    cache_dao.remove_cache(title)
+                if bank is not None and answer:
+                    bank.drop_answer(title, qtype, options, answer)
+            elif judged is True:
+                # 判对了：这道题的错答记录可以清掉（已经知道对的答案了）
+                try:
+                    book = wrong_answers.get_book()
+                    fp = wrong_answers.fingerprint_for(title, qtype, options)
+                    if book.clear(fp):
+                        cleared += 1
+                except Exception:  # noqa: BLE001
+                    pass
+        if wrong:
+            logger.warning(f"本次 {wrong} 题被平台判错：已作废缓存答案并清除题库中的错误条目"
+                           f"（重答时将重新搜题/请求 AI）")
+        if cleared:
+            logger.info(f"{cleared} 题答对，已清除错题记录")
+
+    def _learn_work_answers(self, course, submitted: list, work_params: dict,
+                            verdicts: "dict | None" = None) -> None:
         """按平台判分结果同步本地题库（补缺失 + 纠正答错的题）。
 
         口径：
@@ -1332,7 +1572,10 @@ class Chaoxing:
             title = str(course.get("title") or "") if isinstance(course, dict) else ""
             course_id = str(course.get("courseId") or "") if isinstance(course, dict) else ""
             known = bank.known(submitted, title, course_id)
-            verdicts = work_verify.verify_work(SessionManager.get_session(), work_params) or None
+            # verdicts 由 _sync_after_submit 传进来（一次核验两处用，别重复请求作业页）
+            if verdicts is None:
+                verdicts = work_verify.verify_work(SessionManager.get_session(),
+                                                   work_params) or None
             if not verdicts:
                 logger.info("未取到判分信息，本次不更新本地题库（不猜答案）")
                 return
@@ -1343,13 +1586,45 @@ class Chaoxing:
                 learned = learner(submitted, verdicts, course=title, course_id=course_id)
             except TypeError:          # 兼容外部自定义题库没跟进新签名
                 learned = learner(submitted, verdicts, course=title)
+            stats = dict(getattr(bank, "last_stats", None) or {})
             if learned:
+                detail = []
+                if stats.get("right"):
+                    detail.append(f"{stats['right']} 题平台判对")
+                if stats.get("fixed"):
+                    detail.append(f"{stats['fixed']} 题按平台正确答案写入")
+                if stats.get("corrected"):
+                    detail.append(f"{stats['corrected']} 题纠正了库里的错误答案")
+                if stats.get("skipped"):
+                    detail.append(f"{stats['skipped']} 题库里已一致、未重写")
                 logger.info(f"本地题库写入 {learned} 题正确答案"
-                            f"（题库原有 {known} 题命中，共 {bank.stats().get('total', 0)} 题）")
+                            f"（{'，'.join(detail) or '正确答案'}；题库原有 {known} 题命中，"
+                            f"共 {bank.stats().get('total', 0)} 题）")
             else:
-                logger.info("本次没有可写入的正确答案（判错且页面未公布答案）")
+                logger.info(f"本次没有需要写入的正确答案（{self._learn_skip_reason(stats)}）")
         except Exception as exc:  # noqa: BLE001 - 入库失败绝不能中断刷课
             logger.error(f"本地题库入库流程异常：{type(exc).__name__}: {exc}")
+
+    @staticmethod
+    def _learn_skip_reason(stats: dict) -> str:
+        """把「0 题入库」的原因说清楚（判分拿到没、对上了没、还是答案本来就一样）。"""
+        stats = stats or {}
+        parts = []
+        if stats.get("skipped"):
+            parts.append(f"题库里已有同答案 {stats['skipped']} 题")
+        if stats.get("known_elsewhere"):
+            parts.append(f"别的课程文件已有同答案 {stats['known_elsewhere']} 题")
+        if stats.get("judged_wrong"):
+            parts.append(f"判错且页面没给正确答案 {stats['judged_wrong']} 题")
+        if stats.get("unmatched"):
+            parts.append(f"判分与题目对不上 {stats['unmatched']} 题")
+        if stats.get("invalid"):
+            parts.append(f"答案无法归一 {stats['invalid']} 题")
+        if stats.get("empty_answer"):
+            parts.append(f"作答为空 {stats['empty_answer']} 题")
+        if parts:
+            return "，".join(parts)
+        return stats.get("reason") or "无可用判分信息（不猜答案）"
 
     def study_read(self, _course, _job, _job_info) -> StudyResult:
         """

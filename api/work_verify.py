@@ -38,6 +38,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from bs4 import BeautifulSoup
 
+from api import local_bank
 from api.logger import logger
 
 # 作业页（作答页 / 成绩页是同一个地址，提交前后返回的内容不同）
@@ -566,10 +567,14 @@ def _counts(verdicts: Dict[str, Any]) -> "Tuple[int, int, int]":
 
 
 def verify_work(session, params: Dict[str, Any], url: Optional[str] = None,
-                timeout: float = 10.0) -> Dict[str, Any]:
+                timeout: float = 10.0,
+                page_out: "Optional[Dict[str, str]]" = None) -> Dict[str, Any]:
     """重新拉取作业页并解析判分结果。
 
     ``params`` 与提交前抓题时用的参数一致（见 ``Chaoxing.study_work``）。
+    ``page_out`` 传一个 dict 进来，会把拿到的页面 HTML 写进 ``page_out["html"]``
+    （供 :func:`align_verdicts` 按题干把判分对齐到提交明细）。传 None 时不保留页面。
+
     任何异常都只记日志并返回空 dict —— 核验失败不应影响刷课主流程。
     """
     target = url or WORK_URL
@@ -579,6 +584,8 @@ def verify_work(session, params: Dict[str, Any], url: Optional[str] = None,
         logger.warning(f"作业判分核验请求失败：{type(exc).__name__}: {exc}")
         return {}
     text = getattr(resp, "text", "") or ""
+    if page_out is not None:
+        page_out["html"] = text
     if getattr(resp, "status_code", 0) != 200:
         logger.warning(f"作业判分核验返回异常状态码：{getattr(resp, 'status_code', '?')}")
         return {}
@@ -590,3 +597,65 @@ def verify_work(session, params: Dict[str, Any], url: Optional[str] = None,
     logger.info(f"作业判分核验：识别 {len(verdicts)} 题（对 {right} / 错 {wrong} / "
                 f"拿到正确答案 {fixed}）")
     return verdicts
+
+
+def align_verdicts(verdicts: Dict[str, Any], items: "List[dict]",
+                   page_html: str = "") -> Dict[str, Any]:
+    """把「按页面 qid 索引」的判分结果对齐到**提交明细**的 qid 上。
+
+    为什么需要这一步：作答页的题目 id 与成绩页的 qid 未必是同一个值
+    （新版页面把 qid 藏在隐藏域、旧版放在 ``data``，两套 DOM 混用时会对不上），
+    一旦对不上，``LocalBank.learn`` 就一条都匹配不到 —— 现象是日志明明写着
+    「对 4 / 错 1」，本地题库却「写入 0 题」，下次重做又把已经答对的题全部重搜一遍。
+
+    对齐口径：先看提交明细的 qid 在判分里有没有直接命中，全部命中就原样返回；
+    否则用成绩页的题干（``decode_work_questions`` 归一化后）做一次**唯一匹配**，
+    匹配不唯一（同一份作业里题干重复）就不猜，留给日志报「对不上」。
+    """
+    if not verdicts or not items:
+        return verdicts or {}
+    direct = 0
+    missing: "List[dict]" = []
+    for item in items:
+        if local_bank.verdict_of(verdicts, item.get("qid")) is None:
+            missing.append(item)
+        else:
+            direct += 1
+    if not missing:
+        return verdicts                     # qid 本来就能对上，什么都不用做
+    if not page_html:
+        logger.warning(f"判分结果与提交明细的题号对不上（{len(missing)} 题），"
+                       f"且没有页面可用来按题干对齐")
+        return verdicts
+
+    page_questions = parse_questions(page_html)
+    if not page_questions:
+        return verdicts
+    by_title: Dict[str, "List[Tuple[str, Any]]"] = {}
+    for qid, info in page_questions.items():
+        verdict = local_bank.verdict_of(verdicts, qid)
+        if verdict is None:
+            continue
+        key = local_bank.normalize_text(info.get("title"))
+        if key:
+            by_title.setdefault(key, []).append((qid, verdict))
+
+    aligned = dict(verdicts)
+    fixed = 0
+    for item in missing:
+        key = local_bank.normalize_text(item.get("title"))
+        candidates = by_title.get(key) or []
+        if len(candidates) != 1:            # 找不到 / 有歧义 -> 不猜
+            continue
+        item_qid = item.get("qid")
+        if item_qid in (None, ""):
+            continue
+        aligned[str(item_qid)] = candidates[0][1]
+        fixed += 1
+    if fixed:
+        logger.warning(f"判分结果与提交明细的题号对不上，已按题干对齐 {fixed} 题"
+                       f"（另有 {len(missing) - fixed} 题未能对齐）")
+    else:
+        logger.warning(f"判分结果与提交明细的题号对不上，按题干也没对齐任何一题"
+                       f"（{len(missing)} 题，本题库不收，等下轮判分）")
+    return aligned
