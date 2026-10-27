@@ -16,8 +16,7 @@
                                            题干 .mark_name，正确答案 .rightAnswerContent
     ====================================  ==========================================
 
-所以解析一律「先找题块、再各自取 qid / 题干 / 答案」，任一套结构认得出就够用；
-全都认不出才算「无法识别」（见 ``api.collect`` 的计数器）。
+所以解析一律「先找题块、再各自取 qid / 题干 / 答案」，任一套结构认得出就够用。
 
 本模块只负责「拿页面 + 解析」，不决定要不要入库（由 ``api.local_bank`` 决定）：
 
@@ -69,8 +68,6 @@ _SCORE_RE = re.compile(r"得\s*分\s*[:：]?\s*(\d+(?:\.\d+)?)")
 _FULL_SCORE_RE = re.compile(r"(?:满分|本题分值|分值)\s*[:：]?\s*(\d+(?:\.\d+)?)")
 _RIGHT_ANSWER_RE = re.compile(r"正确答案\s*[:：]\s*([^\n\r]{1,200})")
 _MY_ANSWER_RE = re.compile(r"我的答案\s*[:：]\s*([^\n\r]{1,200})")
-# 提交后页面上的状态提示（用于判断「有没有判分」这件事本身）
-_SUBMITTED_HINTS = ("已提交", "已完成", "我的答案", "正确答案", "得分")
 # 正确答案后面常跟的下一段内容，取到它就要截断
 _ANSWER_STOP_RE = re.compile(r"(?:答案解析|我的答案|题型|难度|知识点|正确答案|得分|满分)")
 _LETTER_PREFIX_RE = re.compile(r"^\s*([A-Za-z])\s*[.、．)）:：]?\s*")
@@ -417,140 +414,11 @@ def parse_verdicts(html_text: str) -> Dict[str, Any]:
     return verdicts
 
 
-def has_result_marks(html_text: str) -> bool:
-    """页面是否已经出现判分痕迹（用来区分「刚提交还没判分」和「已判分」）。"""
-    return any(hint in str(html_text or "") for hint in _SUBMITTED_HINTS)
-
-
-# 页面状态：用来把「没答案可采」的原因说清楚，而不是笼统报「无法识别」
-STATE_OK = "ok"                    # 有判分/正确答案，能采
-STATE_UNGRADED = "ungraded"        # 已提交，但平台还没批阅 / 没公布答案
-STATE_UNSUBMITTED = "unsubmitted"  # 平台给的是新的一次作答（页面上没有上次答案）
-STATE_PASSED = "passed"            # 平台标成已完成/已通过，但页面不再给答案
-STATE_CLOSED = "closed"            # 作业已结束 / 已关闭，平台只回一句提示
-STATE_UNKNOWN = "unknown"          # 结构不认识（需要抓页面看）
-
-# 作业被老师关闭 / 已过期时，接口只返回一整个光秃秃的页面（实测 31 字节）：
-# ``<html><body>作业已结束</body></html>``。这不是「解析失败」，也不是「没提交」。
-_CLOSED_HINTS = ("作业已结束", "作业已过期", "作业已关闭", "该作业已结束",
-                 "作业尚未开始", "作业未开始")
-
-# 已提交页面的特征（作答区后面多出「我的答案 / 正确答案 / 得分」区块）。
-# 不能用 ``answerCon`` / ``marking_``：未提交的作答区里也有这些 class。
-_ANSWER_BLOCK_HINTS = ("newAnswerBx", "myAnswerBx", "我的答案", "正确答案",
-                       "得分：", "得分:")
-
-# 平台自己写在题目页头部的状态（实测 ``<div class="fr testTit_status"><i></i>待完成</div>``）。
-# 这是**唯一权威**的判据：只有它知道这份作业以前交没交过。
-_STATUS_BLOCK_RE = re.compile(r'class="[^"]*testTit_status[^"]*"[^>]*>(.*?)</div>', re.S)
-_STATUS_TAG_RE = re.compile(r"<[^>]+>")
-# 平台说法 → 语义。「待完成」不等于「从来没交过」：作业允许重做时，超星每次打开都
-# 新开一条作答记录（workAnswerId 是新分配的，状态就写「待完成」），上次答案不会带过来。
-_STATUS_TODO_WORDS = ("待完成", "未完成", "未提交", "尚未完成")
-_STATUS_DONE_WORDS = ("已完成", "已通过", "已提交", "已批阅", "已阅")
-_STATUS_REDO_WORDS = ("重做", "未达到", "未通过", "不合格", "重新作答", "重新提交")
-
-
-def page_status(html_text: str) -> str:
-    """平台写在作业页头部的状态文本（``待完成`` / ``未达到及格线，请重做`` / ``已完成``）。
-
-    拿不到就是空串（老版页面、作业类页面没有这个区块）。
-    """
-    text = str(html_text or "")
-    if not text:
-        return ""
-    matched = _STATUS_BLOCK_RE.search(text)
-    if not matched:
-        return ""
-    return re.sub(r"[\s\u3000]+", " ", _STATUS_TAG_RE.sub(" ", matched.group(1))).strip()
-
-
-def is_closed_page(html_text: str) -> bool:
-    """是不是「作业已结束」这类只回一句提示的页面（不含题目）。
-
-    这类响应往往只有几十字节（实测 ``<html><body>作业已结束</body></html>``，31 字节），
-    加长度上限是为了避免正常作业页里恰好出现「作业已结束」几个字时被误判。
-    """
-    text = str(html_text or "")
-    if not text.strip() or len(text) > 2000:
-        return False
-    return any(hint in text for hint in _CLOSED_HINTS)
-
-
-def is_unsubmitted_page(html_text: str) -> bool:
-    """平台给的是不是「一次新的作答」（页面上没有上次的答案）。
-
-    **不能理解成「从来没交过」**：作业允许重做时，超星每次打开都新开一条作答记录，
-    状态照样写「待完成」，上次的答案不会带过来（实测：已及格章节点进去就是全新作答页，
-    ``workAnswerId`` 是新分配的）。所以只能确认「这一页没有上次答案」，
-    不能断言「用户没做过」。日志文案必须按前者写。
-
-    判据优先级：
-    1. 页头 ``.testTit_status``（平台自己写的，最权威）；
-    2. 没有状态区（老版 / 作业类页面）才退回正反向线索——**不再用 ``btnSubmit``**，
-       因为「已提交可重做」的页面同样有提交按钮（实测同一个 ``<a class="btnSubmit">``）。
-    """
-    text = str(html_text or "")
-    if not text.strip():
-        return False
-    status = page_status(text)
-    if status:
-        if any(word in status for word in _STATUS_DONE_WORDS + _STATUS_REDO_WORDS):
-            return False
-        return any(word in status for word in _STATUS_TODO_WORDS)
-    # 已交过的反向标志：出现任何一个就说明这一页带着上次的痕迹
-    if any(hint in text for hint in _ANSWER_BLOCK_HINTS) \
-       or ("重新作答" in text) or ("重新提交" in text) or ("已提交" in text) \
-       or ("btnReEdit" in text):
-        return False
-    # 未提交的正向标志
-    return any(m in text for m in
-               ("待完成", "提交作业", "btnSave", "暂时保存", "尚未提交",
-                "提交答案", "提交试卷"))
-
-
-def page_state(html_text: str, has_questions: bool = False,
-               has_verdicts: bool = False) -> str:
-    """判断这个作业页处在什么状态（供「采集」给出准确原因）。
-
-    判定顺序刻意用**正向标志**优先，少靠「没有答案就当未提交」这种反推，
-    否则「已提交但平台不显示答案」会被误报成未提交。
-    """
-    if has_verdicts:
-        return STATE_OK
-    text = str(html_text or "")
-    if not text.strip():
-        return STATE_UNKNOWN
-    if is_closed_page(text) and not has_questions:
-        return STATE_CLOSED
-    status = page_status(text)
-    if status:
-        # 页头状态是平台自己写的，优先按它归类
-        if any(word in status for word in _STATUS_REDO_WORDS):
-            # 交过、没过、允许重做 —— 但这页没留下判分痕迹
-            return STATE_UNGRADED
-        if any(word in status for word in _STATUS_DONE_WORDS):
-            # 平台说已完成/已通过，但页面没给答案：答案在平台侧，采不到
-            return STATE_PASSED
-        if any(word in status for word in _STATUS_TODO_WORDS):
-            return STATE_UNSUBMITTED
-    if is_unsubmitted_page(text):
-        return STATE_UNSUBMITTED
-    # 已交过但平台没公布答案 / 没判分：靠答案区块或「重新作答」识别
-    if any(hint in text for hint in _ANSWER_BLOCK_HINTS) \
-       or ("重新作答" in text) or ("重新提交" in text) or ("已提交" in text) \
-       or ("btnReEdit" in text):
-        return STATE_UNGRADED
-    if has_questions:
-        return STATE_UNKNOWN          # 有题目但没有任何提交/批阅线索：结构不认识，需留样
-    return STATE_UNKNOWN
-
-
 def parse_questions(html_text: str) -> Dict[str, Dict[str, str]]:
     """从作业页解析题目本身（qid / 题干 / 题型 / 选项）。
 
     实现在 ``api.decode.decode_work_questions``（复用同一套题干/选项提取与字体解密），
-    这样采集进来的指纹与作答时算出来的完全一致。
+    这样入库的指纹与作答时算出来的完全一致。
     """
     try:
         from api.decode import decode_work_questions

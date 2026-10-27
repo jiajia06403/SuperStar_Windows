@@ -473,7 +473,7 @@ class Chaoxing:
     CARD_NUMS_FIRST = "0"
     # 整章读取时，连续多少张「没有任何任务点」的卡片就认为后面没有了。
     # 给 1 张以上的容忍度是因为多卡片章节里可能掺有纯文本卡 / 已全部通过的卡片，
-    # 宁可多请求一张，也不能像 stop_early 那样一遇空卡就停而漏掉后面的任务点。
+    # 宁可多请求一张，也不能一遇空卡就收手而漏掉后面的任务点。
     CARD_MAX_EMPTY = 2
     def __init__(self, account: Account = None, tiku: Tiku = None, **kwargs):
         self.account = account
@@ -715,12 +715,9 @@ class Chaoxing:
         return decode_course_point(_resp.text)
 
     def get_job_list(self, course: dict, point: dict,
-                     stop_early: bool = False,
                      nums: Optional[str] = None,
                      stop_when: Optional[Callable[[list, dict], bool]] = None,
-                     track_cards: bool = False,
-                     mark_empty: bool = True,
-                     include_passed: bool = False) -> tuple[list[dict], dict]:
+                     track_cards: bool = False) -> tuple[list[dict], dict]:
         """读取章节任务点。
 
         三个「少请求」开关（风控考虑：原来每章固定打满 7 张卡片，且一次调用只限流一次）：
@@ -731,20 +728,8 @@ class Chaoxing:
           拿不到任务点也不会被当成「空章节」（不打空页、不写 ``empty``）——
           因为我们根本没看全，断言「本章没有任务点」是错的。
         - ``stop_when(job_slice, card_info)``：命中即返回，不再请求后续卡片。
-        - ``track_cards``：在 ``job_info["card_of_job"]`` 里给出
+        -         ``track_cards``：在 ``job_info["card_of_job"]`` 里给出
           ``{jobid: 卡片序号}``，供调用方下回只回读相关卡片。
-
-        ``stop_early``：一遇到空卡片就停（采集题库时用）。整章刷课不用它，改由
-        ``CARD_MAX_EMPTY`` 容忍若干张空卡后再收手，避免漏掉多卡片章节的任务点。
-
-        ``mark_empty``：空章节是否上报``studentstudyAjax``把它标记成已完成。
-        **采集题库必须传 False**：那是写操作（会改服务端进度），且每章刷一条
-        「空页面任务完成」日志，把采集真正有用的信息挤出界面日志窗口。
-
-        ``include_passed``：是否返回**已通过**的作业（``passed=True``）。刷课必须保持
-        False（已通过的不该重做）。采集要传 True，否则「已通过」的作业卡片（超星不给
-        ``job``/``jobid``，只留 ``property._jobid``）会被整份丢掉——一门课 244 章里
-        119 章已通过，采集却只看得到未通过的 101 份，于是满屏「还没提交」。
 
         失败态（读不到任务点）在 ``job_info`` 里用 ``unreadable=True`` 标记，
         **不再返回空列表冒充成功**：非 200、掉登录/验证码/403 页、mArg 解析失败
@@ -791,8 +776,7 @@ class Chaoxing:
                 logger.error(_resp.text)
                 return [], {"unreadable": True}
 
-            _job_list, _job_info = decode_course_card(_resp.text,
-                                                      include_passed=include_passed)
+            _job_list, _job_info = decode_course_card(_resp.text)
             if _job_info.get("notOpen", False):
                 # 直接返回, 节省一次请求
                 logger.info("该章节未开放")
@@ -802,8 +786,6 @@ class Chaoxing:
                 # 卡片页不可读（掉登录 / 验证码 / 403 / 解析失败），没有任务点可言
                 logger.warning(f"章节任务点卡片 {_possible_num} 读取失败（可能是掉登录或风控页）")
                 empty_run = 0
-                if stop_early and _possible_num != card_nums[0]:
-                    break
                 continue
 
             readable = True
@@ -823,9 +805,6 @@ class Chaoxing:
 
             if not _job_list:
                 empty_run += 1
-                # 卡片序号从 0 连续排列：第 1 张之后还空就说明没有更多卡片了
-                if stop_early and _possible_num != card_nums[0]:
-                    break
                 if empty_run >= self.CARD_MAX_EMPTY:
                     logger.trace(f"连续 {empty_run} 张卡片没有任务点，判定后面没有卡片了")
                     break
@@ -847,11 +826,7 @@ class Chaoxing:
                 logger.debug(f"部分卡片读取(nums={card_nums})未取到任务点，跳过空章节判定")
                 return job_list, job_info
             # 确实是空章节（卡片全解析成功但没有任务点），按空页处理
-            if mark_empty:
-                self.study_emptypage(course, point)
-            else:
-                # 只读调用方（采集题库）：只标记「空」，不写服务端进度
-                logger.debug(f"只读模式：跳过空页面任务上报 -> {point.get('title')}")
+            self.study_emptypage(course, point)
             job_info["empty"] = True
         # logger.trace(f"原始任务点列表内容:\n{_resp.text}")
         logger.info("章节任务点读取成功...")
@@ -1479,7 +1454,7 @@ class Chaoxing:
         _session = SessionManager.get_session()
 
         _url = work_verify.WORK_URL
-        # 抓题、提交后核验、采集已完成作业共用同一组参数（见 api.work_verify.build_work_params）
+        # 抓题、提交后核验共用同一组参数（见 api.work_verify.build_work_params）
         work_params = work_verify.build_work_params(_course, _job, _job_info)
 
         @with_retry(max_retries=3, delay=1)

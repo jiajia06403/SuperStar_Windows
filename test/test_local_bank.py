@@ -644,23 +644,6 @@ PAGE_REAL_GRADED = """
 </div>
 """
 
-PAGE_REAL_UNSUBMITTED = """
-<html><body>
-<div class="workTitle">章节测验（待完成）</div>
-<div class="singleQuesId" data="405803973" id="question405803973">
-  <div class="TiMu newTiMu" data="0">
-    <div class="Zy_TItle clearfix"><i class="fl">1</i>
-      <div><span class="newZy_TItle">【单选题】</span>【选择题】大学生安全教育的基本定义不包括( )</div></div>
-    <ul class="Zy_ulTop"><li qid="405803973" qtype="0"><span class="num_option choice405803973" data="A">A</span>
-      <a class="fl after">学习大学生安全教育是国家法律法规规定的</a></li></ul>
-    <input id="answer405803973" name="answer405803973" type="hidden" value=""/>
-  </div>
-</div>
-<a class="btnSubmit" href="javascript:;">提交</a>
-</body></html>
-"""
-
-
 def test_parse_real_graded_page():
     """实测结构：marking_dui + div.answerCon（我的答案）。"""
     verdicts = wv.parse_verdicts(PAGE_REAL_GRADED)
@@ -671,82 +654,6 @@ def test_parse_real_graded_page():
     assert questions["405804363"]["type"] == "judgement", questions["405804363"]
     assert questions["405804361"]["type"] == "multiple", questions["405804361"]
     assert len(questions) == 2
-
-
-def test_real_page_state_is_classified():
-    """未提交 / 已提交未批阅 / 结构不认识 要能区分（采集日志据此说明原因）。"""
-    assert wv.page_state(PAGE_REAL_GRADED, True, True) == wv.STATE_OK
-    assert wv.page_state(PAGE_REAL_GRADED, True, False) == wv.STATE_UNGRADED
-    assert wv.page_state(PAGE_REAL_UNSUBMITTED, True, False) == wv.STATE_UNSUBMITTED
-    assert wv.page_state("<html>参数验证不通过</html>", False, False) == wv.STATE_UNKNOWN
-
-
-def test_status_block_decides_not_submit_button():
-    """页头 ``.testTit_status`` 才是权威判据；提交按钮两边都有，不能当证据。
-
-    真机实测：已交过、可重做的章节测验页同样有 ``<a class="btnSubmit">提交</a>``，
-    按旧逻辑（btnSubmit 算「未提交」）会把交过的作业误报成「还没提交」。
-    """
-    todo = ('<div class="fr testTit_status"><i></i>待完成</div>'
-            '<a class="btnSubmit" href="javascript:;">提交</a>')
-    redo = ('<div class="fr testTit_status"><i></i>未达到及格线，请重做</div>'
-            '<a class="btnSubmit" href="javascript:;">提交</a>')
-    done = ('<div class="fr testTit_status"><i></i>已完成</div>'
-            '<a class="btnSubmit" href="javascript:;">提交</a>')
-    assert wv.page_status(todo) == "待完成"
-    assert wv.is_unsubmitted_page(todo) is True
-    assert wv.page_state(todo, True, False) == wv.STATE_UNSUBMITTED
-    # 交过、没过、可重做：不是「没交过」，但也没答案（没有判分痕迹）
-    assert wv.is_unsubmitted_page(redo) is False
-    assert wv.page_state(redo, True, False) == wv.STATE_UNGRADED
-    # 平台标已完成但页面不给答案：单独归类，别混进 ungraded
-    assert wv.page_state(done, True, False) == wv.STATE_PASSED
-
-
-def test_new_attempt_page_is_not_proof_of_never_submitted():
-    """「待完成」只说明这一页是新的空白作答，不能断言用户没做过。
-
-    超星作业允许重做时，每次打开都新开一条作答记录（workAnswerId 重新分配），
-    上次答案不会带过来 —— 真机上已及格章节点进去也是这个页面。
-    """
-    page = PAGE_REAL_UNSUBMITTED
-    assert wv.page_status(page) == ""          # 老页面没有状态区
-    assert wv.is_unsubmitted_page(page) is True  # 只能说「这一页没有上次答案」
-    # 同一份作业带着平台状态时，语义完全一致
-    page_with_status = page.replace(
-        '<div class="workTitle">章节测验（待完成）</div>',
-        '<div class="fr testTit_status"><i></i>待完成</div>')
-    assert wv.page_state(page_with_status, True, False) == wv.STATE_UNSUBMITTED
-
-
-
-def test_submitted_but_no_answer_is_ungraded():
-    """已交过但老师不公布答案的页，不能误报成未提交。
-
-    特征：有「重新作答」入口、没有对错/正确答案标记（marking 为空）。
-    """
-    page = """
-    <html><body>
-    <div class="singleQuesId" data="405803973" id="question405803973">
-      <div class="TiMu" data="0"><div class="Zy_TItle"><span class="newZy_TItle">【单选题】</span>题干</div></div>
-      <ul class="Zy_ulTop"><li><span class="num_option" data="A">A</span><a class="fl after">选项</a></li></ul>
-    </div>
-    <a class="btnReEdit" href="javascript:;">重新作答</a>
-    </body></html>
-    """
-    assert wv.is_unsubmitted_page(page) is False
-    assert wv.page_state(page, True, False) == wv.STATE_UNGRADED
-
-
-def test_closed_work_page_is_its_own_state():
-    """老师关掉作业后接口只回一句「作业已结束」（实测 31 字节），要单独归类。"""
-    closed = "<html><body>作业已结束</body></html>"
-    assert wv.is_closed_page(closed) is True
-    assert wv.page_state(closed, False, False) == wv.STATE_CLOSED
-    # 正常作业页里偶然出现这几个字，不能被当成关闭页（靠长度与是否有题目兜住）
-    long_page = PAGE_REAL_UNSUBMITTED + "<!-- 作业已结束 -->" * 300
-    assert wv.is_closed_page(long_page) is False
-    assert wv.page_state(long_page, True, False) == wv.STATE_UNSUBMITTED
 
 
 def test_normalize_strips_repeated_type_tags():

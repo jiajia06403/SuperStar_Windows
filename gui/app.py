@@ -1429,8 +1429,6 @@ class App:
         # courseId -> 正在处理的章节 pid 集合（章节并发时同一门课可能同时有多章在跑）
         self._studying_pids: dict[str, set[str]] = {}
         self._studying_cids: set[str] = set()     # 正在处理的课程（courseId），界面标「进行中」
-        self._collect_gen = 0                     # 「采集题库」代数：递增即中止
-        self._collecting = False                  # 是否正在采集题库
         self._stopping = False                    # 是否正在「停止中」（按钮反馈用）
         self._acc_uids: dict[str, str] = {}       # 账号下拉显示文本 -> uid
         self._login_dialog = None                 # 当前打开的登录框（行内报错用）
@@ -1754,8 +1752,6 @@ class App:
 
         self.read_btn = ttk.Button(right, text="读取进度", width=9, command=self.on_read_progress)
         self.read_btn.pack(side="left", padx=(0, 6))
-        self.collect_btn = ttk.Button(right, text="采集题库", width=9, command=self.on_collect_bank)
-        self.collect_btn.pack(side="left", padx=(0, 6))
         self.action_btn = ttk.Button(right, text="开始刷课", width=12, style="Accent.TButton",
                                      command=self.on_action)
         self.action_btn.pack(side="left")
@@ -2006,16 +2002,15 @@ class App:
             label.configure(text=shown)
 
     def _refresh_action(self) -> None:
-        """单一「开始/停止」按钮：空闲显示开始，刷课或采集中显示停止。"""
+        """单一「开始/停止」按钮：空闲显示开始，刷课中显示停止。"""
         if self._stopping:
             self.action_btn.configure(text="停止中…", state="disabled")
             return
-        busy = bool(getattr(self.engine, "is_running", False)) or bool(self._collecting)
+        busy = bool(getattr(self.engine, "is_running", False))
         self.action_btn.configure(
             text="停止" if busy else "开始刷课",
             state="normal",
         )
-        self.collect_btn.configure(state="disabled" if busy else "normal")
 
     def _tips(self, text: str) -> None:
         if not self.silent:
@@ -2090,7 +2085,7 @@ class App:
         if not uid:
             self._tips("暂无已保存的账号，请在账号下拉选择「+ 添加账号」")
             return
-        if self.engine.is_running or self._collecting:
+        if self.engine.is_running:
             self._tips("请先停止当前刷课再修改账号")
             return
         acc = self.engine.accounts.get(str(uid)) or {}
@@ -2688,142 +2683,6 @@ class App:
             self._read_gen += 1
             self._set_reading(False)
 
-    # ---------------- 采集题库（只读已完成作业） ----------------
-    def on_collect_bank(self) -> None:
-        """把已完成作业的正确答案采集进本地题库（只读，不提交作业）。"""
-        if self.engine.chaoxing is None:
-            return self._tips("请先登录（或点击「演示」）")
-        if self._collecting:
-            return self._tips("正在采集题库，请稍候（可点「停止」中断）")
-        if self.engine.is_running:
-            return self._tips("刷课进行中，请先停止再采集题库")
-        if not self.current_course:
-            return self._tips("请先在左侧选择一门课程")
-        selected = [self.current_course]        # 单选：只采集当前选中的这门课
-        names = "、".join(str(c.get("title") or "") for c in selected[:3])
-        if len(selected) > 3:
-            names += " 等"
-        if not self.silent and not messagebox.askokcancel(
-            "采集题库",
-            f"将从 {len(selected)} 门课程（{names}）已完成的作业里读取正确答案，\n"
-            "写入本地题库。全程只读：不提交、不保存草稿、不修改作业。\n\n"
-            "章节多的课程需要几分钟，期间可点「停止」中断（已采集的部分保留）。",
-            parent=self.root,
-        ):
-            return
-        self._cancel_reading()
-        self._collect_gen += 1
-        gen = self._collect_gen
-        self._collecting = True
-        self._refresh_action()
-        threading.Thread(target=self._do_collect, args=(selected, gen), daemon=True).start()
-
-    def _do_collect(self, courses: list, gen: int) -> None:
-        """后台采集：逐门课遍历章节 -> 读作业页 -> 入库；用代数判断是否被中止。"""
-        from api import collect as collect_mod
-
-        def stale() -> bool:
-            return gen != self._collect_gen
-
-        summary = {"learned": 0, "read": 0, "unreadable": 0, "courses": 0, "stopped": False,
-                   "fresh": 0, "passed": 0, "ungraded": 0, "known": 0, "undecided": 0,
-                   "closed": 0}
-
-        def on_event(event: dict) -> None:
-            message = str(event.get("message") or "")
-            if message:
-                self.events.put(("log", message))
-            if event.get("kind") == "progress":
-                done, total = int(event.get("done") or 0), int(event.get("total") or 0)
-                if not total:
-                    return
-                # 章节级进度 message 是章节名；作业级进度 message 为空
-                text = (f"采集题库 · 章节 {done}/{total} {message}" if message
-                        else f"采集题库 · 作业 {done}/{total}")
-                self.events.put(("status", "reading", text.strip()))
-
-        try:
-            for index, course in enumerate(courses, 1):
-                if stale():
-                    summary["stopped"] = True
-                    break
-                self.events.put(("status", "reading",
-                                 f"采集题库 {index}/{len(courses)} · {course.get('title', '')}"))
-                try:
-                    points = self.engine.get_course_points(course)
-                    stats = collect_mod.collect_course(
-                        self.engine.chaoxing, course, points=points,
-                        on_event=on_event, should_stop=stale)
-                except Exception as exc:  # noqa: BLE001
-                    self.events.put(("log", f"【采集】{course.get('title', '')} 失败：{exc}"))
-                    continue
-                summary["learned"] += int(stats.get("learned") or 0)
-                summary["read"] += int(stats.get("read") or 0)
-                summary["unreadable"] += int(stats.get("unreadable") or 0)
-                summary["fresh"] += int(stats.get("fresh") or 0)
-                summary["passed"] += int(stats.get("passed") or 0)
-                summary["ungraded"] += int(stats.get("ungraded") or 0)
-                summary["known"] += int(stats.get("known") or 0)
-                summary["undecided"] += int(stats.get("undecided") or 0)
-                summary["closed"] += int(stats.get("closed") or 0)
-                summary["courses"] += 1
-                if stats.get("stopped"):
-                    summary["stopped"] = True
-                    break
-        except Exception as exc:  # noqa: BLE001
-            self.events.put(("status", "error", f"采集失败: {exc}"))
-        finally:
-            self.events.put(("collect_done", gen, summary))
-
-    def _ev_collect_done(self, gen: int, summary: dict) -> None:
-        if gen != self._collect_gen:
-            return
-        self._collecting = False
-        self._refresh_action()
-        text = f"读完 {summary.get('read', 0)} 份作业，收录 {summary.get('learned', 0)} 题"
-        extra = []
-        if summary.get("known"):
-            extra.append(f"题库已有 {summary['known']} 题")
-        if summary.get("undecided"):
-            extra.append(f"平台没判对也没给答案 {summary['undecided']} 题")
-        if extra:
-            text += "（" + "、".join(extra) + "）"
-        reasons = []
-        if summary.get("fresh"):
-            reasons.append(f"{summary['fresh']} 份没有上次答案")
-        if summary.get("passed"):
-            reasons.append(f"{summary['passed']} 份已通过(作答页已收回)")
-        if summary.get("ungraded"):
-            reasons.append(f"{summary['ungraded']} 份未批阅/未公布答案")
-        if summary.get("closed"):
-            reasons.append(f"{summary['closed']} 份作业已结束")
-        if summary.get("unreadable"):
-            reasons.append(f"{summary['unreadable']} 份无法识别")
-        if reasons:
-            text += "，跳过 " + "、".join(reasons)
-        if summary.get("stopped"):
-            text += "，已中断"
-        self.set_status("idle", "采集题库完成 · " + text)
-        if not self.silent:
-            hint = ""
-            if not summary.get("read"):
-                if summary.get("fresh") or summary.get("passed"):
-                    hint = ("\n\n这些作业的页面上没有上次的答案：\n"
-                            "· 「没有上次答案」= 平台打开的是**新的一次空白作答**。"
-                            "作业允许重做时，超星每打开一次就新开一条作答记录，"
-                            "上次答过的内容不会带过来 —— 所以不能据此说「没做过」。\n"
-                            "· 「已通过」= 平台标了已完成，同时**收回了作答页**："
-                            "带上作业号请求会被直接拒绝（403），去掉作业号只会新开一次"
-                            "空白作答，历史答案取不回来。网页端也没有“查看详情”这类入口"
-                            "（课程的“作业”列表里根本不包含章节测验）。\n\n"
-                            "所以：只有**还能打开**的作业（未通过、可重做）能采到答案；"
-                            "已经通过的章节测验，超星不再对外提供答案。")
-                elif summary.get("closed"):
-                    hint = "\n\n作业都已被老师关闭/过期，平台不再提供答案。"
-                else:
-                    hint = "\n\n本课程暂时没有可读的已完成作业。"
-            messagebox.showinfo("采集完成", text + hint, parent=self.root)
-
     # ---------------- 开始 / 停止 ----------------
     def _save_run_params(self) -> None:
         """把界面上的倍速/并发写进用户配置（下次启动自动恢复）。
@@ -2908,17 +2767,12 @@ class App:
         self._refresh_action()
 
     def on_action(self) -> None:
-        if self._stopping or self.engine.is_running or self._collecting:
+        if self._stopping or self.engine.is_running:
             self.on_stop()
         else:
             self.on_start()
 
     def on_stop(self) -> None:
-        # 采集题库时「停止」只作废采集（不动刷课状态机）
-        if self._collecting:
-            self._collect_gen += 1
-            self.set_status("idle", "已请求停止采集…")
-            return
         # 立即把按钮切到「停止中…」给出「已收到」的反馈；线程收尾后会经 idle 状态统一恢复
         if not self._stopping:
             self._stopping = True

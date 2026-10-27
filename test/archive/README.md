@@ -16,9 +16,12 @@
 | `_probe_submit.py` / `_probe_submit2.py` | 提交作业后的判分页解析（对错 / 得分 / 正确答案） |
 | `_probe_view.py` | 「查看答案」入口是否开放 |
 
-它们的探测结论已经固化进 `api/collect.py`、`api/work_verify.py`，
-并有断言式回归测试覆盖（`test/test_collect.py`、`test/test_local_bank.py`），
-所以脚本本身不再需要每次运行。
+它们的探测结论已经固化进 `api/work_verify.py` 与 `api/local_bank.py`，
+并有断言式回归测试覆盖（`test/test_local_bank.py`），所以脚本本身不再需要每次运行。
+
+> 注：这些探索最初是为了「从已完成账号批量采集答案」。真机验证发现平台对**已通过**的
+> 章节测验会收回作答页（带作业号直连 403，去掉只给空白重做页），入口已试穷，
+> 该功能（`api/collect.py` 与主界面「采集题库」）已删除，只保留刷课提交时自动入库。
 
 **运行前需自备环境变量**（脚本已改为不硬编码账号）：
 

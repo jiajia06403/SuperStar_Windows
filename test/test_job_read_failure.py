@@ -80,30 +80,15 @@ _OPEN_WORK_CARD = (
     '"_jobid":"work-bb08"}}]};</script>')
 
 
-def test_decode_passed_work_is_dropped_by_default():
-    """刷课默认行为不变：已通过的作业不进任务点列表（不该被重做）。"""
+def test_decode_passed_work_is_dropped():
+    """已通过的作业不进任务点列表（不该被重做）；超星这类卡片也不带 job/jobid。"""
     jobs, _info = decode.decode_course_card(_PASSED_WORK_CARD)
     assert jobs == [], jobs
 
 
-def test_decode_passed_work_kept_when_requested():
-    """采集要 include_passed：否则「已通过」的作业整份丢失，统计永远偏。
-
-    真机：244 章里 119 章已通过，采集却只看得到未通过的 101 份，于是满屏「还没提交」。
-    """
-    jobs, _info = decode.decode_course_card(_PASSED_WORK_CARD, include_passed=True)
-    assert len(jobs) == 1, jobs
-    job = jobs[0]
-    assert job["type"] == "workid"
-    assert job["jobid"] == "work-a72c79e8", "jobid 要从 property._jobid 兜回来"
-    assert job["passed"] is True
-    assert job["enc"] == "e1"
-
-
-def test_decode_open_work_not_marked_passed():
-    jobs, _info = decode.decode_course_card(_OPEN_WORK_CARD, include_passed=True)
+def test_decode_open_work_kept():
+    jobs, _info = decode.decode_course_card(_OPEN_WORK_CARD)
     assert len(jobs) == 1 and jobs[0]["jobid"] == "work-bb08", jobs
-    assert not jobs[0].get("passed"), jobs
 
 
 
