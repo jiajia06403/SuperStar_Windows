@@ -1323,6 +1323,17 @@ class App:
         # 启动后尝试用本机已保存的账号自动登录（自检/无账号时静默跳过）
         self._auto_login_id = self.root.after(300, self._auto_login)
 
+        # ---- resize 冻结：拖拽期间冻结内容区，只重绘窗口边框，松手一次性重排 ----
+        # ttk.Treeview / Text 整窗重绘在弱显卡/远程桌面下每帧高达上百毫秒，
+        # 拖拽时 WM 持续发 Configure，主线程被整窗重绘占满 → 帧率骤降。
+        # 冻结期间内容区尺寸不变，TK 不重排/重绘重型控件，drag 只画边框（~10ms，
+        # 高帧率）；最后一次 Configure 后 120ms 视为拖拽结束，恢复 pack 并做最终重排。
+        self._last_geo = None          # 首帧 Configure 只记录、不冻结
+        self._resizing = False
+        self._resize_end_id = None
+        self._last_config_t = 0.0       # 最近一次尺寸变化的单调时钟
+        self.root.bind("<Configure>", self._on_root_configure, add="+")
+
     # ---------------- 兼容旧接口（单选视图） ----------------
     @property
     def checked(self) -> "set[str]":
@@ -1414,6 +1425,104 @@ class App:
             self.theme.stop_watch()
         except Exception:  # noqa: BLE001
             pass
+        # 取消待触发的 resize 结束定时器（窗口销毁时无需再恢复布局）
+        rid = getattr(self, "_resize_end_id", None)
+        if rid is not None:
+            try:
+                self.root.after_cancel(rid)
+            except tk.TclError:
+                pass
+            self._resize_end_id = None
+
+    # ---------------- resize 冻结 ----------------
+    def _on_root_configure(self, event=None) -> None:
+        """根窗口尺寸变化：进入/维持 resize 冻结；纯移动则忽略。
+
+        仅在尺寸真正变化时干预；移动窗口（x/y 变、wh 不变）不触发冻结，
+        避免误冻结。首次 Configure（启动建窗）只记录基准尺寸、不冻结。
+        """
+        if event is not None and event.widget is not self.root:
+            return
+        try:
+            if not self.root.winfo_exists():
+                return
+            w, h = self.root.winfo_width(), self.root.winfo_height()
+        except tk.TclError:
+            return
+        if self._last_geo is None:
+            self._last_geo = (w, h)
+            return
+        if self._last_geo == (w, h):
+            return                                   # 纯移动 / 重复事件
+        self._last_geo = (w, h)
+        self._last_config_t = time.monotonic()
+        if not self._resizing:
+            # 延迟到 idle 再改几何管理器：在 <Configure> 事件处理里直接 pack_forget/
+            # place 会触发 TclError，idle 阶段（事件队列清空后）改才安全。
+            try:
+                self.root.after_idle(self._enter_resize)
+            except tk.TclError:
+                pass
+        rid = self._resize_end_id
+        if rid is not None:
+            try:
+                self.root.after_cancel(rid)
+            except tk.TclError:
+                pass
+        try:
+            # 去抖放宽到 300ms：覆盖单帧慢重绘（弱显卡下过渡帧可达 ~160ms），
+            # 避免退出定时器在过渡重绘期间误触发、把冻结又取消掉。
+            self._resize_end_id = self.root.after(300, self._exit_resize)
+        except tk.TclError:
+            self._resize_end_id = None
+
+    def _enter_resize(self) -> None:
+        """冻结内容区：把 outer 从 pack 切到固定像素尺寸的 place。
+
+        在 idle（非事件处理中）执行，避免同步改动几何管理器抛 TclError；
+        place 锁死尺寸后 TK 不再重排/重绘内部两个 Treeview + 日志 Text 等重型控件。
+        """
+        if self._resizing:
+            return
+        outer = getattr(self, "_outer", None)
+        if outer is None or not outer.winfo_exists():
+            return
+        try:
+            cw, ch = outer.winfo_width(), outer.winfo_height()
+            if cw <= 1 or ch <= 1:
+                return
+            outer.pack_forget()
+            outer.place(x=0, y=0, width=cw, height=ch)
+            self._resizing = True
+        except tk.TclError:
+            pass
+
+    def _exit_resize(self) -> None:
+        """拖拽结束（最后一次 Configure 后 300ms 内无新变化）：恢复布局并做最终重排。
+
+        保险：若 250ms 内仍有过尺寸变化（弱显卡下过渡重绘可能耗时 >300ms，
+        定时器提前触发），改期而非退出，避免冻结被误取消。
+        """
+        self._resize_end_id = None
+        if not self._resizing:
+            return
+        if time.monotonic() - self._last_config_t < 0.25:
+            try:
+                self._resize_end_id = self.root.after(300, self._exit_resize)
+            except tk.TclError:
+                self._resize_end_id = None
+            return
+        self._resizing = False
+        outer = getattr(self, "_outer", None)
+        if outer is not None and outer.winfo_exists():
+            try:
+                outer.place_forget()
+                outer.pack(fill="both", expand=True)
+            except tk.TclError:
+                pass
+        # 最终重排：工具栏折行 + 状态栏/提示截断（内容区尺寸已变）
+        self._reflow_toolbar()
+        self._run_fit_columns()
 
     # ---------------- 界面构建 ----------------
     def _build_ui(self) -> None:
@@ -1425,6 +1534,7 @@ class App:
         style.configure("Treeview", rowheight=max(22, self._line_h + 6))
 
         outer = ttk.Frame(self.root, padding=(10, 8))
+        self._outer = outer
         outer.pack(fill="both", expand=True)
         outer.columnconfigure(0, weight=1)
         # row0（工具栏）与 row2（状态栏）刻意不给 weight：它们是单行文本高度，
