@@ -134,7 +134,8 @@ def _collect_work(session, chaoxing, course: Dict[str, Any], job: dict,
         elif not questions:
             key, reason = "no_questions", "没读到题目"
         elif state == work_verify.STATE_PASSED:
-            key, reason = "passed", f"平台标记已完成（页面不给答案），跳过{f'（{status}）' if status else ''}"
+            key, reason = "passed", ("平台标已通过并收回了作答页"
+                                     f"{f'（{status}）' if status else ''}，跳过")
         elif state == work_verify.STATE_UNSUBMITTED:
             # 注意：这只说明「这一页是新的空白作答」，**不代表没交过** —— 作业允许重做时
             # 超星每次打开都新开一条作答记录，上次答案不会带过来（见 work_verify 说明）。
@@ -287,8 +288,19 @@ def collect_course(chaoxing: Any, course: Dict[str, Any],
                  done=index, total=len(points))
             continue
 
-        # 已通过（平台标「已完成」）的作业：答案在平台侧、页面不开放（实测直连 403，
-        # 去掉 jobid 只会拿到全新空白作答页），所以不再发请求，只计数报出来。
+        # 已通过（平台标「已完成」）的作业：答案在平台侧、作答页已被收回，不再发请求。
+        # 2026-10-27 真机把入口试穷了（测试账号 244 章）：
+        #   · doHomeWorkNew 带 jobid -> 403；逐个拆参数确认 **只要带 jobid 就 403**
+        #     （与 enc / originJobId / needRedirect 无关）；
+        #   · 去掉 jobid -> 200，但只是**新的一次空白作答**（answerId 重新分配、0 我的答案）；
+        #   · mooc2/work/task 与 view -> 403，连「未通过」作业带真实 answerId 也 403，
+        #     这两个端点对学生侧就不开放；
+        #   · mooc2/work/answer-list -> 「error enc,code=2」，卡片 enc / workEnc / enc /
+        #     openc / oldenc / examEnc 全试过都不认，它要的是作业列表 data 里那串按作业
+        #     下发的 enc；而 mooc2/work/list 在本账号两门课都是「暂无作业」0/0
+        #     （章节测验 workA 不进作业列表），拿不到那串 enc；
+        #   · 错题集入口在 i.chaoxing.com/base 菜单里不存在。
+        # 结论：已通过 workA 的历史答案 API 侧取不到，只能计数报出来，别浪费请求。
         passed = [job for job in works if job.get("passed")]
         pending = [job for job in works if not job.get("passed")]
         stats["works_total"] += len(works)
@@ -296,7 +308,7 @@ def collect_course(chaoxing: Any, course: Dict[str, Any],
             stats["passed"] = int(stats.get("passed") or 0) + len(passed)
         emit(kind="log",
              message=f"【采集】{point.get('title', '')}：发现 {len(works)} 份作业"
-                     + (f"（其中 {len(passed)} 份已通过，平台不开放查看答案）"
+                     + (f"（其中 {len(passed)} 份已通过，作答页已被平台收回）"
                         if passed else ""))
         outcomes = []
         for job in pending:
@@ -331,7 +343,7 @@ def collect_course(chaoxing: Any, course: Dict[str, Any],
         parts.append(f"平台未给答案 {stats['undecided']} 题")
     skips = []
     for key, label in (("fresh", "无上次答案"),
-                       ("passed", "已通过(平台不开放)"),
+                       ("passed", "已通过(作答页已收回)"),
                        ("ungraded", "未批阅/未公布答案"),
                        ("closed", "已结束"),
                        ("no_questions", "没读到题目"),
@@ -345,8 +357,8 @@ def collect_course(chaoxing: Any, course: Dict[str, Any],
         parts.append("跳过：" + "、".join(skips))
     if not stats["read"] and (int(stats.get("fresh") or 0)
                               or int(stats.get("passed") or 0)):
-        parts.append("没读到答案：平台对这些作业要么给的是新的空白作答，"
-                     "要么已通过但不再开放查看（要在网页端「查看详情」才看得到历史答案）")
+        parts.append("没读到答案：平台给的是新的空白作答；已通过的作业"
+                     "作答页已被收回（带作业号请求被拒、去掉只开空页），取不回历史答案")
     parts.append(f"题库共 {total} 题")
     emit(kind="log", message=f"【采集】{course_title} 完成：" + "，".join(parts))
     return stats
